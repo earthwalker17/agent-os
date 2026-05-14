@@ -73,6 +73,9 @@ pnpm-debug.log*
 .vscode/
 .idea/
 
+# Claude Code local settings (per-machine, not shared)
+.claude/
+
 .DS_Store
 Thumbs.db
 desktop.ini

@@ -23,10 +23,13 @@ from execution import (
     read_task_state,
     update_task_state,
     ToolRuntime,
-    CodingAgentRunner,
+    get_default_manager,
+    shutdown_default_manager,
     is_code_delegation,
     handle_code_delegation,
     GENERAL_REJECTION_MESSAGE,
+    looks_like_code_request,
+    render_suggestion,
 )
 from execution.tool_models import (
     ListFilesRequest,
@@ -56,6 +59,14 @@ MEMORY_FILES = ["PROJECT.md", "STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RES
 @app.on_event("startup")
 def startup():
     init_db()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    # Best-effort: tear down the background run executor so the process exits
+    # cleanly. In-flight runs are not awaited — their artifacts may end in an
+    # inconsistent state if the server is killed mid-run.
+    shutdown_default_manager(wait=False)
 
 
 # --- Project endpoints ---
@@ -340,6 +351,26 @@ def api_chat(req: ChatRequest):
             memory_updates=[],
         )
 
+    # --- Implicit delegation suggestion (Task 05.8) ---
+    # In project chats only, if the message reads like a coding request, reply
+    # with a non-executing suggestion that proposes an `@code` task card.
+    # @code remains the only actual execution trigger; the user must confirm.
+    # Memory writeback is skipped — the message hasn't produced durable
+    # project knowledge yet (the user still needs to dispatch).
+    if not is_general and looks_like_code_request(req.message):
+        response_content = render_suggestion(req.message)
+        assistant_msg = add_message(req.conversation_id, "assistant", response_content)
+        if len([m for m in messages if m["role"] == "user"]) <= 1:
+            title = req.message[:60] + ("..." if len(req.message) > 60 else "")
+            update_conversation_title(req.conversation_id, title)
+        return ChatResponse(
+            role="assistant",
+            content=response_content,
+            timestamp=assistant_msg["timestamp"],
+            memory_updated=False,
+            memory_updates=[],
+        )
+
     history = [{"role": m["role"], "content": m["content"]} for m in messages]
 
     # Generate orchestration response
@@ -531,10 +562,10 @@ def api_tool_run_shell(project_id: str, req: RunShellRequest):
     return ToolRuntime(project_id).run_shell(req.command, req.timeout_seconds).model_dump()
 
 
-# --- Execution agent run endpoints (Phase 3 — Task 05.3) ---
-# A run is created synchronously: the request blocks until the Coding Agent
-# loop finishes (or hits the step budget) and returns a ResultSummary.
-# Background-job execution + main-chat delegation are deferred to Task 05.4.
+# --- Execution agent run endpoints (Phase 3 — Tasks 05.3 + 05.6A) ---
+# Runs are dispatched to a background thread pool (see execution/background.py).
+# POST returns the placeholder RunRecord (status="running") immediately; the
+# GET endpoints below reflect status transitions as the run progresses.
 
 
 class CreateRunRequest(BaseModel):
@@ -552,9 +583,8 @@ def api_create_run(project_id: str, req: CreateRunRequest):
         raise HTTPException(status_code=400, detail="task_card is required")
 
     task = TaskSpec(title=req.title, task_card=req.task_card, created_by=req.created_by)
-    runner = CodingAgentRunner(project_id)
-    summary = runner.run_task(task)
-    return summary.model_dump()
+    record = get_default_manager().dispatch(project_id, task)
+    return record.model_dump()
 
 
 @app.get("/api/projects/{project_id}/execution/runs")

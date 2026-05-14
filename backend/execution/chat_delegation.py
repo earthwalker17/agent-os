@@ -5,18 +5,20 @@ message off to this module. The helper:
 
 1. Strips the `@code` prefix to form the task card.
 2. Lazily ensures the project's execution workspace exists.
-3. Calls `CodingAgentRunner.run_task()` synchronously.
-4. Renders the `ResultSummary` as a markdown chat reply.
+3. Dispatches the run to `BackgroundRunManager` — returns immediately.
+4. Renders a `running` placeholder as the assistant chat reply.
 
 The chat endpoint is responsible for persisting the user/assistant messages
 and conversation auto-title — this module only produces the assistant text.
+Run completion happens off-thread; the user reads the final result via the
+Runs panel (or by polling `GET /execution/runs/{id}`).
 """
 
 from __future__ import annotations
 
+from .background import get_default_manager
 from .manager import init_execution_workspace
-from .models import ResultSummary, TaskSpec
-from .runner import CodingAgentRunner
+from .models import RunRecord, TaskSpec
 
 
 CODE_TRIGGER = "@code"
@@ -56,8 +58,9 @@ def handle_code_delegation(
     project_name: str | None,
     user_message: str,
 ) -> str:
-    """Run the Coding Agent for a `@code …` chat message and return the
-    assistant-facing markdown reply. Pre-condition: caller has confirmed the
+    """Dispatch the Coding Agent for a `@code …` chat message and return the
+    immediate assistant-facing markdown reply (a placeholder while the run
+    executes in the background). Pre-condition: caller has confirmed the
     project is not the GENERAL workspace and the message starts with `@code`.
     """
     task_card = extract_task_card(user_message)
@@ -71,11 +74,11 @@ def handle_code_delegation(
     spec = TaskSpec(title=title, task_card=task_card, created_by="chat")
 
     try:
-        summary = CodingAgentRunner(project_id).run_task(spec)
+        record = get_default_manager().dispatch(project_id, spec)
     except Exception as e:
-        return _format_runner_error(e)
+        return _format_dispatch_error(e)
 
-    return _format_summary(project_id, summary)
+    return _format_dispatch_placeholder(project_id, record)
 
 
 # ---------- helpers ----------
@@ -88,32 +91,24 @@ def _derive_title(task_card: str) -> str:
     return first_line or "Untitled coding task"
 
 
-def _bullets(items: list[str]) -> str:
-    return "\n".join(f"- {x}" for x in items) if items else "None"
-
-
-def _format_summary(project_id: str, summary: ResultSummary) -> str:
+def _format_dispatch_placeholder(project_id: str, record: RunRecord) -> str:
     return (
-        f"## Coding Agent Run Complete\n\n"
-        f"**Run ID:** `{summary.run_id}`\n"
-        f"**Status:** {summary.status}\n\n"
-        f"### Summary\n"
-        f"{summary.summary.strip() or '_(no summary provided)_'}\n\n"
-        f"### Files Changed\n"
-        f"{_bullets(summary.files_changed)}\n\n"
-        f"### Commands Run\n"
-        f"{_bullets(summary.commands_run)}\n\n"
-        f"### Blockers\n"
-        f"{_bullets(summary.blockers)}\n\n"
-        f"You can inspect the full result at:\n"
-        f"`/api/projects/{project_id}/execution/runs/{summary.run_id}/result`"
+        f"## Coding Agent Run Started\n\n"
+        f"**Run ID:** `{record.run_id}`\n"
+        f"**Status:** running\n"
+        f"**Task:** {record.task_title}\n\n"
+        f"The Coding Agent is working on this in the background. Open the "
+        f"**Runs** panel on the right and hit refresh to see the result when "
+        f"it's ready, or fetch:\n\n"
+        f"- `/api/projects/{project_id}/execution/runs/{record.run_id}` — run record\n"
+        f"- `/api/projects/{project_id}/execution/runs/{record.run_id}/result` — rendered result.md\n"
     )
 
 
-def _format_runner_error(exc: Exception) -> str:
+def _format_dispatch_error(exc: Exception) -> str:
     return (
-        "## Coding Agent Run Failed\n\n"
-        f"The runner raised `{type(exc).__name__}` before completing:\n\n"
+        "## Coding Agent Dispatch Failed\n\n"
+        f"The run could not be queued — `{type(exc).__name__}`:\n\n"
         f"> {exc}\n\n"
-        "No run summary is available. Check backend logs for details."
+        "No run was created. Check backend logs for details."
     )

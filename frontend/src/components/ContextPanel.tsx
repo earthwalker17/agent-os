@@ -5,11 +5,12 @@ interface Props {
   projectId: string | null
   context: ProjectContext | null
   onEditFile: (filename: string, content: string) => void
+  runsRefreshSignal?: number
 }
 
 const FILE_ORDER = ['PROJECT.md', 'STATUS.md', 'TASK_QUEUE.md', 'DECISIONS.md', 'RESEARCH.md']
 
-function ContextPanel({ projectId, context, onEditFile }: Props) {
+function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Props) {
   if (!projectId || !context) {
     return (
       <aside className="sidebar context-panel">
@@ -41,7 +42,7 @@ function ContextPanel({ projectId, context, onEditFile }: Props) {
         })}
       </div>
 
-      <RunsSection projectId={projectId} />
+      <RunsSection projectId={projectId} refreshSignal={runsRefreshSignal} />
     </aside>
   )
 }

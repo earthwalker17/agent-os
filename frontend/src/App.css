@@ -201,6 +201,40 @@ html, body, #root {
   white-space: pre-wrap;
 }
 
+/* Run-aware affordance — shown only on assistant bubbles that contain a
+   Coding Agent run id (e.g. @code placeholders). Opens RunDetailModal. */
+.chat-run-affordance-row {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+
+.chat-run-affordance {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  background: var(--bg-input);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.chat-run-affordance::before {
+  content: "↗";
+  font-size: 12px;
+  line-height: 1;
+}
+
+.chat-run-affordance:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
 /* Chat input */
 .chat-input {
   display: flex;
@@ -766,6 +800,49 @@ html, body, #root {
   align-items: center;
   justify-content: space-between;
   list-style: revert;
+}
+
+.runs-summary-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.runs-running-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6ab3ff;
+  background: rgba(106, 179, 255, 0.1);
+  border: 1px solid #2a4a7a;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+
+.runs-running-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6ab3ff;
+  box-shadow: 0 0 0 0 rgba(106, 179, 255, 0.6);
+  animation: runs-pulse 1.4s ease-out infinite;
+}
+
+@keyframes runs-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(106, 179, 255, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(106, 179, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(106, 179, 255, 0);
+  }
 }
 
 .runs-refresh-btn {

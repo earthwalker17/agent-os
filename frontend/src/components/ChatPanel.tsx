@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import type { Message } from '../types'
+import RunDetailModal from './RunDetailModal'
 
 interface Props {
   projectId: string | null
@@ -8,6 +9,12 @@ interface Props {
   onSend: (message: string) => void
   loading?: boolean
   headerLabel?: string | null
+  /**
+   * Real project id for run-detail navigation, or null when the chat is the
+   * GENERAL workspace. Distinct from `projectId` which is also used as the
+   * "is the chat open" sentinel and can be the literal string "general".
+   */
+  runProjectId?: string | null
 }
 
 /** Minimal markdown-to-HTML for orchestration responses. */
@@ -30,13 +37,38 @@ function renderMarkdown(text: string): string {
     .replace(/\n/g, '<br/>')
 }
 
-function ChatPanel({ projectId, conversationId, messages, onSend, loading, headerLabel }: Props) {
+// Backend `run_store.new_run_id()` format: YYYYMMDD-HHMMSS-XXXXXXXX (8 hex
+// chars). We pin to exactly this shape so the affordance only ever appears
+// for genuine Coding Agent placeholders, not for arbitrary backticked text
+// in normal orchestrator replies.
+const RUN_ID_RE = /\*\*Run ID:\*\*\s*`(\d{8}-\d{6}-[0-9a-f]{8})`/i
+
+function extractRunId(content: string): string | null {
+  const m = content.match(RUN_ID_RE)
+  return m ? m[1] : null
+}
+
+function ChatPanel({
+  projectId,
+  conversationId,
+  messages,
+  onSend,
+  loading,
+  headerLabel,
+  runProjectId,
+}: Props) {
   const [input, setInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [openRunId, setOpenRunId] = useState<string | null>(null)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  // If the user navigates away from a project that had a modal open, clear it.
+  useEffect(() => {
+    if (!runProjectId) setOpenRunId(null)
+  }, [runProjectId])
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -76,19 +108,35 @@ function ChatPanel({ projectId, conversationId, messages, onSend, loading, heade
         {messages.length === 0 && (
           <div className="chat-empty">No messages yet. Start the conversation.</div>
         )}
-        {messages.map((msg, i) => (
-          <div key={msg.id || i} className={`chat-message ${msg.role}`}>
-            <div className="chat-message-role">{msg.role === 'user' ? 'You' : 'Agent OS'}</div>
-            {msg.role === 'assistant' ? (
-              <div
-                className="chat-message-content orch-response"
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
-              />
-            ) : (
-              <div className="chat-message-content">{msg.content}</div>
-            )}
-          </div>
-        ))}
+        {messages.map((msg, i) => {
+          const runId =
+            msg.role === 'assistant' && runProjectId ? extractRunId(msg.content) : null
+          return (
+            <div key={msg.id || i} className={`chat-message ${msg.role}`}>
+              <div className="chat-message-role">{msg.role === 'user' ? 'You' : 'Agent OS'}</div>
+              {msg.role === 'assistant' ? (
+                <div
+                  className="chat-message-content orch-response"
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+                />
+              ) : (
+                <div className="chat-message-content">{msg.content}</div>
+              )}
+              {runId && (
+                <div className="chat-run-affordance-row">
+                  <button
+                    type="button"
+                    className="chat-run-affordance"
+                    onClick={() => setOpenRunId(runId)}
+                    title={`Open run ${runId}`}
+                  >
+                    View Run
+                  </button>
+                </div>
+              )}
+            </div>
+          )
+        })}
         {loading && (
           <div className="chat-message assistant">
             <div className="chat-message-role">Agent OS</div>
@@ -108,6 +156,13 @@ function ChatPanel({ projectId, conversationId, messages, onSend, loading, heade
         />
         <button type="submit" disabled={loading}>Send</button>
       </form>
+      {openRunId && runProjectId && (
+        <RunDetailModal
+          projectId={runProjectId}
+          runId={openRunId}
+          onClose={() => setOpenRunId(null)}
+        />
+      )}
     </main>
   )
 }

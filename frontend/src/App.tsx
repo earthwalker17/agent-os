@@ -9,6 +9,17 @@ import type { Message, Conversation, ProjectContext } from './types'
 
 const GENERAL_PROJECT_ID = '__GENERAL__'
 
+// Mirrors backend execution.chat_delegation.is_code_delegation — we use this
+// in the frontend purely to decide whether to ping the Runs panel for a fast
+// refresh after a chat send. The backend is the source of truth for actual
+// delegation routing.
+function isCodeDelegation(message: string): boolean {
+  const stripped = message.replace(/^\s+/, '')
+  if (!stripped.toLowerCase().startsWith('@code')) return false
+  const rest = stripped.slice(5)
+  return rest === '' || /^[\s:\-,]/.test(rest)
+}
+
 function App() {
   const [projects, setProjects] = useState<string[]>([])
   const [activeProject, setActiveProject] = useState<string | null>(null)
@@ -27,6 +38,10 @@ function App() {
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: () => void } | null>(null)
   const [globalMemoryModal, setGlobalMemoryModal] = useState(false)
   const [globalMemory, setGlobalMemory] = useState<Record<string, string>>({})
+
+  // Runs panel refresh trigger — bumped after the user sends an @code message
+  // so the panel reloads without waiting for the next poll tick.
+  const [runsRefreshKey, setRunsRefreshKey] = useState(0)
 
   // --- Data loading ---
 
@@ -324,6 +339,13 @@ function App() {
           await refreshContext()
         }
       }
+
+      // If this was an @code dispatch inside a project, nudge the Runs panel
+      // to refresh immediately so the new run shows up without waiting for
+      // the polling tick.
+      if (!isGeneralActive && activeProject && isCodeDelegation(message)) {
+        setRunsRefreshKey(k => k + 1)
+      }
     } catch (err) {
       console.error('Chat error:', err)
     } finally {
@@ -396,11 +418,13 @@ function App() {
         onSend={handleSend}
         loading={loading}
         headerLabel={chatLabel}
+        runProjectId={isGeneralActive ? null : activeProject}
       />
       <ContextPanel
         projectId={isGeneralActive ? null : activeProject}
         context={isGeneralActive ? null : context}
         onEditFile={handleEditFile}
+        runsRefreshSignal={runsRefreshKey}
       />
       {editModal && (
         <EditModal

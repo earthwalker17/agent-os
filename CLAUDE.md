@@ -1,186 +1,147 @@
 # CLAUDE.md
 
-## Project
-Agent OS MVP
+Operating guide for Claude Code and any other coding agent working on this
+repository. This file is intentionally short and phase-independent. For the
+current project status and roadmap, read `README.md`.
 
-## Current Phase
-**Phase 3 — Execution Layer** (Tasks 05.1 + 05.2 + 05.3 + 05.4 + 05.5 complete).
-Phases 1–2 (workspace, memory, orchestration, semantic writeback) are complete.
-Phase 3 introduces per-project execution workspaces under `execution_workspaces/{project_id}/` so a Coding Agent can be delegated work against the project's `repo/`.
-- Task 05.1 — workspace/data foundation: `repo/`, `runs/`, `logs/`, `AGENT.md`, `TASK.md`, idempotent init.
-- Task 05.2 — sandbox + tool runtime: `ProjectSandbox` and `ToolRuntime` provide bounded `list_files`, `read_file`, `write_file`, `append_file`, `search_files`, `run_shell` operations restricted to the project's `repo/` directory.
-- Task 05.3 — LLM-driven Coding Agent runner: `CodingAgentRunner` runs a bounded JSON tool loop against a `TaskSpec`, writes `task_card.md` / `events.jsonl` / `run.json` / `result.md` under `runs/{run_id}/`, and updates `TASK.md` at the end. Exposed via `POST /api/projects/{id}/execution/runs` (synchronous).
-- Task 05.4 — main-chat delegation: `/api/chat` recognizes `@code …` in project conversations as an explicit delegation trigger and hands the message off to `CodingAgentRunner`, returning a structured run summary as the assistant reply. GENERAL workspace rejects `@code` cleanly. Memory writeback is skipped for delegated turns (the runner owns `TASK.md`).
-- Task 05.5 — frontend run surface: a read-only Runs panel in the right column for project workspaces (hidden in GENERAL). Lists runs newest-first with status badges; clicking a row opens a modal with run record + rendered `result.md`. Manual refresh button. No new backend code — purely UI on top of the existing four `GET /execution/runs[…]` endpoints.
+## 1. Project Mission
 
-**All execution-layer tools must go through `ProjectSandbox` validation.** The Coding Agent runner is never allowed to call `os` / `pathlib` against repo paths, or `subprocess` directly — it must use `ToolRuntime`, which routes paths through `resolve_repo_path()` and shell commands through `validate_command()`. The chat layer must NOT call `ToolRuntime` or filesystem APIs directly either: any code-execution path from chat must go through `CodingAgentRunner` (currently via the `@code` helper in `execution/chat_delegation.py`).
+Agent OS is a lightweight **local-first project cockpit** — a small Agent
+Operating System for managing multiple long-term projects through a single
+web chat surface. It combines project-scoped conversations, structured
+markdown memory, an orchestration layer, and a bounded execution layer that
+can hand work off to a Coding Agent inside a sandboxed workspace. The goal
+is not to build a general-purpose assistant or a heavyweight agent platform;
+it is to give a single builder a clear, controllable place to plan, decide,
+and execute project work.
 
-**Still synchronous.** A `@code` turn blocks the chat request until the run finishes. There is no background queue, run-aware chat bubble, or implicit delegation intent yet — the runs panel surfaces results once they exist, but the user has to click refresh after a long `@code` turn.
+## 2. Core Architecture Principles
 
-## Mission
-Build a lightweight local-first Agent Operating System for project development.
+- **Local-first.** Filesystem + SQLite + FastAPI + React. No cloud services,
+  no queues, no external infra dependencies for the MVP.
+- **Project isolation.** Each project has its own conversations, memory
+  files, and execution workspace. Crossings are deliberate and bounded.
+- **Structured markdown memory.** Important state lives in readable,
+  editable `.md` files, not buried in chat history.
+- **Main agent = brain.** Planner / memory steward / orchestrator. Does
+  not edit code under `repo/`.
+- **Coding Agent = hands.** Bounded executor inside the project's
+  `execution_workspaces/{project_id}/repo/`. Does not edit project memory
+  or other projects' workspaces.
+- **All execution goes through `ProjectSandbox` + `ToolRuntime`.** No raw
+  `os` / `pathlib` access to repo paths, no raw `subprocess`. Every tool
+  call routes through `resolve_repo_path()` or `validate_command()`.
 
-This system is designed for a single user to build and manage multiple long-term projects through:
-- a dedicated web chat interface
-- project-scoped conversations
-- structured markdown memory
-- a central orchestration layer
-- delegated execution through coding agents and tools
-- browser-based inspection and verification
+## 3. Agent Roles
 
-The goal is not to build a general-purpose assistant, social chatbot, or a full OpenClaw replacement.
-The goal is to build a focused Project OS for AI-assisted product development workflow.
+### Main agent (orchestrator)
+**Does:**
+- Holds project conversations and produces planning / explanation /
+  recommendation responses.
+- Loads global + project memory and assembles context.
+- Decides through a separate semantic-judge call whether memory files
+  should be updated.
+- Delegates execution work to the Coding Agent (today: only via the
+  explicit `@code` trigger).
+- Consumes Coding Agent run summaries when reasoning about progress.
 
----
+**Does NOT:**
+- Edit code under any project's `repo/`.
+- Run shell commands directly.
+- Auto-inject repo contents or diffs into its context (see §6).
+- Auto-dispatch a Coding Agent run from inferred intent.
 
-## Product Positioning
-This product sits between ChatGPT, Claude Code, and OpenClaw:
+### Coding Agent (executor)
+**Does:**
+- Runs bounded JSON tool loops inside one project's execution workspace.
+- Edits files under `repo/` via `ToolRuntime` (`list_files`, `read_file`,
+  `write_file`, `append_file`, `search_files`, `run_shell`).
+- Updates the per-project `TASK.md` and produces a concise `result.md` +
+  `run.json` per run.
 
-- ChatGPT is strong at discussion, planning, and high-level product thinking, but cannot directly operate local code/runtime.
-- Claude Code is strong at execution, but not ideal as the main long-term project conversation surface.
-- OpenClaw has tool access and local agency, but is too heavy, too broad, and not optimized for project-separated development workflow.
+**Does NOT:**
+- Touch other projects' workspaces.
+- Edit project memory (`projects/{id}/*.md`) or global memory (`memory/*.md`).
+- Bypass the sandbox: no `os`, `pathlib`, or `subprocess` direct calls
+  against repo paths.
+- Run destructive shell commands (`rm -rf`, `git push --force`,
+  `git reset --hard`, etc.) without explicit confirmation.
 
-Agent OS should combine the best parts:
-- ChatGPT-like project-separated conversation
-- Claude Code-like execution power through delegation
-- OpenClaw-inspired local control, memory files, and tool orchestration
+## 4. Memory Policy
 
-But it should remain lighter, clearer, and more workflow-centered than a general-purpose agent platform.
+- **Global memory** lives in `memory/`: `USER.md`, `WORKSTYLE.md`,
+  `SOUL.md`, `MEMORY.md`.
+- **Project memory** lives in `projects/{project_id}/`: `PROJECT.md`,
+  `STATUS.md`, `TASK_QUEUE.md`, `DECISIONS.md`, `RESEARCH.md`.
+- `SOUL.md` is **read-only and hidden**. It is loaded as the identity
+  anchor on every turn and is never shown in any UI, never auto-written,
+  never included in any write path.
+- All other global / project memory files participate in **policy-filtered
+  semantic memory writeback**: after each non-delegated chat turn, a second
+  LLM call examines the latest exchange + current memory and proposes
+  structured JSON updates (`{filename, section, content, action}`). The
+  backend validates each proposal against the appropriate writable-file set
+  before touching disk.
+- Memory writes are **clean structured markdown**, not raw conversation
+  text or log dumps. Keep entries concise; this layer is meant to stay
+  readable by humans.
 
----
+## 5. Execution Policy
 
-## MVP Scope
-The MVP should support:
+- **`@code` is currently the only actual execution trigger.** A project
+  chat message prefixed with `@code ` dispatches a background Coding Agent
+  run. Nothing else dispatches runs, including the implicit-delegation
+  heuristic (see below).
+- **Implicit delegation is a rule-based MVP suggestion layer**, not a real
+  semantic delegation judge. It can flag obvious coding requests and
+  propose an `@code` task card, but it never auto-dispatches and is not
+  authoritative. The intended final design is a model-judged detector.
+- **Coding Agent runs in `execution_workspaces/{project_id}/repo/`.** Run
+  artifacts live under `execution_workspaces/{project_id}/runs/{run_id}/`
+  (`task_card.md`, `events.jsonl`, `run.json`, `result.md`).
+- **Runs are background.** Both `@code` and `POST /api/projects/{id}/execution/runs`
+  return an initial `RunRecord` (status=`running`) immediately; finalization
+  happens in a worker thread. Crashes promote to `failed` with the error
+  captured as a blocker.
+- **Main agent sees run summaries by default.** Not full repo contents,
+  not full diffs, not raw event logs.
 
-1. Multi-project workspace
-   - separate projects
-   - isolated chat context
-   - clear project switching
+## 6. Context Hygiene
 
-2. Explicit memory system
-   - global memory files
-   - project memory files
-   - readable and editable markdown state
+- **Do NOT auto-inject repo contents or code diffs into the main agent's
+  context.** That would blow up token budgets and conflate project
+  knowledge with implementation detail.
+- The main agent's default view of a run is the compact metadata:
+  `status`, `task_title`, `summary`, `files_changed`, `commands_run`,
+  `blockers`, plus the rendered `result.md`.
+- Reading specific changed files into context is **on-demand only**,
+  driven by a concrete reason: reviewing a change, debugging a regression,
+  or answering a user question about a specific file. Use the existing
+  `ToolRuntime.read_file` / `list_files` / `search_files`; do not invent
+  new filesystem paths.
+- Keep crossings between "summaries + memory" (main agent) and "files in
+  `repo/`" (Coding Agent) deliberate and bounded.
 
-3. Orchestration layer
-   - understand user intent in project context
-   - load memory and current state
-   - produce structured guidance and next steps
-   - prepare work for execution agents
+## 7. Working Style for Claude Code
 
-4. Delegated execution flow
-   - hand off coding work to external execution agents or tools
-   - receive concise result summaries
-   - avoid unnecessary low-level context pollution
-
-5. Verification loop
-   - inspect outputs through browser testing, tool feedback, or state checks
-   - help determine whether work is actually done
-
----
-
-## Non-Goals
-For the MVP, do not optimize for:
-- multi-user collaboration
-- cloud deployment
-- social/chat platform integrations
-- autonomous always-on background behavior
-- plugin ecosystems
-- heavy visual polish
-- large-scale infrastructure
-
-This is a local-first, workflow-first system for one builder.
-
----
-
-## Core Principles
-
-### 1. Workflow-first
-The system exists to move projects forward.
-
-### 2. Project isolation
-Each project should have distinct chat, memory, and state.
-
-### 3. Explicit memory
-Important project state should live in readable files, not only hidden chat history.
-
-### 4. Thin orchestration
-Keep the central agent layer clear and lightweight.
-Do not overbuild speculative architecture.
-
-### 5. Delegated execution
-The main agent should coordinate execution, not become a monolithic coding worker.
-
-### 6. Verifiable progress
-The system should prefer inspected results over assumed success.
-
-### 7. Local control
-Prefer simple, debuggable, local-first architecture.
-
----
-
-## Memory Rules
-
-### Global memory
-- `USER.md` → who the user is
-- `WORKSTYLE.md` → collaboration preferences
-- `SOUL.md` → primary agent identity and operating philosophy
-- `MEMORY.md` → cross-project persistent notes
-
-### Project memory
-- `PROJECT.md` → project definition
-- `STATUS.md` → current state and milestone
-- `TASK_QUEUE.md` → next actions
-- `DECISIONS.md` → important choices and rationale
-- `RESEARCH.md` → external findings and technical notes
-
-Memory should remain readable, editable, and operationally useful.
-
-### Execution workspace (Phase 3)
-Per-project Coding Agent workspaces live at `execution_workspaces/{project_id}/`:
-
-- `repo/` — working code tree the Coding Agent edits (no other agent edits here)
-- `runs/` — per-run artifacts
-- `logs/` — per-run logs
-- `AGENT.md` — agent identity, principles, safe-operating rules (project-owned, never auto-overwritten)
-- `TASK.md` — current objective, queue, in-progress, completed, files changed, commands run, blockers, result summary
-
-The main orchestrator does NOT edit code under `repo/`. It delegates to the Coding Agent via the workspace.
-
----
-
-## Recommended Stack
-- Frontend: React + Vite + TypeScript
-- Backend: Python + FastAPI
-- Storage: local filesystem first, SQLite only when needed
-- Communication: simple HTTP first
-
----
-
-## Coding Standards
-- keep code clear and modular
-- prefer explicitness over abstraction
-- avoid premature complexity
-- make file and API boundaries easy to understand
-- write code that supports future delegation and verification flows
-
----
-
-## UI Expectations
-Main layout:
-- left: project list
-- center: chat / orchestration surface
-- right: project memory / state panel
-
-The UI should feel like a practical internal tool for project operation.
-
----
-
-## What to Optimize For
-When working in this repository, prioritize:
-- clarity
-- continuity
-- controllability
-- readable shared state
-- low-friction local usage
-- smooth path toward delegated execution and verification
+- **Make small bounded changes.** Touch the files the task names; don't
+  fan out into unrelated refactors. If a refactor would help, propose it
+  separately.
+- **Preserve existing behavior unless asked.** No silent renames, no
+  surprise API changes, no "while I was in there" cleanup of unrelated
+  modules.
+- **Update `README.md` when project state changes.** Current status, new
+  features, new constraints, and roadmap shifts belong there. Do NOT
+  duplicate that progress into `CLAUDE.md` — this file is the stable
+  operating guide.
+- **Summarize changed files and verification steps** at the end of every
+  task. Mention what you ran (typecheck, build, smoke test) and what you
+  did not run.
+- **Prefer simple local-first solutions.** ThreadPoolExecutor over Celery,
+  SQLite over Postgres, polling over SSE — until there is a concrete
+  reason to swap. Don't introduce dependencies you don't need.
+- **Match the existing style and structure** of the file you're editing.
+  Match indentation, import order, naming conventions, and comment density.
+- **Follow §3, §4, §5, §6** without exception. The sandbox boundary,
+  memory policy, and context hygiene rules are constitutional, not
+  negotiable per task.

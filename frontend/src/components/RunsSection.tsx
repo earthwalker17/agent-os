@@ -4,7 +4,15 @@ import RunDetailModal from './RunDetailModal'
 
 interface Props {
   projectId: string
+  /**
+   * Increment this from a parent to force a one-shot reload (e.g. after the
+   * user sends an `@code` chat message). Re-renders that change projectId or
+   * the manual refresh button already trigger their own reloads.
+   */
+  refreshSignal?: number
 }
+
+const POLL_INTERVAL_MS = 2000
 
 function formatTime(iso: string | undefined | null): string {
   if (!iso) return ''
@@ -15,7 +23,7 @@ function formatTime(iso: string | undefined | null): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-function RunsSection({ projectId }: Props) {
+function RunsSection({ projectId, refreshSignal }: Props) {
   const [runs, setRuns] = useState<RunRecord[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -46,14 +54,40 @@ function RunsSection({ projectId }: Props) {
     }
   }, [projectId])
 
+  // Initial load + reload on project switch + manual refresh signal.
   useEffect(() => {
     loadRuns()
-  }, [loadRuns])
+  }, [loadRuns, refreshSignal])
+
+  // Auto-poll while any run is in `running` state. The effect re-binds only
+  // when the *presence* of running runs flips, not on every fetch tick, so
+  // the interval keeps a steady cadence.
+  const runningCount = runs.filter((r) => r.status === 'running').length
+  const hasRunning = runningCount > 0
+
+  useEffect(() => {
+    if (!hasRunning) return
+    const id = window.setInterval(() => {
+      loadRuns()
+    }, POLL_INTERVAL_MS)
+    return () => window.clearInterval(id)
+  }, [hasRunning, loadRuns])
 
   return (
     <details className="runs-section" open>
       <summary>
-        <span>Runs</span>
+        <span className="runs-summary-left">
+          <span>Runs</span>
+          {hasRunning && (
+            <span
+              className="runs-running-indicator"
+              title={`${runningCount} run${runningCount === 1 ? '' : 's'} in progress — auto-refreshing every ${POLL_INTERVAL_MS / 1000}s`}
+            >
+              <span className="runs-running-dot" />
+              {runningCount} running
+            </span>
+          )}
+        </span>
         <button
           type="button"
           className="runs-refresh-btn"

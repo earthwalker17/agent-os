@@ -78,24 +78,56 @@ class CodingAgentRunner:
         self.runtime = ToolRuntime(project_id)
         self.model = model  # None -> let llm.chat use its default
 
-    def run_task(self, task: TaskSpec) -> ResultSummary:
+    def run_task(self, task: TaskSpec, run_id: str | None = None) -> ResultSummary:
+        """Execute the Coding Agent loop and finalize artifacts.
+
+        If `run_id` is provided, the caller (e.g. BackgroundRunManager) is
+        expected to have already created the run directory, task_card.md, and
+        an initial run.json with status=running. The runner reuses that record
+        instead of allocating a new one. Otherwise the runner does the
+        allocation itself (stand-alone synchronous path).
+        """
         ws = get_execution_workspace(self.project_id)
         if ws is None:
             raise FileNotFoundError(
                 f"Execution workspace not initialized for project {self.project_id!r}"
             )
 
-        run_id = run_store.new_run_id()
-        run_store.init_run_dir(self.project_id, run_id)
-        run_store.write_task_card(self.project_id, run_id, task.title, task.task_card)
+        if run_id is None:
+            run_id = run_store.new_run_id()
+            run_store.init_run_dir(self.project_id, run_id)
+            run_store.write_task_card(self.project_id, run_id, task.title, task.task_card)
+            record = RunRecord(
+                run_id=run_id,
+                project_id=self.project_id,
+                task_title=task.title,
+                status=RunStatus.RUNNING,
+            )
+            run_store.write_run_json(self.project_id, run_id, record)
+        else:
+            existing = run_store.read_run_json(self.project_id, run_id)
+            if existing is not None:
+                try:
+                    record = RunRecord(**existing)
+                except Exception:
+                    record = RunRecord(
+                        run_id=run_id,
+                        project_id=self.project_id,
+                        task_title=task.title,
+                        status=RunStatus.RUNNING,
+                    )
+                    run_store.write_run_json(self.project_id, run_id, record)
+            else:
+                record = RunRecord(
+                    run_id=run_id,
+                    project_id=self.project_id,
+                    task_title=task.title,
+                    status=RunStatus.RUNNING,
+                )
+                run_store.init_run_dir(self.project_id, run_id)
+                run_store.write_task_card(self.project_id, run_id, task.title, task.task_card)
+                run_store.write_run_json(self.project_id, run_id, record)
 
-        record = RunRecord(
-            run_id=run_id,
-            project_id=self.project_id,
-            task_title=task.title,
-            status=RunStatus.RUNNING,
-        )
-        run_store.write_run_json(self.project_id, run_id, record)
         run_store.append_event(
             self.project_id,
             run_id,
