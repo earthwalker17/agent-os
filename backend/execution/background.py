@@ -31,6 +31,7 @@ from threading import Lock
 
 from . import run_store
 from .manager import get_execution_workspace
+from .memory_reconciliation import reconcile_run_memory
 from .models import RunRecord, RunStatus, TaskSpec
 from .runner import CodingAgentRunner
 
@@ -165,6 +166,16 @@ class BackgroundRunManager:
         notes = f"{type(exc).__name__}: {exc}"
         result_md = run_store.render_result_md(record, summary, notes=notes)
         run_store.write_result_md(project_id, run_id, result_md)
+
+        # Task 06.0 — give the reconciler a chance to record this crash as a
+        # DECISIONS.md note if the blocker is informative enough. Skip rules
+        # will route a generic crash to ``skipped_failed_noisy`` — that's the
+        # expected outcome here. Reconciliation is best-effort and cannot
+        # affect the failed run state.
+        try:
+            reconcile_run_memory(project_id, run_id, summary_override=summary)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------- module-level singleton ----------

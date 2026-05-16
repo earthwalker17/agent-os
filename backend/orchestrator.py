@@ -19,10 +19,18 @@ import json
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from llm import chat as llm_chat
 
 log = logging.getLogger(__name__)
+
+
+# Task 06.1 — bounded on-demand file inspection.
+# The orchestrator gives the LLM an "inspect_request" channel when the
+# project has an execution workspace. The loop caps the number of
+# inspections per turn so a runaway model can't dump the repo into context.
+MAX_INSPECTIONS_PER_TURN = 3
 
 MEMORY_DIR = Path(__file__).resolve().parent.parent / "memory"
 PROJECTS_DIR = Path(__file__).resolve().parent.parent / "projects"
@@ -126,7 +134,7 @@ def load_memory(project_id: str, history: list[dict] | None = None) -> MemoryCon
 # Context assembly — builds system prompt + messages for the LLM
 # ---------------------------------------------------------------------------
 
-def _build_system_prompt(ctx: MemoryContext) -> str:
+def _build_system_prompt(ctx: MemoryContext, *, inspection_enabled: bool = False) -> str:
     """
     Assemble the system prompt from memory context.
 
@@ -135,6 +143,8 @@ def _build_system_prompt(ctx: MemoryContext) -> str:
       2. Global memory — user profile, workstyle, cross-project notes
       3. Project memory — all project files
       4. Behavioral rules for memory and honesty
+      5. (optional) File inspection channel — only when ``inspection_enabled``
+         is True (project has an execution workspace and is not GENERAL)
     """
     sections: list[str] = []
 
@@ -205,6 +215,12 @@ def _build_system_prompt(ctx: MemoryContext) -> str:
         "SOUL.md is read-only. It defines your identity. Never suggest modifying it."
     )
 
+    if inspection_enabled:
+        # Imported lazily to avoid pulling execution-layer code into GENERAL
+        # chats or callers that don't need inspection.
+        from execution.inspect import inspect_system_prompt_section
+        sections.append("---\n\n# Available Channels\n\n" + inspect_system_prompt_section())
+
     return "\n\n".join(sections)
 
 
@@ -242,18 +258,121 @@ def _build_messages(ctx: MemoryContext, current_message: str) -> list[dict]:
 # Main orchestration entry point
 # ---------------------------------------------------------------------------
 
-def orchestrate(project_id: str, message: str, history: list[dict] | None = None) -> str:
+def orchestrate(
+    project_id: str,
+    message: str,
+    history: list[dict] | None = None,
+    *,
+    llm_caller: Optional[Callable] = None,
+) -> tuple[str, list[dict]]:
     """
     Main orchestration entry point.
 
-    Loads memory, assembles context, calls the LLM, and returns the response.
-    SOUL.md is always loaded as the system-level identity anchor.
+    Loads memory, assembles context, runs a bounded chat-with-inspection loop,
+    and returns ``(text_response, inspected_files)``. SOUL.md is always loaded
+    as the system-level identity anchor.
+
+    The inspection loop is enabled only for non-GENERAL projects that have
+    an initialized execution workspace. Inside the loop the LLM may emit
+    ``{"inspect_request": {...}}`` JSON to read a file from ``repo/`` via
+    the sandboxed inspect API. The loop caps at
+    ``MAX_INSPECTIONS_PER_TURN`` so a runaway model cannot dump the repo
+    into chat context.
+
+    For GENERAL chats or projects without an execution workspace, behavior
+    is unchanged: a single LLM call producing text, with
+    ``inspected_files == []``.
+
+    ``llm_caller`` is an optional injection seam for tests; the default is
+    the live LLM.
     """
     ctx = load_memory(project_id, history=history)
-    system_prompt = _build_system_prompt(ctx)
-    messages = _build_messages(ctx, message)
+    inspection_enabled = _inspection_enabled_for(project_id)
+    caller = llm_caller or llm_chat
 
-    return llm_chat(system=system_prompt, messages=messages)
+    if not inspection_enabled:
+        system_prompt = _build_system_prompt(ctx, inspection_enabled=False)
+        messages = _build_messages(ctx, message)
+        text = caller(system=system_prompt, messages=messages)
+        return text, []
+
+    # ---- bounded inspection loop ----
+    # Imported here to keep the GENERAL/no-workspace path free of execution
+    # imports.
+    from execution.inspect import (
+        execute_inspect_request,
+        format_result_for_llm,
+        parse_inspect_request,
+    )
+
+    base_system_prompt = _build_system_prompt(ctx, inspection_enabled=True)
+    messages = _build_messages(ctx, message)
+    inspected_files: list[dict] = []
+
+    for step in range(MAX_INSPECTIONS_PER_TURN + 1):
+        # On the final allowed iteration, force a text answer by dropping the
+        # inspection guidance from the system prompt. This is what we hand
+        # the model after it has exhausted the inspection budget.
+        force_text = step == MAX_INSPECTIONS_PER_TURN
+        system_prompt = (
+            _build_system_prompt(ctx, inspection_enabled=False)
+            if force_text
+            else base_system_prompt
+        )
+
+        raw = caller(system=system_prompt, messages=messages)
+        if force_text:
+            return raw, inspected_files
+
+        request = parse_inspect_request(raw)
+        if request is None:
+            # Plain text answer — done.
+            return raw, inspected_files
+
+        # Run the inspection, record it, feed the result back into the
+        # transcript, and let the model decide whether to keep inspecting or
+        # answer.
+        result = execute_inspect_request(project_id, request)
+        inspected_files.append({
+            "tool": result.kind,
+            "path": result.path,
+            "query": result.query,
+            "ok": result.ok,
+            "truncated": result.truncated,
+            "error": result.error or None,
+        })
+
+        # Persist the model's request and the inspection result in the
+        # transcript so it can build on what it just learned.
+        messages.append({"role": "assistant", "content": raw})
+        messages.append({
+            "role": "user",
+            "content": format_result_for_llm(result),
+        })
+
+    # The for-loop returns once it hits ``force_text``; this line is
+    # unreachable but kept defensively.
+    return "", inspected_files
+
+
+def _inspection_enabled_for(project_id: str) -> bool:
+    """Return True iff the project has an initialized execution workspace.
+
+    GENERAL has no execution workspace by definition. Other projects only
+    qualify once ``/api/projects/{id}/execution/init`` has been run.
+    """
+    if project_id == GENERAL_PROJECT_ID:
+        return False
+    # Lazy import — orchestrator must not import execution at module load
+    # time (avoids any chance of a circular import).
+    try:
+        from execution import get_execution_workspace
+    except Exception:  # pragma: no cover - defensive
+        return False
+    try:
+        return get_execution_workspace(project_id) is not None
+    except Exception:  # pragma: no cover - defensive
+        return False
 
 
 # ---------------------------------------------------------------------------

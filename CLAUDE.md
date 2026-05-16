@@ -2,7 +2,8 @@
 
 Operating guide for Claude Code and any other coding agent working on this
 repository. This file is intentionally short and phase-independent. For the
-current project status and roadmap, read `README.md`.
+current project status, task log, and roadmap, read `ROADMAP.md`. The public
+README is deliberately kept brief and should not be used as a status file.
 
 ## 1. Project Mission
 
@@ -88,14 +89,31 @@ and execute project work.
 
 ## 5. Execution Policy
 
-- **`@code` is currently the only actual execution trigger.** A project
-  chat message prefixed with `@code ` dispatches a background Coding Agent
-  run. Nothing else dispatches runs, including the implicit-delegation
-  heuristic (see below).
-- **Implicit delegation is a rule-based MVP suggestion layer**, not a real
-  semantic delegation judge. It can flag obvious coding requests and
-  propose an `@code` task card, but it never auto-dispatches and is not
-  authoritative. The intended final design is a model-judged detector.
+- **Two trigger paths actually start a Coding Agent run, both explicit.**
+  (a) `@code <task>` in a project chat dispatches a run immediately.
+  (b) An inferred-intent **pending execution plan** dispatches only when
+  the user clicks "OK, run this" on the chat bubble — which calls
+  `POST /api/projects/{id}/execution/pending/{pid}/confirm` and routes
+  through the same `BackgroundRunManager.dispatch()` as `@code`.
+  Nothing else dispatches runs.
+- **Implicit delegation is model-judged.** Each non-`@code` project-chat
+  message goes through `judge_delegation()` — a small Claude call that
+  classifies the message into `dispatch_suggested` / `discussion` /
+  `memory_only` using recent conversation + a compact project-memory
+  snapshot. A `dispatch_suggested` decision creates a `pending_executions`
+  row holding the display plan + full task card; the assistant message
+  is a project-manager-tone summary with **OK, run this** / **Revise
+  plan** buttons. **No auto-dispatch ever occurs from inferred intent.**
+- **Revising a pending plan** runs a separate small LLM call that
+  rewrites display_plan + task_card in place (status stays `pending`);
+  the user must still click OK to dispatch. Revision failures fall back
+  to appending the instruction verbatim; revising a dispatched plan is
+  rejected.
+- **Heuristic fallback.** The 05.8 rule-based detector
+  (`delegation_intent.py`) remains as a safe fallback. If the judge call
+  fails (network, malformed JSON, invalid decision value), the chat
+  endpoint falls back to the heuristic — never blocks chat, never
+  triggers execution.
 - **Coding Agent runs in `execution_workspaces/{project_id}/repo/`.** Run
   artifacts live under `execution_workspaces/{project_id}/runs/{run_id}/`
   (`task_card.md`, `events.jsonl`, `run.json`, `result.md`).
@@ -105,6 +123,14 @@ and execute project work.
   captured as a blocker.
 - **Main agent sees run summaries by default.** Not full repo contents,
   not full diffs, not raw event logs.
+- **Post-run memory reconciliation is bounded.** When a run reaches a
+  terminal state (`completed` / `partial` / `blocked` / `failed`), a
+  small model-judged call may update `STATUS.md` / `TASK_QUEUE.md` /
+  `DECISIONS.md` / `RESEARCH.md` from the compact `ResultSummary` +
+  rendered `result.md`. `PROJECT.md`, global memory, `SOUL.md`, and repo
+  files are out of scope. Read-only inspection runs and noisy failures
+  skip the LLM call. Each run reconciles at most once.
+  Reconciliation failure NEVER fails the run.
 
 ## 6. Context Hygiene
 
@@ -116,9 +142,13 @@ and execute project work.
   `blockers`, plus the rendered `result.md`.
 - Reading specific changed files into context is **on-demand only**,
   driven by a concrete reason: reviewing a change, debugging a regression,
-  or answering a user question about a specific file. Use the existing
-  `ToolRuntime.read_file` / `list_files` / `search_files`; do not invent
-  new filesystem paths.
+  or answering a user question about a specific file. Use the bounded
+  `execution.inspect` API (`list_repo_files` / `read_repo_file` /
+  `search_repo_files`) — read-only wrappers over `ToolRuntime` with
+  tighter caps for chat context. Do not invent new filesystem paths.
+  The orchestrator's chat loop already opens this channel to the main
+  agent through `{"inspect_request": {...}}` JSON (max 3 inspections per
+  turn).
 - Keep crossings between "summaries + memory" (main agent) and "files in
   `repo/`" (Coding Agent) deliberate and bounded.
 
@@ -130,9 +160,10 @@ and execute project work.
 - **Preserve existing behavior unless asked.** No silent renames, no
   surprise API changes, no "while I was in there" cleanup of unrelated
   modules.
-- **Update `README.md` when project state changes.** Current status, new
-  features, new constraints, and roadmap shifts belong there. Do NOT
-  duplicate that progress into `CLAUDE.md` — this file is the stable
+- **Update `ROADMAP.md` when project state changes.** Detailed task
+  status, new constraints, and roadmap shifts belong there. The public
+  `README.md` only needs a short bump if the change is user-visible.
+  Do NOT duplicate progress into `CLAUDE.md` — this file is the stable
   operating guide.
 - **Summarize changed files and verification steps** at the end of every
   task. Mention what you ran (typecheck, build, smoke test) and what you

@@ -3,6 +3,26 @@ export interface Message {
   role: 'user' | 'assistant'
   content: string
   timestamp: string
+  /** Arbitrary backend-provided metadata (Task 05.9.5: pending_execution_id). */
+  metadata?: Record<string, unknown> | null
+  /** Hydrated pending-execution state attached client-side after fetch. */
+  pending_execution?: PendingExecution | null
+}
+
+export type PendingExecutionStatus = 'pending' | 'dispatched' | 'cancelled'
+
+export interface PendingExecution {
+  pending_execution_id: string
+  project_id: string
+  conversation_id: string
+  title: string
+  display_plan: string
+  task_card: string
+  status: PendingExecutionStatus
+  run_id?: string | null
+  revision_count: number
+  created_at: string
+  updated_at: string
 }
 
 export interface Conversation {

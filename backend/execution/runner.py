@@ -31,6 +31,7 @@ import llm
 
 from .manager import get_execution_workspace, read_task_state, update_task_state
 from .models import RunRecord, RunStatus, ResultSummary, TaskSpec
+from .memory_reconciliation import reconcile_run_memory
 from .prompts import (
     build_correction_prompt,
     build_initial_user_prompt,
@@ -384,6 +385,21 @@ class CodingAgentRunner:
         result_md = run_store.render_result_md(record, summary, notes=notes)
         run_store.write_result_md(self.project_id, run_id, result_md)
         result_path = str(run_store.get_run_dir(self.project_id, run_id) / "result.md")
+
+        # Task 06.0 — bounded post-run memory reconciliation. Best-effort:
+        # any failure here is captured into run.json's reconciliation fields
+        # and swallowed so the run itself still finalizes cleanly.
+        try:
+            reconcile_run_memory(
+                self.project_id,
+                run_id,
+                summary_override=summary,
+            )
+        except Exception:  # noqa: BLE001
+            # `reconcile_run_memory` already swallows its own exceptions; this
+            # extra guard exists only to absolutely guarantee the runner never
+            # leaks a reconciliation failure to its callers.
+            pass
 
         return ResultSummary(
             run_id=run_id,

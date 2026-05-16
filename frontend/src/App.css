@@ -235,6 +235,124 @@ html, body, #root {
   color: #fff;
 }
 
+/* Pending execution plan actions (Task 05.9.5) — confirmable Coding Agent
+   plan rendered under an assistant message. */
+.pending-execution-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.pending-confirm-btn,
+.pending-revise-btn,
+.pending-inspect-btn {
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.pending-confirm-btn {
+  background: var(--accent);
+  color: #fff;
+  border: 1px solid var(--accent);
+}
+
+.pending-confirm-btn:hover:not(:disabled) {
+  background: #d63a52;
+  border-color: #d63a52;
+}
+
+.pending-revise-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.pending-revise-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: #fff;
+}
+
+.pending-inspect-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.pending-inspect-btn:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.pending-confirm-btn:disabled,
+.pending-revise-btn:disabled,
+.pending-inspect-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pending-revising-hint {
+  margin-top: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-left: 2px solid var(--accent);
+  background: rgba(233, 69, 96, 0.05);
+}
+
+.pending-task-card {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+  font-size: 12px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+/* Revise-mode banner above the chat input — tells the user the next send
+   will revise a pending plan, not create a new turn. */
+.revise-mode-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 20px;
+  background: rgba(233, 69, 96, 0.08);
+  border-top: 1px solid var(--accent);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.revise-mode-banner strong {
+  color: var(--accent);
+}
+
+.revise-mode-cancel {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.revise-mode-cancel:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
 /* Chat input */
 .chat-input {
   display: flex;

@@ -5,7 +5,7 @@ import ContextPanel from './components/ContextPanel'
 import EditModal from './components/EditModal'
 import ConfirmDialog from './components/ConfirmDialog'
 import GlobalMemoryModal from './components/GlobalMemoryModal'
-import type { Message, Conversation, ProjectContext } from './types'
+import type { Message, Conversation, ProjectContext, PendingExecution } from './types'
 
 const GENERAL_PROJECT_ID = '__GENERAL__'
 
@@ -42,6 +42,13 @@ function App() {
   // Runs panel refresh trigger — bumped after the user sends an @code message
   // so the panel reloads without waiting for the next poll tick.
   const [runsRefreshKey, setRunsRefreshKey] = useState(0)
+
+  // Task 05.9.5: pending-execution revise mode. When the user clicks
+  // "Revise plan" on a confirmable plan, we remember which pending id the
+  // next chat send is revising. Cleared after the next send completes or
+  // when the user cancels.
+  const [revisingPendingId, setRevisingPendingId] = useState<string | null>(null)
+  const [revisingPendingTitle, setRevisingPendingTitle] = useState<string | null>(null)
 
   // --- Data loading ---
 
@@ -111,13 +118,64 @@ function App() {
     else setContext(null)
   }, [activeProject, refreshContext])
 
+  // Switching conversations clears any in-progress revise mode — the
+  // pending plan it was targeting belongs to a different conversation.
+  useEffect(() => {
+    setRevisingPendingId(null)
+    setRevisingPendingTitle(null)
+  }, [activeConversation])
+
+  // Hydrate pending-execution state for messages that carry a
+  // pending_execution_id in their metadata (Task 05.9.5). On page reload
+  // the message list returns metadata only, so we fetch the live state of
+  // each referenced pending row in parallel and attach it for rendering.
+  const hydratePendingForMessages = useCallback(
+    async (msgs: Message[], projectIdForFetch: string | null): Promise<Message[]> => {
+      if (!projectIdForFetch || projectIdForFetch === 'general') return msgs
+      const targets = msgs
+        .map((m, idx) => ({ idx, pid: (m.metadata as { pending_execution_id?: string } | null | undefined)?.pending_execution_id }))
+        .filter((t): t is { idx: number; pid: string } => typeof t.pid === 'string')
+      if (targets.length === 0) return msgs
+      const results = await Promise.all(
+        targets.map(async (t) => {
+          try {
+            const res = await fetch(
+              `/api/projects/${projectIdForFetch}/execution/pending/${t.pid}`,
+            )
+            if (!res.ok) return { idx: t.idx, plan: null as PendingExecution | null }
+            const plan: PendingExecution = await res.json()
+            return { idx: t.idx, plan }
+          } catch {
+            return { idx: t.idx, plan: null }
+          }
+        }),
+      )
+      const hydrated = msgs.slice()
+      for (const { idx, plan } of results) {
+        hydrated[idx] = { ...hydrated[idx], pending_execution: plan }
+      }
+      return hydrated
+    },
+    [],
+  )
+
   useEffect(() => {
     if (!activeConversation) { setMessages([]); return }
+    let cancelled = false
     fetch(`/api/conversations/${activeConversation}/messages`)
       .then(res => res.json())
-      .then(setMessages)
+      .then(async (msgs: Message[]) => {
+        if (cancelled) return
+        // Pending plans only exist in real projects, never GENERAL. Use the
+        // owning project id from the active project state so the fetch
+        // routes to the right namespace.
+        const projectIdForFetch = isGeneralActive ? null : activeProject
+        const hydrated = await hydratePendingForMessages(msgs, projectIdForFetch)
+        if (!cancelled) setMessages(hydrated)
+      })
       .catch(console.error)
-  }, [activeConversation])
+    return () => { cancelled = true }
+  }, [activeConversation, activeProject, isGeneralActive, hydratePendingForMessages])
 
   const loadGlobalMemory = useCallback(async () => {
     try {
@@ -306,6 +364,15 @@ function App() {
   const handleSend = useCallback(async (message: string) => {
     if (!activeConversation) return
 
+    // Snapshot revise-mode at the start of the send; clear it eagerly so the
+    // banner disappears immediately on submit. We restore on error so the
+    // user can retry without re-clicking "Revise plan".
+    const revisingId = revisingPendingId
+    if (revisingId) {
+      setRevisingPendingId(null)
+      setRevisingPendingTitle(null)
+    }
+
     const userMsg: Message = {
       role: 'user',
       content: message,
@@ -315,13 +382,39 @@ function App() {
     setLoading(true)
 
     try {
+      const body: { conversation_id: string; message: string; revise_pending_id?: string } = {
+        conversation_id: activeConversation,
+        message,
+      }
+      if (revisingId) body.revise_pending_id = revisingId
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversation_id: activeConversation, message }),
+        body: JSON.stringify(body),
       })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        // Restore revise mode so the user can edit and retry.
+        if (revisingId) {
+          setRevisingPendingId(revisingId)
+          setRevisingPendingTitle(revisingPendingTitle)
+        }
+        alert(err.detail || 'Chat request failed')
+        return
+      }
       const data = await res.json()
-      setMessages(prev => [...prev, { role: data.role, content: data.content, timestamp: data.timestamp }])
+      const newMsg: Message = {
+        id: data.message_id ?? undefined,
+        role: data.role,
+        content: data.content,
+        timestamp: data.timestamp,
+        pending_execution: data.pending_execution ?? null,
+        metadata: data.pending_execution
+          ? { pending_execution_id: data.pending_execution.pending_execution_id }
+          : null,
+      }
+      setMessages(prev => [...prev, newMsg])
 
       // Refresh conversation list for title update
       if (isGeneralActive) {
@@ -348,10 +441,56 @@ function App() {
       }
     } catch (err) {
       console.error('Chat error:', err)
+      if (revisingId) {
+        setRevisingPendingId(revisingId)
+        setRevisingPendingTitle(revisingPendingTitle)
+      }
     } finally {
       setLoading(false)
     }
-  }, [activeConversation, activeProject, isGeneralActive, loadConversations, loadGeneralConversations, refreshContext, loadGlobalMemory])
+  }, [activeConversation, activeProject, isGeneralActive, loadConversations, loadGeneralConversations, refreshContext, loadGlobalMemory, revisingPendingId, revisingPendingTitle])
+
+  // Task 05.9.5: confirm a pending execution plan. Dispatches the stored
+  // task card through the same path as `@code`, marks the pending row as
+  // dispatched, and appends a confirmation chat message. We re-load the
+  // conversation messages so the new assistant message shows up, and
+  // re-hydrate the existing pending bubble so its buttons disappear.
+  const handleConfirmPending = useCallback(async (pendingId: string) => {
+    if (!activeProject || isGeneralActive) return
+    try {
+      const res = await fetch(
+        `/api/projects/${activeProject}/execution/pending/${pendingId}/confirm`,
+        { method: 'POST' },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        alert(err.detail || 'Failed to dispatch the run.')
+        return
+      }
+      // Refresh messages (new confirmation bubble + updated pending status)
+      if (activeConversation) {
+        const msgsRes = await fetch(`/api/conversations/${activeConversation}/messages`)
+        const msgs: Message[] = await msgsRes.json()
+        const hydrated = await hydratePendingForMessages(msgs, activeProject)
+        setMessages(hydrated)
+      }
+      // Refresh Runs panel immediately.
+      setRunsRefreshKey(k => k + 1)
+    } catch (err) {
+      console.error('Confirm pending plan error:', err)
+      alert('Failed to dispatch the run — see console for details.')
+    }
+  }, [activeProject, activeConversation, isGeneralActive, hydratePendingForMessages])
+
+  const handleRevisePending = useCallback((pending: PendingExecution) => {
+    setRevisingPendingId(pending.pending_execution_id)
+    setRevisingPendingTitle(pending.title || 'Pending plan')
+  }, [])
+
+  const handleCancelRevise = useCallback(() => {
+    setRevisingPendingId(null)
+    setRevisingPendingTitle(null)
+  }, [])
 
   // --- Memory file editing ---
 
@@ -419,6 +558,11 @@ function App() {
         loading={loading}
         headerLabel={chatLabel}
         runProjectId={isGeneralActive ? null : activeProject}
+        onConfirmPending={handleConfirmPending}
+        onRevisePending={handleRevisePending}
+        revisingPendingId={revisingPendingId}
+        revisingPendingTitle={revisingPendingTitle}
+        onCancelRevise={handleCancelRevise}
       />
       <ContextPanel
         projectId={isGeneralActive ? null : activeProject}

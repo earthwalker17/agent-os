@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import type { Message } from '../types'
+import type { Message, PendingExecution } from '../types'
 import RunDetailModal from './RunDetailModal'
 
 interface Props {
@@ -15,6 +15,16 @@ interface Props {
    * "is the chat open" sentinel and can be the literal string "general".
    */
   runProjectId?: string | null
+  /** Confirm a pending execution plan — dispatches the stored task card. */
+  onConfirmPending?: (pendingExecutionId: string) => void
+  /** Enter "revise mode" for a pending plan; next chat send revises it. */
+  onRevisePending?: (pending: PendingExecution) => void
+  /** Currently active revise-mode target (null = no pending revision). */
+  revisingPendingId?: string | null
+  /** Human-readable title for the plan being revised; used in the banner. */
+  revisingPendingTitle?: string | null
+  /** Drop out of revise mode without sending. */
+  onCancelRevise?: () => void
 }
 
 /** Minimal markdown-to-HTML for orchestration responses. */
@@ -56,10 +66,17 @@ function ChatPanel({
   loading,
   headerLabel,
   runProjectId,
+  onConfirmPending,
+  onRevisePending,
+  revisingPendingId,
+  revisingPendingTitle,
+  onCancelRevise,
 }: Props) {
   const [input, setInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
   const [openRunId, setOpenRunId] = useState<string | null>(null)
+  const [showTaskCardFor, setShowTaskCardFor] = useState<string | null>(null)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -69,6 +86,12 @@ function ChatPanel({
   useEffect(() => {
     if (!runProjectId) setOpenRunId(null)
   }, [runProjectId])
+
+  // When the user enters revise mode, focus the input so they can start
+  // typing the revision instructions immediately.
+  useEffect(() => {
+    if (revisingPendingId) inputRef.current?.focus()
+  }, [revisingPendingId])
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -111,6 +134,13 @@ function ChatPanel({
         {messages.map((msg, i) => {
           const runId =
             msg.role === 'assistant' && runProjectId ? extractRunId(msg.content) : null
+          const pending = msg.role === 'assistant' ? msg.pending_execution ?? null : null
+          const isPendingActionable =
+            pending && pending.status === 'pending' && !!onConfirmPending && !!onRevisePending
+          const isPendingDispatched = pending && pending.status === 'dispatched'
+          const isBeingRevised = pending && pending.pending_execution_id === revisingPendingId
+          const taskCardKey = pending?.pending_execution_id ?? null
+          const taskCardOpen = taskCardKey !== null && showTaskCardFor === taskCardKey
           return (
             <div key={msg.id || i} className={`chat-message ${msg.role}`}>
               <div className="chat-message-role">{msg.role === 'user' ? 'You' : 'Agent OS'}</div>
@@ -134,6 +164,58 @@ function ChatPanel({
                   </button>
                 </div>
               )}
+              {pending && isPendingActionable && !isBeingRevised && (
+                <div className="pending-execution-actions">
+                  <button
+                    type="button"
+                    className="pending-confirm-btn"
+                    onClick={() => onConfirmPending && onConfirmPending(pending.pending_execution_id)}
+                    disabled={loading}
+                  >
+                    OK, run this
+                  </button>
+                  <button
+                    type="button"
+                    className="pending-revise-btn"
+                    onClick={() => onRevisePending && onRevisePending(pending)}
+                    disabled={loading}
+                  >
+                    Revise plan
+                  </button>
+                  <button
+                    type="button"
+                    className="pending-inspect-btn"
+                    onClick={() =>
+                      setShowTaskCardFor(taskCardOpen ? null : pending.pending_execution_id)
+                    }
+                    title="Show the full task card the Coding Agent will receive"
+                  >
+                    {taskCardOpen ? 'Hide task card' : 'Show task card'}
+                  </button>
+                </div>
+              )}
+              {pending && isBeingRevised && (
+                <div className="pending-revising-hint">
+                  Revising this plan — type your changes in the input below.
+                </div>
+              )}
+              {isPendingDispatched && pending && pending.run_id && (
+                <div className="chat-run-affordance-row">
+                  <button
+                    type="button"
+                    className="chat-run-affordance"
+                    onClick={() => setOpenRunId(pending.run_id || null)}
+                    title={`Open run ${pending.run_id}`}
+                  >
+                    View Run
+                  </button>
+                </div>
+              )}
+              {pending && taskCardOpen && (
+                <pre className="pending-task-card">
+                  {pending.task_card}
+                </pre>
+              )}
             </div>
           )
         })}
@@ -145,16 +227,35 @@ function ChatPanel({
         )}
         <div ref={messagesEndRef} />
       </div>
+      {revisingPendingId && (
+        <div className="revise-mode-banner">
+          <span>
+            Revising plan: <strong>{revisingPendingTitle || revisingPendingId}</strong>
+            . Type your revision instructions and send.
+          </span>
+          <button
+            type="button"
+            className="revise-mode-cancel"
+            onClick={() => onCancelRevise && onCancelRevise()}
+            disabled={loading}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
       <form className="chat-input" onSubmit={handleSubmit}>
         <input
+          ref={inputRef}
           type="text"
           value={input}
           onChange={e => setInput(e.target.value)}
-          placeholder="Type a message..."
+          placeholder={revisingPendingId ? 'Describe what to change about the plan...' : 'Type a message...'}
           autoFocus
           disabled={loading}
         />
-        <button type="submit" disabled={loading}>Send</button>
+        <button type="submit" disabled={loading}>
+          {revisingPendingId ? 'Send revision' : 'Send'}
+        </button>
       </form>
       {openRunId && runProjectId && (
         <RunDetailModal

@@ -11,7 +11,13 @@ import re
 # Load .env before anything that needs ANTHROPIC_API_KEY
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from database import init_db, create_conversation, list_conversations, get_conversation, list_messages, add_message, update_conversation_title, delete_conversation, delete_conversations_for_project, rename_project_conversations
+from database import (
+    init_db, create_conversation, list_conversations, get_conversation,
+    list_messages, add_message, update_conversation_title, delete_conversation,
+    delete_conversations_for_project, rename_project_conversations,
+    create_pending_execution, get_pending_execution,
+    update_pending_execution_plan, mark_pending_execution_dispatched,
+)
 from orchestrator import (
     orchestrate, load_memory, judge_memory_updates, apply_memory_updates, apply_memory_update,
     judge_global_memory_updates, apply_global_memory_updates, apply_global_memory_update,
@@ -28,8 +34,16 @@ from execution import (
     is_code_delegation,
     handle_code_delegation,
     GENERAL_REJECTION_MESSAGE,
-    looks_like_code_request,
-    render_suggestion,
+    judge_delegation,
+    DECISION_DISPATCH,
+    PendingExecutionView,
+    serialize_pending,
+    revise_pending_plan,
+    render_pending_chat_body,
+    render_revised_chat_body,
+    derive_title_from_card,
+    STATUS_PENDING,
+    STATUS_DISPATCHED,
 )
 from execution.tool_models import (
     ListFilesRequest,
@@ -41,6 +55,11 @@ from execution.tool_models import (
 )
 from execution.models import TaskSpec
 from execution import run_store
+from execution.inspect import (
+    list_repo_files,
+    read_repo_file,
+    search_repo_files,
+)
 
 app = FastAPI(title="Agent OS Backend")
 
@@ -301,6 +320,10 @@ def api_update_global_file(req: UpdateGlobalFileRequest):
 class ChatRequest(BaseModel):
     conversation_id: str
     message: str
+    # When the user clicked "Revise plan" on a pending execution and is now
+    # typing revision instructions, the frontend echoes the pending id here
+    # so the backend routes to the revision flow instead of the orchestrator.
+    revise_pending_id: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -309,6 +332,18 @@ class ChatResponse(BaseModel):
     timestamp: str
     memory_updated: bool = False
     memory_updates: list[dict] = []
+    # Populated when the assistant message has a confirmable execution plan
+    # attached (Task 05.9.5). The frontend keys off `status` to decide
+    # whether to render the OK/Revise buttons under the message.
+    pending_execution: dict | None = None
+    # Echo of the assistant message id so the frontend can correlate the
+    # rendered message with the persisted row (used for re-rendering on
+    # reload via message metadata).
+    message_id: str | None = None
+    # Task 06.1 — when the orchestrator inspected repo files to answer
+    # the user, surface that list so the UI can clearly distinguish
+    # answers grounded in memory from answers grounded in file reads.
+    inspected_files: list[dict] = []
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -320,11 +355,26 @@ def api_chat(req: ChatRequest):
     project_id = conv["project_id"]
     is_general = project_id == GENERAL_PROJECT_ID
 
-    # Persist user message
-    add_message(req.conversation_id, "user", req.message)
+    # Persist user message. We capture its id so the pending-execution row
+    # can link back to the message that triggered it.
+    user_msg = add_message(req.conversation_id, "user", req.message)
 
     # Load conversation history for orchestration context
     messages = list_messages(req.conversation_id)
+
+    # --- Revise pending execution plan (Task 05.9.5) ---
+    # When the user clicked "Revise plan" and is now sending revision
+    # instructions, the frontend echoes the pending id back. We route to the
+    # revision LLM call instead of the orchestrator, rewrite the plan in
+    # place, and persist a new assistant message that points to the same
+    # pending row (now with the revised display_plan + task_card).
+    if req.revise_pending_id:
+        return _handle_revise_pending(
+            req=req,
+            messages=messages,
+            user_message_id=user_msg["id"],
+            is_general=is_general,
+        )
 
     # --- @code delegation short-circuit (Task 05.4) ---
     # When the user prefixes a project chat with `@code`, hand the message off
@@ -349,35 +399,47 @@ def api_chat(req: ChatRequest):
             timestamp=assistant_msg["timestamp"],
             memory_updated=False,
             memory_updates=[],
-        )
-
-    # --- Implicit delegation suggestion (Task 05.8) ---
-    # In project chats only, if the message reads like a coding request, reply
-    # with a non-executing suggestion that proposes an `@code` task card.
-    # @code remains the only actual execution trigger; the user must confirm.
-    # Memory writeback is skipped — the message hasn't produced durable
-    # project knowledge yet (the user still needs to dispatch).
-    if not is_general and looks_like_code_request(req.message):
-        response_content = render_suggestion(req.message)
-        assistant_msg = add_message(req.conversation_id, "assistant", response_content)
-        if len([m for m in messages if m["role"] == "user"]) <= 1:
-            title = req.message[:60] + ("..." if len(req.message) > 60 else "")
-            update_conversation_title(req.conversation_id, title)
-        return ChatResponse(
-            role="assistant",
-            content=response_content,
-            timestamp=assistant_msg["timestamp"],
-            memory_updated=False,
-            memory_updates=[],
+            message_id=assistant_msg["id"],
         )
 
     history = [{"role": m["role"], "content": m["content"]} for m in messages]
 
-    # Generate orchestration response
-    response_content = orchestrate(project_id, req.message, history=history)
+    # --- Implicit delegation judge → confirmable plan (Task 05.9 + 05.9.5) ---
+    # In project chats only, the LLM judge classifies the message. On
+    # `dispatch_suggested` we create a pending execution plan, persist a
+    # natural project-manager-style assistant message linked to it, and let
+    # the user confirm or revise via UI buttons. `@code` and the confirm
+    # endpoint are still the only paths that actually dispatch a run. The
+    # GENERAL workspace has no execution workspace, so the judge is skipped.
+    if not is_general:
+        project_name = _project_display_name(project_id)
+        decision = judge_delegation(
+            project_id=project_id,
+            project_name=project_name,
+            user_message=req.message,
+            history=history,
+            is_general=False,
+        )
+        if decision.decision == DECISION_DISPATCH:
+            return _handle_dispatch_suggested(
+                req=req,
+                project_id=project_id,
+                source_message_id=user_msg["id"],
+                decision=decision,
+                messages=messages,
+            )
 
-    # Persist assistant reply
-    assistant_msg = add_message(req.conversation_id, "assistant", response_content)
+    # Generate orchestration response (with optional on-demand file inspection).
+    response_content, inspected_files = orchestrate(
+        project_id, req.message, history=history
+    )
+
+    # Persist assistant reply. When inspections happened, include them in the
+    # message metadata so the chat history reflects how the answer was built.
+    inspect_metadata = {"inspected_files": inspected_files} if inspected_files else None
+    assistant_msg = add_message(
+        req.conversation_id, "assistant", response_content, metadata=inspect_metadata
+    )
 
     # Memory judgment: route to global or project writeback
     ctx = load_memory(project_id)
@@ -399,6 +461,156 @@ def api_chat(req: ChatRequest):
         timestamp=assistant_msg["timestamp"],
         memory_updated=len(applied) > 0,
         memory_updates=applied,
+        message_id=assistant_msg["id"],
+        inspected_files=inspected_files,
+    )
+
+
+# --- Confirmable execution plan helpers (Task 05.9.5) ---
+
+
+def _handle_dispatch_suggested(
+    *,
+    req: ChatRequest,
+    project_id: str,
+    source_message_id: str,
+    decision,
+    messages: list[dict],
+) -> ChatResponse:
+    """Persist a new pending execution plan and return the assistant reply.
+
+    Memory writeback is skipped — the user hasn't actually agreed to do the
+    work yet. Auto-title behaves the same as the other short-circuit paths.
+    """
+    task_card = (decision.proposed_task_card or "").strip()
+    if not task_card:
+        # The judge said "dispatch" but didn't give us a task card. That
+        # shouldn't happen with the current prompt, but be defensive — fall
+        # back to the user's literal message.
+        task_card = req.message.strip()
+
+    title = (decision.title or "").strip() or derive_title_from_card(task_card)
+    display_plan = (decision.display_plan or "").strip()
+    if not display_plan:
+        # Defensive fallback: synthesize a minimal plan so the UX still works.
+        display_plan = (
+            "I read this as a Coding Agent task. Here's what I'd hand off:\n\n"
+            f"> {task_card}\n\n"
+            "Confirm to dispatch, or revise the plan first."
+        )
+
+    pending_row = create_pending_execution(
+        project_id=project_id,
+        conversation_id=req.conversation_id,
+        source_message_id=source_message_id,
+        title=title,
+        display_plan=display_plan,
+        task_card=task_card,
+    )
+    plan = serialize_pending(pending_row)
+    body = render_pending_chat_body(plan)
+    metadata = {"pending_execution_id": plan.pending_execution_id}
+    assistant_msg = add_message(
+        req.conversation_id, "assistant", body, metadata=metadata
+    )
+
+    if len([m for m in messages if m["role"] == "user"]) <= 1:
+        auto_title = req.message[:60] + ("..." if len(req.message) > 60 else "")
+        update_conversation_title(req.conversation_id, auto_title)
+
+    return ChatResponse(
+        role="assistant",
+        content=body,
+        timestamp=assistant_msg["timestamp"],
+        memory_updated=False,
+        memory_updates=[],
+        pending_execution=plan.to_dict(),
+        message_id=assistant_msg["id"],
+    )
+
+
+def _handle_revise_pending(
+    *,
+    req: ChatRequest,
+    messages: list[dict],
+    user_message_id: str,
+    is_general: bool,
+) -> ChatResponse:
+    """Apply revision instructions to an existing pending plan.
+
+    Fails safely (HTTPException) on: missing pending id, stale pending id,
+    pending row that's already dispatched/cancelled, GENERAL workspace (no
+    execution workspace exists there), or empty revision instructions.
+    """
+    if is_general:
+        raise HTTPException(
+            status_code=400,
+            detail="Pending execution plans are not available in the GENERAL workspace.",
+        )
+
+    pending_row = get_pending_execution(req.revise_pending_id or "")
+    if not pending_row:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending execution plan not found — it may have been dispatched or expired.",
+        )
+    if pending_row["status"] != STATUS_PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Pending execution plan is {pending_row['status']!r}; "
+                "revisions are only allowed while it is still pending."
+            ),
+        )
+    if pending_row["conversation_id"] != req.conversation_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Pending execution plan does not belong to this conversation.",
+        )
+
+    instructions = (req.message or "").strip()
+    if not instructions:
+        raise HTTPException(
+            status_code=400,
+            detail="Revision instructions are empty.",
+        )
+
+    current = serialize_pending(pending_row)
+    revision = revise_pending_plan(current, instructions)
+
+    ok = update_pending_execution_plan(
+        current.pending_execution_id,
+        title=revision.title,
+        display_plan=revision.display_plan,
+        task_card=revision.task_card,
+    )
+    if not ok:
+        # Race: pending was dispatched between read and write.
+        raise HTTPException(
+            status_code=409,
+            detail="Pending execution plan changed state during revision; please refresh.",
+        )
+
+    refreshed_row = get_pending_execution(current.pending_execution_id)
+    refreshed = serialize_pending(refreshed_row)  # type: ignore[arg-type]
+    body = render_revised_chat_body(refreshed, revision.change_summary)
+    metadata = {"pending_execution_id": refreshed.pending_execution_id}
+    assistant_msg = add_message(
+        req.conversation_id, "assistant", body, metadata=metadata
+    )
+
+    if len([m for m in messages if m["role"] == "user"]) <= 1:
+        auto_title = req.message[:60] + ("..." if len(req.message) > 60 else "")
+        update_conversation_title(req.conversation_id, auto_title)
+
+    return ChatResponse(
+        role="assistant",
+        content=body,
+        timestamp=assistant_msg["timestamp"],
+        memory_updated=False,
+        memory_updates=[],
+        pending_execution=refreshed.to_dict(),
+        message_id=assistant_msg["id"],
     )
 
 
@@ -609,3 +821,143 @@ def api_get_run_result(project_id: str, run_id: str):
     if content is None:
         raise HTTPException(status_code=404, detail="result not found")
     return {"run_id": run_id, "content": content}
+
+
+# --- Main-agent file inspection endpoints (Task 06.1) ---
+# These are the on-demand inspection surface for the main agent and any
+# frontend UI that wants to surface workspace files alongside chat. Same
+# sandbox + ToolRuntime as the Coding Agent uses, but with tighter caps
+# and read-only operations only. The orchestrator's bounded chat loop
+# (orchestrate() in orchestrator.py) also goes through these wrappers.
+
+
+class InspectListRequest(BaseModel):
+    path: str = "."
+
+
+class InspectReadRequest(BaseModel):
+    path: str
+
+
+class InspectSearchRequest(BaseModel):
+    query: str
+    path: str = "."
+
+
+@app.post("/api/projects/{project_id}/execution/inspect/list")
+def api_inspect_list(project_id: str, req: InspectListRequest):
+    _require_project(project_id)
+    result = list_repo_files(project_id, req.path)
+    return result.to_dict()
+
+
+@app.post("/api/projects/{project_id}/execution/inspect/read")
+def api_inspect_read(project_id: str, req: InspectReadRequest):
+    _require_project(project_id)
+    result = read_repo_file(project_id, req.path)
+    return result.to_dict()
+
+
+@app.post("/api/projects/{project_id}/execution/inspect/search")
+def api_inspect_search(project_id: str, req: InspectSearchRequest):
+    _require_project(project_id)
+    result = search_repo_files(project_id, req.query, req.path)
+    return result.to_dict()
+
+
+# --- Pending execution endpoints (Task 05.9.5) ---
+# A pending execution is a confirmable plan produced by the LLM delegation
+# judge. Confirming it dispatches a Coding Agent run via the same
+# BackgroundRunManager path used by `@code`. The GENERAL workspace cannot
+# create or confirm pending plans (no execution workspace exists there).
+
+
+@app.get("/api/projects/{project_id}/execution/pending/{pending_id}")
+def api_get_pending_execution(project_id: str, pending_id: str):
+    """Fetch a pending plan. Used by the frontend when re-rendering messages
+    after a page reload — the message's metadata carries the pending id and
+    the UI keys off the row's current status."""
+    _require_project(project_id)
+    row = get_pending_execution(pending_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="pending execution not found")
+    if row["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="pending execution not found")
+    return serialize_pending(row).to_dict()
+
+
+@app.post("/api/projects/{project_id}/execution/pending/{pending_id}/confirm")
+def api_confirm_pending_execution(project_id: str, pending_id: str):
+    """Dispatch the stored task card via the same path as `@code`.
+
+    Validates project + workspace, ensures the pending plan exists, is still
+    in 'pending' state, and belongs to this project; then submits to the
+    background run manager and marks the pending row as dispatched with the
+    new run id. A short assistant message is appended to the chat so the
+    user sees confirmation inline (matching the `@code` placeholder UX).
+    """
+    if project_id == GENERAL_PROJECT_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="Pending execution plans are not available in the GENERAL workspace.",
+        )
+    _require_workspace(project_id)
+
+    row = get_pending_execution(pending_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="pending execution not found")
+    if row["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="pending execution not found")
+    if row["status"] != STATUS_PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Pending execution is {row['status']!r}; cannot dispatch.",
+        )
+
+    plan = serialize_pending(row)
+    spec = TaskSpec(
+        title=plan.title,
+        task_card=plan.task_card,
+        created_by="pending_confirm",
+    )
+    record = get_default_manager().dispatch(project_id, spec)
+
+    marked = mark_pending_execution_dispatched(pending_id, record.run_id)
+    if not marked:
+        # Lost a race with a concurrent confirm; the run is already in flight
+        # but our pending row didn't update. Surface clearly rather than
+        # silently leaving the row in an inconsistent state.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Run was dispatched but the pending plan changed state "
+                "concurrently. Check the Runs panel."
+            ),
+        )
+
+    # Drop an inline confirmation message into the chat so the user can see
+    # the new run id without scanning the runs panel.
+    confirmation_body = (
+        "## Coding Agent Run Started\n\n"
+        f"**Run ID:** `{record.run_id}`\n"
+        f"**Status:** running\n"
+        f"**Task:** {record.task_title}\n\n"
+        "The Coding Agent is working on this in the background. Open the "
+        "**Runs** panel on the right to track progress."
+    )
+    add_message(
+        plan.conversation_id,
+        "assistant",
+        confirmation_body,
+        metadata={
+            "pending_execution_id": plan.pending_execution_id,
+            "run_id": record.run_id,
+        },
+    )
+
+    return {
+        "run": record.model_dump(),
+        "pending_execution": serialize_pending(
+            get_pending_execution(pending_id)  # type: ignore[arg-type]
+        ).to_dict(),
+    }
