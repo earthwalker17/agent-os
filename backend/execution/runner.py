@@ -49,6 +49,7 @@ from .tool_models import (
     ToolResult,
     WriteFileRequest,
 )
+from .verification import run_verification
 
 
 MAX_STEPS = 8
@@ -363,7 +364,12 @@ class CodingAgentRunner:
         record.files_changed = files_changed
         record.commands_run = commands_run
         record.blockers = blockers
-        run_store.write_run_json(self.project_id, run_id, record)
+
+        # Snapshot the pre-update TASK.md so the verify command is read
+        # from the project's persistent config, even when the agent's
+        # final action rewrites TASK.md and accidentally drops the
+        # ## Verification section.
+        pre_update_task_md = read_task_state(self.project_id) or ""
 
         # TASK.md update — only execution-layer file we touch.
         if task_md_update:
@@ -378,6 +384,40 @@ class CodingAgentRunner:
                 f"{summary or '(no summary)'}\n"
             )
             update_task_state(self.project_id, existing + auto)
+
+        # Task 06.2A — optional verification. Runs after the agent's
+        # normal final action; never raises. A failing verify command
+        # downgrades a `completed` run to `partial`; non-completed
+        # statuses (failed/blocked/partial) are preserved either way.
+        verification = run_verification(
+            self.project_id,
+            runtime=self.runtime,
+            task_md_override=pre_update_task_md,
+        )
+        record.verification = verification
+        if (
+            verification.enabled
+            and verification.status == "failed"
+            and record.status == RunStatus.COMPLETED
+        ):
+            record.status = RunStatus.PARTIAL
+            blocker_msg = f"verification failed: {verification.command or '(unknown command)'}"
+            if blocker_msg not in record.blockers:
+                record.blockers.append(blocker_msg)
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {
+                "type": "verification",
+                "enabled": verification.enabled,
+                "status": verification.status,
+                "command": verification.command,
+                "exit_code": verification.exit_code,
+                "duration_ms": verification.duration_ms,
+            },
+        )
+
+        run_store.write_run_json(self.project_id, run_id, record)
 
         notes = ""
         if loop_failed_reason and final_action is None:
@@ -405,10 +445,11 @@ class CodingAgentRunner:
             run_id=run_id,
             status=record.status.value,
             summary=summary,
-            files_changed=files_changed,
+            files_changed=record.files_changed,
             commands_run=commands_run,
-            blockers=blockers,
+            blockers=record.blockers,
             result_path=result_path,
+            verification=verification,
         )
 
 

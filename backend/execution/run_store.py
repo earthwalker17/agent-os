@@ -21,6 +21,7 @@ from typing import Any
 
 from .manager import get_project_execution_dir
 from .models import RunRecord
+from .verification import render_verification_section
 
 
 def new_run_id() -> str:
@@ -120,5 +121,6 @@ def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
         f"## Files Changed\n{_bullets(record.files_changed)}\n\n"
         f"## Commands Run\n{_bullets(record.commands_run)}\n\n"
         f"## Blockers\n{_bullets(record.blockers)}\n\n"
+        f"{render_verification_section(record.verification)}\n"
         f"## Notes for Main Agent\n{notes.strip() or '_(none)_'}\n"
     )

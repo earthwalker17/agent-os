@@ -1214,3 +1214,73 @@ html, body, #root {
   overflow-y: auto;
   margin: 0;
 }
+
+.run-detail-verification {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.run-verify-status {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 3px;
+  margin-right: 8px;
+}
+
+.run-verify-status.status-passed {
+  background: rgba(46, 160, 67, 0.15);
+  color: #2ea043;
+}
+
+.run-verify-status.status-failed {
+  background: rgba(248, 81, 73, 0.15);
+  color: #f85149;
+}
+
+.run-verify-status.status-skipped {
+  background: rgba(139, 148, 158, 0.15);
+  color: var(--text-muted);
+}
+
+.run-detail-verify-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-right: 8px;
+}
+
+.run-detail-verify-cmd {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.run-detail-verify-cmd code {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 12px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  word-break: break-all;
+}
+
+.run-detail-verify-output {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 8px 10px;
+  background: var(--bg);
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 0;
+}

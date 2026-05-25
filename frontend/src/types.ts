@@ -46,6 +46,17 @@ export interface MemoryUpdate {
 
 export type RunStatus = 'running' | 'completed' | 'partial' | 'blocked' | 'failed' | 'unknown'
 
+export type VerificationStatus = 'passed' | 'failed' | 'skipped'
+
+export interface VerificationResult {
+  enabled: boolean
+  command?: string | null
+  status: VerificationStatus
+  exit_code?: number | null
+  output_preview?: string
+  duration_ms?: number | null
+}
+
 export interface RunRecord {
   run_id: string
   project_id: string
@@ -56,4 +67,5 @@ export interface RunRecord {
   files_changed?: string[]
   commands_run?: string[]
   blockers?: string[]
+  verification?: VerificationResult | null
 }

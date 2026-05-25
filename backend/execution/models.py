@@ -49,6 +49,25 @@ class TaskSpec(BaseModel):
     created_by: str = "manual"
 
 
+class VerificationResult(BaseModel):
+    """Outcome of the optional post-run verify command (Task 06.2A).
+
+    ``enabled`` is False when the project did not configure a verify
+    command (or it failed to parse). When ``enabled`` is True, ``status``
+    distinguishes ``"passed"`` (exit 0), ``"failed"`` (non-zero exit or
+    sandbox/runtime error), and ``"skipped"`` (recorded as a no-op for
+    completeness — e.g. ``enabled`` but the command was rejected before
+    execution and we want the UI to surface the reason).
+    """
+
+    enabled: bool = False
+    command: Optional[str] = None
+    status: str = "skipped"  # "passed" | "failed" | "skipped"
+    exit_code: Optional[int] = None
+    output_preview: str = ""
+    duration_ms: Optional[int] = None
+
+
 class RunRecord(BaseModel):
     """Persistent metadata for a single agent run (serialized as run.json)."""
 
@@ -73,6 +92,10 @@ class RunRecord(BaseModel):
     memory_reconciled: Optional[bool] = None
     memory_reconciliation: Optional[str] = None
     memory_reconciliation_error: Optional[str] = None
+    # Task 06.2A — optional post-run command verification. ``None`` for
+    # runs that finished before verification was introduced, or that did
+    # not reach the finalize step where verification runs.
+    verification: Optional[VerificationResult] = None
 
 
 class ResultSummary(BaseModel):
@@ -85,3 +108,4 @@ class ResultSummary(BaseModel):
     commands_run: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     result_path: Optional[str] = None
+    verification: Optional[VerificationResult] = None

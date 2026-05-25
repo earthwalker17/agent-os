@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { RunRecord } from '../types'
+import type { RunRecord, VerificationResult } from '../types'
 
 interface Props {
   projectId: string
@@ -16,6 +16,44 @@ function bullets(items: string[] | undefined | null): JSX.Element {
         <li key={i}>{x}</li>
       ))}
     </ul>
+  )
+}
+
+function VerificationBlock({ v }: { v: VerificationResult | null | undefined }): JSX.Element {
+  if (!v) {
+    return <span className="run-detail-none">Not run</span>
+  }
+  if (!v.enabled) {
+    return (
+      <div className="run-detail-verification">
+        <div>
+          <span className={`run-verify-status status-skipped`}>skipped</span>
+          <span className="run-detail-verify-meta">no verify command configured</span>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="run-detail-verification">
+      <div>
+        <span className={`run-verify-status status-${v.status}`}>{v.status}</span>
+        {typeof v.exit_code === 'number' && (
+          <span className="run-detail-verify-meta">exit {v.exit_code}</span>
+        )}
+        {typeof v.duration_ms === 'number' && (
+          <span className="run-detail-verify-meta">{v.duration_ms} ms</span>
+        )}
+      </div>
+      {v.command && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Command</span>
+          <code>{v.command}</code>
+        </div>
+      )}
+      {v.output_preview && (
+        <pre className="run-detail-verify-output">{v.output_preview}</pre>
+      )}
+    </div>
   )
 }
 
@@ -113,6 +151,11 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
                   {bullets(record.blockers)}
                 </section>
               </div>
+
+              <section className="run-detail-result">
+                <h4>Verification</h4>
+                <VerificationBlock v={record.verification} />
+              </section>
 
               <section className="run-detail-result">
                 <h4>result.md</h4>

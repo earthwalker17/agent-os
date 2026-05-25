@@ -48,12 +48,13 @@ on purpose.
 
 **Phase 1 & 2** (workspace + memory + orchestration + semantic
 writeback) are complete. **Phase 3 — Execution Layer** is complete
-through **Task 06.1** (on-demand main-agent file inspection). The
-Coding Agent can run sandboxed jobs in the background, runs panel
-auto-refreshes, inferred coding intent is surfaced as a confirmable
-plan, terminal runs reconcile back into project memory, and the main
-agent can inspect specific repo files on demand through a bounded
-sandboxed channel.
+through **Task 06.2A** (command-based verification). The Coding Agent
+runs sandboxed jobs in the background, the runs panel auto-refreshes,
+inferred coding intent is surfaced as a confirmable plan, terminal
+runs reconcile back into project memory, the main agent can inspect
+specific repo files on demand through a bounded sandboxed channel,
+and an optional project-defined verify command runs after each
+Coding Agent run — downgrading `completed` to `partial` on failure.
 
 Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 
@@ -159,6 +160,7 @@ python tests/test_pending_execution.py
 python tests/test_pending_execution_db.py
 python tests/test_memory_reconciliation.py
 python tests/test_inspect.py
+python tests/test_verification.py
 ```
 
 All tests stub the LLM caller, so no Anthropic API key is needed to

@@ -94,6 +94,20 @@ should accomplish)
 
 ## Result Summary for Main Agent
 (short, factual report of the latest run — overwritten each run)
+
+## Verification
+
+```bash
+# Optional: a single shell command run after every Coding Agent run
+# finishes. Leave the block empty (or every line commented) to skip
+# verification. Lines starting with `#` are ignored; the first
+# uncommented line is used as the verify command.
+#
+# Examples:
+#   python -m pytest tests/
+#   npm test --silent
+#   tsc --noEmit
+```
 """
 
 

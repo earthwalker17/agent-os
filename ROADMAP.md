@@ -145,6 +145,29 @@ Each run is reconciled at most once — the outcome is recorded on
 in `events.jsonl`. Reconciliation NEVER prevents a run from
 completing.
 
+### 06.2A — Command verification MVP
+After a Coding Agent run finishes its normal final action, the runner now
+optionally executes a single project-defined verify command and records
+the outcome on `RunRecord.verification` (`enabled`, `command`, `status`
+`= passed | failed | skipped`, `exit_code`, `output_preview`,
+`duration_ms`). The verify command lives in a `## Verification` fenced
+bash block inside each project's `execution_workspaces/{id}/TASK.md`
+(seeded as a commented-out example by the workspace template). The
+runner snapshots TASK.md before applying the agent's task_md_update so
+the agent can't accidentally clobber the verification config. The
+command is dispatched through the existing `ToolRuntime.run_shell` path,
+which means the same sandbox block-list applies — unsafe commands are
+recorded as `failed` with the sandbox reason in `output_preview` rather
+than executed. A failing verification downgrades a `completed` run to
+`partial` and appends a `verification failed: <cmd>` blocker; runs that
+finalized as `failed` / `blocked` / `partial` keep their status either
+way. Verification output appears as a new `## Verification` section in
+`result.md` and as a styled block in `RunDetailModal`. Verification
+failure NEVER fails the run itself — exceptions are converted into a
+`failed` status with the error in the preview. Browser-based / dev-server
+verification is intentionally deferred — no Playwright, no headless
+browser, no screenshot capture in this slice.
+
 ### 06.1 — On-demand main-agent file inspection
 The main agent now has a bounded, sandboxed path to inspect specific
 files inside a project's execution workspace `repo/` directory **only
@@ -204,6 +227,7 @@ surfaces which files were read.
 | `pending_execution.py`     | Confirmable execution plans (05.9.5)               |
 | `memory_reconciliation.py` | Post-run memory reconciliation (06.0)              |
 | `inspect.py`               | Main-agent file inspection (06.1)                  |
+| `verification.py`          | Post-run command verification (06.2A)              |
 
 ### Execution-trigger contract
 
@@ -230,9 +254,12 @@ surfaces which files were read.
 ## Current Constraints
 
 - **No streaming** on `/api/chat` — full response returned in one shot.
-- **No browser-based verification loop** — the Coding Agent runs
-  shell commands but does not yet open the rendered UI for visual
-  checks. This is the 06.2 target.
+- **Command-based verification only (06.2A).** After each Coding Agent
+  run, an optional project-defined `## Verification` shell command runs
+  through the existing sandbox and downgrades a `completed` run to
+  `partial` on failure. **No browser-based verification yet** — the
+  runner does not spin up a dev server, drive a headless browser, or
+  capture screenshots. That remains the open piece of 06.2.
 - **Up to four LLM calls per non-`@code` project chat turn** —
   delegation judge + (optional inspection loop iterations) + chat
   response + memory judge. The inspection loop is only entered when
@@ -263,7 +290,8 @@ so no Anthropic API key is needed to run them.
 | `test_pending_execution_db.py`       |     4 | 05.9.5 SQLite lifecycle + metadata roundtrip    |
 | `test_memory_reconciliation.py`      |    26 | 06.0 parser, skip rules, e2e pipeline           |
 | `test_inspect.py`                    |    29 | 06.1 sandbox, parser, orchestrator loop         |
-| **Total**                            |  **91** |                                                 |
+| `test_verification.py`               |    21 | 06.2A parser, runner integration, sandbox path  |
+| **Total**                            | **112** |                                                 |
 
 Run all:
 ```bash
@@ -273,31 +301,33 @@ python tests/test_pending_execution.py
 python tests/test_pending_execution_db.py
 python tests/test_memory_reconciliation.py
 python tests/test_inspect.py
+python tests/test_verification.py
 ```
 
 ---
 
 ## Recommended Next Steps
 
-### Next up: Task 06.2 — Verification loop
-Give the Coding Agent (or the main agent on demand) a way to verify
-that a run produced working software, not just modified files. Two
-plausible shapes:
+### Next up: Task 06.2B — Browser-based verification
+Command-based verification (06.2A) has landed. The remaining piece is
+visual / UI verification for projects that ship a frontend:
 
-- **Tool-based verification.** The runner's tool budget gets one extra
-  step where it executes a project-defined `verify` command (`pytest`,
-  `npm test`, `tsc --noEmit`, etc.) and captures the result into
-  `run.json` + `result.md`.
-- **Browser-based verification.** For UI runs, spawn a headless
-  browser (Playwright?) against the dev server, take a screenshot,
-  attach it to `result.md`. Only for projects that opt in.
+- Spawn a headless browser (Playwright likely) against a project-managed
+  dev server, drive a short check-list, and attach screenshots to
+  `result.md`. Opt-in per project — no auto-running for backend-only
+  projects.
 
 Open questions before starting:
-- Where does the per-project verify command live? `AGENT.md`? A new
-  `VERIFY.md`? A field in `task_card.md`?
-- Should verification failure flip a `completed` run to `partial`?
+- How does Agent OS know how to start the dev server? Another optional
+  block in `TASK.md` (e.g. `## Dev Server`) parsed the same way as
+  `## Verification`?
+- Where do screenshots live — under `runs/{id}/screenshots/` so the run
+  artifact directory stays self-contained?
+- Should browser verification be a second `verify_status` field on
+  `RunRecord`, or fold into the existing `VerificationResult` with a
+  richer payload?
 
-### After 06.2
+### After 06.2B
 - **Streaming responses.** Server-Sent Events on `/api/chat` for
   longer replies. Touches `llm.py`, `orchestrator.py`, the chat
   endpoint, and `ChatPanel.tsx`.
