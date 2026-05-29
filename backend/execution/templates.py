@@ -108,6 +108,20 @@ should accomplish)
 #   npm test --silent
 #   tsc --noEmit
 ```
+
+## Browser Verification
+
+```bash
+# Optional (Task 06.2B): opt-in headless-browser smoke check.
+# Uncomment both lines below to enable for a frontend project.
+# Agent OS will start the command, wait for the URL to become
+# reachable, take one screenshot, and tear the server back down.
+# Leave commented out for backend-only projects.
+#
+# Example:
+#   npm run dev -- --host 127.0.0.1
+#   url: http://127.0.0.1:5173
+```
 """
 
 

@@ -19,9 +19,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .manager import get_project_execution_dir
-from .models import RunRecord
+from .manager import get_execution_root, get_project_execution_dir
+from .models import RunRecord, RunStatus
 from .verification import render_verification_section
+from .browser_verification import render_browser_verification_section
 
 
 def new_run_id() -> str:
@@ -110,6 +111,86 @@ def list_runs(project_id: str) -> list[dict]:
     return entries
 
 
+def sweep_stuck_runs() -> list[str]:
+    """Promote any run.json still marked ``running`` to ``failed``.
+
+    Runs become "stuck running" when the backend process exits (server
+    restart, crash, machine reboot) while a Coding Agent loop is still
+    in flight: the worker thread dies with the process, so the
+    ``BackgroundRunManager``'s in-process crash-handler never gets to
+    flip the status.
+
+    This sweep is meant to be called once at process startup. It walks
+    every run record under ``execution_workspaces/*/runs/*/`` and, for
+    each one whose status is still ``running``, rewrites it to
+    ``failed`` with an "interrupted" blocker, sets ``completed_at`` to
+    now, appends a ``run_interrupted`` event, and writes a minimal
+    ``result.md`` so the UI doesn't show a spinner forever.
+
+    Returns the list of ``"{project_id}/{run_id}"`` strings that were
+    rewritten — useful for logging at startup. Best-effort: never
+    raises; corrupt or unreadable run.json entries are skipped.
+    """
+    swept: list[str] = []
+    root = get_execution_root()
+    if not root.exists() or not root.is_dir():
+        return swept
+    for project_dir in root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        runs_dir = project_dir / "runs"
+        if not runs_dir.exists() or not runs_dir.is_dir():
+            continue
+        for run_dir in runs_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            run_json_path = run_dir / "run.json"
+            if not run_json_path.exists():
+                continue
+            try:
+                raw = json.loads(run_json_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if raw.get("status") != RunStatus.RUNNING.value:
+                continue
+            try:
+                record = RunRecord(**raw)
+            except Exception:  # noqa: BLE001
+                # Fall back to a minimal record if validation fails.
+                record = RunRecord(
+                    run_id=raw.get("run_id") or run_dir.name,
+                    project_id=raw.get("project_id") or project_dir.name,
+                    task_title=str(raw.get("task_title") or ""),
+                )
+            record.status = RunStatus.FAILED
+            record.completed_at = datetime.utcnow()
+            interrupted_msg = "run interrupted before finalize (server restart or crash)"
+            if interrupted_msg not in record.blockers:
+                record.blockers = list(record.blockers) + [interrupted_msg]
+            try:
+                write_run_json(project_dir.name, run_dir.name, record)
+                append_event(
+                    project_dir.name,
+                    run_dir.name,
+                    {"type": "run_interrupted", "reason": interrupted_msg},
+                )
+                # Only seed result.md if the runner never got that far.
+                if not (run_dir / "result.md").exists():
+                    write_result_md(
+                        project_dir.name,
+                        run_dir.name,
+                        render_result_md(
+                            record,
+                            "Run did not finalize before the backend process exited.",
+                            notes=interrupted_msg,
+                        ),
+                    )
+                swept.append(f"{project_dir.name}/{run_dir.name}")
+            except Exception:  # noqa: BLE001
+                continue
+    return swept
+
+
 def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
     def _bullets(items: list[str]) -> str:
         return "\n".join(f"- {x}" for x in items) if items else "_(none)_"
@@ -122,5 +203,6 @@ def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
         f"## Commands Run\n{_bullets(record.commands_run)}\n\n"
         f"## Blockers\n{_bullets(record.blockers)}\n\n"
         f"{render_verification_section(record.verification)}\n"
+        f"{render_browser_verification_section(record.browser_verification)}\n"
         f"## Notes for Main Agent\n{notes.strip() or '_(none)_'}\n"
     )

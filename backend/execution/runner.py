@@ -50,9 +50,15 @@ from .tool_models import (
     WriteFileRequest,
 )
 from .verification import run_verification
+from .browser_verification import run_browser_verification
 
 
-MAX_STEPS = 8
+# Bumped from 8 -> 16: scaffolding tasks (write package.json + index.html +
+# 2-3 src files + finalize) routinely need 5-8 write_file steps after any
+# exploration, which left no room for a final action under the old budget.
+# Verification + browser verification run AFTER the loop, so the agent
+# shouldn't spend steps running dev servers or test suites — see prompts.py.
+MAX_STEPS = 16
 
 # The LLM transcript can grow; cap any single tool-result payload that we
 # round-trip back into the LLM. ToolRuntime already caps individual outputs at
@@ -79,6 +85,14 @@ class CodingAgentRunner:
         self.project_id = project_id
         self.runtime = ToolRuntime(project_id)
         self.model = model  # None -> let llm.chat use its default
+        # Diagnostic fallback: track what the agent actually accomplished so
+        # files_changed / commands_run still reflect reality when the loop
+        # exhausts its step budget before emitting a final action. The
+        # final action's lists take precedence when supplied; these
+        # ordered, deduplicated lists are used only when the final lists
+        # are absent or empty.
+        self._observed_files_changed: list[str] = []
+        self._observed_commands_run: list[str] = []
 
     def run_task(self, task: TaskSpec, run_id: str | None = None) -> ResultSummary:
         """Execute the Coding Agent loop and finalize artifacts.
@@ -181,6 +195,7 @@ class CodingAgentRunner:
 
             if action.get("action") == "tool_call":
                 tool_result, dispatched = self._dispatch_tool(run_id, step, action)
+                self._observe_tool_result(action, tool_result)
                 run_store.append_event(
                     self.project_id,
                     run_id,
@@ -281,6 +296,26 @@ class CodingAgentRunner:
         messages.append({"role": "assistant", "content": raw})
         return action
 
+    def _observe_tool_result(self, action: dict, result: ToolResult) -> None:
+        """Record successful side-effecting tool calls for the diagnostic fallback.
+
+        We only count operations that actually changed state: write_file,
+        append_file, and run_shell (when sandbox-accepted). Reads are
+        ignored. Lists stay ordered and deduplicated.
+        """
+        if not result.success:
+            return
+        tool_name = (action.get("tool_name") or "").strip()
+        arguments = action.get("arguments") or {}
+        if tool_name in {"write_file", "append_file"}:
+            path = arguments.get("path") if isinstance(arguments, dict) else None
+            if isinstance(path, str) and path and path not in self._observed_files_changed:
+                self._observed_files_changed.append(path)
+        elif tool_name == "run_shell":
+            command = arguments.get("command") if isinstance(arguments, dict) else None
+            if isinstance(command, str) and command and command not in self._observed_commands_run:
+                self._observed_commands_run.append(command)
+
     def _dispatch_tool(self, run_id: str, step: int, action: dict) -> tuple[ToolResult, dict]:
         tool_name = action.get("tool_name") or ""
         arguments = action.get("arguments") or {}
@@ -359,6 +394,16 @@ class CodingAgentRunner:
             blockers = [loop_failed_reason] if loop_failed_reason else ["did not finalize"]
             task_md_update = ""
 
+        # Diagnostic fallback: if the agent didn't supply file/command
+        # lists (typical when the loop exhausted its budget before
+        # emitting `final`), surface what actually happened so the run
+        # is still inspectable. The final action's explicit lists always
+        # win when present.
+        if not files_changed and self._observed_files_changed:
+            files_changed = list(self._observed_files_changed)
+        if not commands_run and self._observed_commands_run:
+            commands_run = list(self._observed_commands_run)
+
         record.status = RunStatus(status_str)
         record.completed_at = datetime.utcnow()
         record.files_changed = files_changed
@@ -417,6 +462,59 @@ class CodingAgentRunner:
             },
         )
 
+        # Task 06.2B — optional browser verification. Same posture as
+        # command verification: runs after the agent's final action,
+        # never raises, and a failing browser verification downgrades a
+        # ``completed`` run to ``partial``. Skipped (no config) is a
+        # no-op for status. Failures are tolerated for already-failed/
+        # blocked/partial runs.
+        try:
+            browser_verification = run_browser_verification(
+                self.project_id,
+                run_dir=run_store.get_run_dir(self.project_id, run_id),
+                task_md_override=pre_update_task_md,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # run_browser_verification already swallows its own exceptions,
+            # but keep an outer guard so a programmer error here never
+            # leaks into background finalization.
+            from .models import BrowserVerificationResult as _BVR
+            browser_verification = _BVR(
+                enabled=True,
+                command=None,
+                url=None,
+                status="failed",
+                screenshot_path=None,
+                output_preview=(
+                    f"browser verification crashed: {type(exc).__name__}: {exc}"
+                ),
+                duration_ms=None,
+            )
+        record.browser_verification = browser_verification
+        if (
+            browser_verification.enabled
+            and browser_verification.status == "failed"
+            and record.status == RunStatus.COMPLETED
+        ):
+            record.status = RunStatus.PARTIAL
+            cmd_label = browser_verification.command or "(unknown command)"
+            blocker_msg = f"browser verification failed: {cmd_label}"
+            if blocker_msg not in record.blockers:
+                record.blockers.append(blocker_msg)
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {
+                "type": "browser_verification",
+                "enabled": browser_verification.enabled,
+                "status": browser_verification.status,
+                "command": browser_verification.command,
+                "url": browser_verification.url,
+                "screenshot_path": browser_verification.screenshot_path,
+                "duration_ms": browser_verification.duration_ms,
+            },
+        )
+
         run_store.write_run_json(self.project_id, run_id, record)
 
         notes = ""
@@ -450,6 +548,7 @@ class CodingAgentRunner:
             blockers=record.blockers,
             result_path=result_path,
             verification=verification,
+            browser_verification=browser_verification,
         )
 
 

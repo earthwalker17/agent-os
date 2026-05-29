@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { RunRecord, VerificationResult } from '../types'
+import type { BrowserVerificationResult, RunRecord, VerificationResult } from '../types'
 
 interface Props {
   projectId: string
@@ -48,6 +48,70 @@ function VerificationBlock({ v }: { v: VerificationResult | null | undefined }):
         <div className="run-detail-verify-cmd">
           <span className="run-detail-label">Command</span>
           <code>{v.command}</code>
+        </div>
+      )}
+      {v.output_preview && (
+        <pre className="run-detail-verify-output">{v.output_preview}</pre>
+      )}
+    </div>
+  )
+}
+
+function BrowserVerificationBlock({
+  projectId,
+  runId,
+  v,
+}: {
+  projectId: string
+  runId: string
+  v: BrowserVerificationResult | null | undefined
+}): JSX.Element {
+  if (!v) {
+    return <span className="run-detail-none">Not run</span>
+  }
+  if (!v.enabled) {
+    return (
+      <div className="run-detail-verification">
+        <div>
+          <span className={`run-verify-status status-skipped`}>skipped</span>
+          <span className="run-detail-verify-meta">no browser verification configured</span>
+        </div>
+      </div>
+    )
+  }
+  const screenshotUrl = v.screenshot_path
+    ? `/api/projects/${projectId}/execution/runs/${runId}/screenshot`
+    : null
+  return (
+    <div className="run-detail-verification">
+      <div>
+        <span className={`run-verify-status status-${v.status}`}>{v.status}</span>
+        {typeof v.duration_ms === 'number' && (
+          <span className="run-detail-verify-meta">{v.duration_ms} ms</span>
+        )}
+      </div>
+      {v.command && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Command</span>
+          <code>{v.command}</code>
+        </div>
+      )}
+      {v.url && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">URL</span>
+          <code>{v.url}</code>
+        </div>
+      )}
+      {screenshotUrl && (
+        <div className="run-detail-browser-screenshot">
+          <span className="run-detail-label">Screenshot</span>
+          <a href={screenshotUrl} target="_blank" rel="noreferrer">
+            <img
+              src={screenshotUrl}
+              alt="browser verification screenshot"
+              className="run-detail-browser-img"
+            />
+          </a>
         </div>
       )}
       {v.output_preview && (
@@ -155,6 +219,15 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
               <section className="run-detail-result">
                 <h4>Verification</h4>
                 <VerificationBlock v={record.verification} />
+              </section>
+
+              <section className="run-detail-result">
+                <h4>Browser Verification</h4>
+                <BrowserVerificationBlock
+                  projectId={projectId}
+                  runId={runId}
+                  v={record.browser_verification}
+                />
               </section>
 
               <section className="run-detail-result">

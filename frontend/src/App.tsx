@@ -343,7 +343,17 @@ function App() {
         setConfirmDialog(null)
         fetch(`/api/conversations/${conv.id}`, { method: 'DELETE' })
           .then(async res => {
-            if (!res.ok) return
+            if (!res.ok) {
+              let detail = `HTTP ${res.status}`
+              try {
+                const err = await res.json()
+                detail = err.detail || detail
+              } catch {
+                // body wasn't JSON — fall through to the HTTP status
+              }
+              alert(`Failed to delete conversation: ${detail}`)
+              return
+            }
             if (conv.project_id === GENERAL_PROJECT_ID) {
               setGeneralConversations(prev => prev.filter(c => c.id !== conv.id))
             } else {
@@ -354,7 +364,10 @@ function App() {
               setMessages([])
             }
           })
-          .catch(err => console.error('Delete conversation error:', err))
+          .catch(err => {
+            console.error('Delete conversation error:', err)
+            alert(`Failed to delete conversation: ${err}`)
+          })
       },
     })
   }, [activeConversation])

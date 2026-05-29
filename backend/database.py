@@ -203,14 +203,24 @@ def get_message(message_id: str) -> dict | None:
 
 
 def delete_conversation(conv_id: str):
+    # Order matters: ``pending_executions`` and ``messages`` both have an
+    # FK on ``conversations(id)`` with PRAGMA foreign_keys=ON, so the
+    # parent row can't be removed until every child is gone. Skipping the
+    # ``pending_executions`` clear was a real bug — any conversation that
+    # had ever held a confirmable plan became permanently undeletable.
     with get_db() as conn:
+        conn.execute("DELETE FROM pending_executions WHERE conversation_id = ?", (conv_id,))
         conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
         conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
 
 
 def delete_conversations_for_project(project_id: str):
-    """Delete all conversations and their messages for a project."""
+    """Delete all conversations, messages, and pending executions for a project."""
     with get_db() as conn:
+        # Clear pending executions first (FK -> conversations.id).
+        conn.execute(
+            "DELETE FROM pending_executions WHERE project_id = ?", (project_id,)
+        )
         conv_ids = conn.execute(
             "SELECT id FROM conversations WHERE project_id = ?", (project_id,)
         ).fetchall()

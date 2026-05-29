@@ -126,6 +126,75 @@ def test_get_pending_returns_none_for_unknown_id():
     assert db.get_pending_execution("does-not-exist") is None
 
 
+def test_delete_conversation_clears_pending_executions():
+    """Regression: ``pending_executions`` has an FK on ``conversations.id``
+    with ``PRAGMA foreign_keys=ON``. ``delete_conversation`` must clear
+    the child rows first, otherwise the parent DELETE raises
+    ``IntegrityError`` and any conversation that ever held a confirmable
+    plan becomes permanently undeletable from the UI.
+    """
+    db = _fresh_db_module()
+    conv = db.create_conversation("agent-os", "conv with pending")
+    db.create_pending_execution(
+        project_id="agent-os",
+        conversation_id=conv["id"],
+        source_message_id=None,
+        title="t",
+        display_plan="p",
+        task_card="c",
+    )
+    # Sanity: pending row exists.
+    with db.get_db() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM pending_executions WHERE conversation_id = ?",
+            (conv["id"],),
+        ).fetchone()[0]
+    assert n == 1
+
+    db.delete_conversation(conv["id"])
+
+    with db.get_db() as conn:
+        n_pending = conn.execute(
+            "SELECT COUNT(*) FROM pending_executions WHERE conversation_id = ?",
+            (conv["id"],),
+        ).fetchone()[0]
+        n_conv = conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE id = ?", (conv["id"],)
+        ).fetchone()[0]
+    assert n_pending == 0
+    assert n_conv == 0
+
+
+def test_delete_conversations_for_project_clears_pending_executions():
+    """Same regression at the project-cascade level: a project with any
+    pending plan must be fully deletable, including the FK-referencing
+    ``pending_executions`` rows.
+    """
+    db = _fresh_db_module()
+    conv = db.create_conversation("agent-os", "conv with pending")
+    db.create_pending_execution(
+        project_id="agent-os",
+        conversation_id=conv["id"],
+        source_message_id=None,
+        title="t",
+        display_plan="p",
+        task_card="c",
+    )
+    db.delete_conversations_for_project("agent-os")
+
+    with db.get_db() as conn:
+        n_pending = conn.execute(
+            "SELECT COUNT(*) FROM pending_executions WHERE project_id = ?",
+            ("agent-os",),
+        ).fetchone()[0]
+        n_conv = conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE project_id = ?",
+            ("agent-os",),
+        ).fetchone()[0]
+    assert n_pending == 0
+    assert n_conv == 0
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

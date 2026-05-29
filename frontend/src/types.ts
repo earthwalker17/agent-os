@@ -57,6 +57,16 @@ export interface VerificationResult {
   duration_ms?: number | null
 }
 
+export interface BrowserVerificationResult {
+  enabled: boolean
+  command?: string | null
+  url?: string | null
+  status: VerificationStatus
+  screenshot_path?: string | null
+  output_preview?: string
+  duration_ms?: number | null
+}
+
 export interface RunRecord {
   run_id: string
   project_id: string
@@ -68,4 +78,5 @@ export interface RunRecord {
   commands_run?: string[]
   blockers?: string[]
   verification?: VerificationResult | null
+  browser_verification?: BrowserVerificationResult | null
 }

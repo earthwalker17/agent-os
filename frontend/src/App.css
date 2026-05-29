@@ -1284,3 +1284,18 @@ html, body, #root {
   overflow-y: auto;
   margin: 0;
 }
+
+.run-detail-browser-screenshot {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.run-detail-browser-img {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  object-fit: contain;
+}

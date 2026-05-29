@@ -1,11 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 
+import os
 import shutil
+import stat
 import re
 
 # Load .env before anything that needs ANTHROPIC_API_KEY
@@ -26,6 +29,7 @@ from orchestrator import (
 from execution import (
     init_execution_workspace,
     get_execution_workspace,
+    get_project_execution_dir,
     read_task_state,
     update_task_state,
     ToolRuntime,
@@ -78,6 +82,15 @@ MEMORY_FILES = ["PROJECT.md", "STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RES
 @app.on_event("startup")
 def startup():
     init_db()
+    # Sweep any run.json still marked `running` from a prior process — they
+    # belong to a backend instance that exited mid-loop and would otherwise
+    # stay stuck forever. Best-effort: never block startup.
+    try:
+        swept = run_store.sweep_stuck_runs()
+        if swept:
+            print(f"[startup] marked {len(swept)} stuck run(s) as failed: {swept}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] sweep_stuck_runs failed: {type(exc).__name__}: {exc}")
 
 
 @app.on_event("shutdown")
@@ -194,14 +207,76 @@ def api_rename_project(project_id: str, req: RenameProjectRequest):
     return {"project_id": new_id, "name": req.new_name.strip()}
 
 
+def _force_writable_and_retry(func, path, _exc_info):
+    """``shutil.rmtree`` callback that strips read-only attrs and retries.
+
+    On Windows, ``node_modules/`` typically contains read-only pack files
+    and bin entries that vanilla ``rmtree`` refuses to delete. The
+    callback chmod's the offender to writable and re-invokes the failing
+    operation, which clears the common failure case without swallowing
+    real errors (truly undeletable files re-raise on the retry).
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except Exception:  # noqa: BLE001
+        pass
+    func(path)
+
+
+def _rmtree_force(path: Path) -> None:
+    """Remove ``path`` recursively, handling Windows read-only files.
+
+    Python 3.12+ deprecated ``onerror`` in favor of ``onexc``; we use
+    ``onexc`` when available and fall back to ``onerror`` otherwise so
+    the same code works on older interpreters.
+    """
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path, onexc=_force_writable_and_retry)  # type: ignore[call-arg]
+    except TypeError:
+        shutil.rmtree(path, onerror=_force_writable_and_retry)
+
+
 @app.delete("/api/projects/{project_id}")
 def api_delete_project(project_id: str):
     project_path = PROJECTS_DIR / project_id
     if not project_path.exists() or not project_path.is_dir():
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Order: tear down DB rows (FK-aware via delete_conversations_for_project)
+    # first, then the memory dir, then the execution workspace. The workspace
+    # is removed last because it's the most likely to fail on Windows when a
+    # dev server, file watcher, or editor still has a handle open — we want
+    # the DB and memory state cleaned even if the workspace removal raises.
     delete_conversations_for_project(project_id)
-    shutil.rmtree(project_path)
+    try:
+        _rmtree_force(project_path)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to remove project directory {project_path}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    workspace_dir = get_project_execution_dir(project_id)
+    workspace_error: str | None = None
+    if workspace_dir.exists():
+        try:
+            _rmtree_force(workspace_dir)
+        except OSError as exc:
+            # The project itself is gone; treat the workspace as a partial
+            # cleanup failure (e.g., a dev server still holding files open)
+            # and report it without re-creating the project entry.
+            workspace_error = (
+                f"Failed to remove execution workspace {workspace_dir}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if workspace_error:
+        return {"status": "partial", "warning": workspace_error}
     return {"status": "ok"}
 
 
@@ -821,6 +896,22 @@ def api_get_run_result(project_id: str, run_id: str):
     if content is None:
         raise HTTPException(status_code=404, detail="result not found")
     return {"run_id": run_id, "content": content}
+
+
+@app.get("/api/projects/{project_id}/execution/runs/{run_id}/screenshot")
+def api_get_run_screenshot(project_id: str, run_id: str):
+    """Serve the browser verification screenshot for a run (Task 06.2B).
+
+    Only ``screenshots/browser.png`` inside the run's artifact dir is
+    served; the path is constructed server-side so there's no caller
+    input that could escape the artifact directory.
+    """
+    _require_workspace(project_id)
+    run_dir = run_store.get_run_dir(project_id, run_id)
+    screenshot = run_dir / "screenshots" / "browser.png"
+    if not screenshot.exists() or not screenshot.is_file():
+        raise HTTPException(status_code=404, detail="screenshot not found")
+    return FileResponse(str(screenshot), media_type="image/png")
 
 
 # --- Main-agent file inspection endpoints (Task 06.1) ---

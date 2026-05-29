@@ -68,6 +68,34 @@ class VerificationResult(BaseModel):
     duration_ms: Optional[int] = None
 
 
+class BrowserVerificationResult(BaseModel):
+    """Outcome of the optional post-run browser verification (Task 06.2B).
+
+    Kept separate from :class:`VerificationResult` because the lifecycle
+    is meaningfully different — there's a long-lived dev server,
+    URL-readiness wait, a headless browser, and a screenshot artifact
+    on disk — and folding it in would conflate two distinct features.
+
+    ``enabled`` is False when the project did not configure a
+    ``## Browser Verification`` block in ``TASK.md``. When enabled,
+    ``status`` is ``"passed"`` (server started, URL reachable, screenshot
+    captured), ``"failed"`` (anything went wrong end-to-end), or
+    ``"skipped"`` (recorded for completeness; rarely used).
+
+    ``screenshot_path`` is the run-relative path (e.g.
+    ``screenshots/browser.png``) so the UI can build a fetch URL without
+    leaking absolute filesystem paths.
+    """
+
+    enabled: bool = False
+    command: Optional[str] = None
+    url: Optional[str] = None
+    status: str = "skipped"  # "passed" | "failed" | "skipped"
+    screenshot_path: Optional[str] = None
+    output_preview: str = ""
+    duration_ms: Optional[int] = None
+
+
 class RunRecord(BaseModel):
     """Persistent metadata for a single agent run (serialized as run.json)."""
 
@@ -96,6 +124,12 @@ class RunRecord(BaseModel):
     # runs that finished before verification was introduced, or that did
     # not reach the finalize step where verification runs.
     verification: Optional[VerificationResult] = None
+    # Task 06.2B — optional post-run browser verification. ``None`` for
+    # runs that finished before browser verification was introduced.
+    # When the project has no ``## Browser Verification`` block, this is
+    # populated with ``enabled=False, status="skipped"`` so the UI can
+    # still display a consistent block.
+    browser_verification: Optional[BrowserVerificationResult] = None
 
 
 class ResultSummary(BaseModel):
@@ -109,3 +143,4 @@ class ResultSummary(BaseModel):
     blockers: list[str] = Field(default_factory=list)
     result_path: Optional[str] = None
     verification: Optional[VerificationResult] = None
+    browser_verification: Optional[BrowserVerificationResult] = None

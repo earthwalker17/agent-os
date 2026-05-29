@@ -52,7 +52,7 @@ These were landed before the execution layer began. They are stable.
 
 ---
 
-## Phase 3 — Execution Layer (Complete through 06.1)
+## Phase 3 — Execution Layer (Complete through 06.2C)
 
 ### 05.1 — Execution workspace foundation
 Per-project workspaces under `execution_workspaces/{project_id}/`:
@@ -168,6 +168,193 @@ failure NEVER fails the run itself — exceptions are converted into a
 verification is intentionally deferred — no Playwright, no headless
 browser, no screenshot capture in this slice.
 
+### 06.2B.1 — Runner diagnostics + stuck-run sweep (06.2B follow-up)
+Smoke-testing 06.2B surfaced four small but real problems in the
+runner. All fixed together as a single targeted patch:
+
+1. **Step budget too tight for scaffolding.** `MAX_STEPS` was 8, but a
+   "scaffold a tiny frontend project" run could need 5–8 `write_file`
+   steps after one or two `list_files` calls and still leave room for
+   a `final` action. Bumped to 16 — still bounded, generous enough for
+   the realistic worst case.
+2. **Empty `files_changed` / `commands_run` when the budget exhausts.**
+   The runner derived those lists exclusively from the agent's `final`
+   action, so a run that ran out of steps after writing several files
+   reported "no files changed" even though several were on disk. The
+   runner now tracks successful `write_file` / `append_file` paths and
+   accepted `run_shell` commands locally and surfaces them as a
+   diagnostic fallback when the final action's lists are absent or
+   empty. The final action's explicit lists still win when supplied.
+3. **System prompt encouraged "verify by running" inside the loop.**
+   The agent was spending its budget on `npm run dev` and similar
+   long-running commands. The prompt now says explicitly that command
+   and browser verification are automatic post-loop steps, so the
+   agent must not spin up dev servers or run full test suites inside
+   the loop, and must avoid `read_file` / `list_files` on paths it
+   plans to overwrite (`write_file` overwrites unconditionally).
+4. **Stuck-`running` runs from a server restart.** When the FastAPI
+   process exited mid-loop (crash, reload, machine reboot), the
+   in-process `BackgroundRunManager` crash-handler died with it and
+   the orphaned run stayed in `running` forever. Added
+   `run_store.sweep_stuck_runs()` and wired it into the FastAPI
+   startup hook — any run.json with `status="running"` at startup is
+   promoted to `failed` with an "interrupted" blocker, `completed_at`
+   stamped, a `run_interrupted` event appended, and `result.md`
+   backfilled if missing.
+
+### 06.2B — Browser verification MVP
+Opt-in headless-browser smoke check that runs after the 06.2A command
+verification. A project that ships a frontend may add a
+`## Browser Verification` block to its
+`execution_workspaces/{id}/TASK.md` with a dev-server command and a
+`url:` line. After every Coding Agent run, if the block is present,
+the runner spins the dev server up through a sandbox-validated
+subprocess in the project's `repo/` directory, polls the URL until it
+becomes reachable (default 30s), drives a headless Playwright Chromium
+browser to that URL, captures a single screenshot to
+`execution_workspaces/{id}/runs/{run_id}/screenshots/browser.png`, and
+tears the server back down (SIGTERM → SIGKILL on POSIX, CTRL_BREAK →
+kill on Windows, with the child started in its own process group on
+POSIX). The result lands on `RunRecord.browser_verification`
+(`enabled`, `command`, `url`, `status = passed | failed | skipped`,
+`screenshot_path`, `output_preview`, `duration_ms`). A failing browser
+verification downgrades a `completed` run to `partial` and appends a
+`browser verification failed: <cmd>` blocker, matching 06.2A's
+behavior. Backend-only projects (no block in TASK.md) skip browser
+verification entirely. The screenshot is served back through
+`GET /api/projects/{id}/execution/runs/{run_id}/screenshot` and
+rendered inline in `RunDetailModal`. Browser verification NEVER
+crashes background finalization — any exception is captured as a
+`failed` status with the reason in `output_preview`. Lifecycle
+constraints are deliberately tight: short readiness timeout, bounded
+output preview, screenshot stays inside the run artifact directory,
+and the dev-server command goes through `ProjectSandbox.validate_command`
+(same block-list as command verification). AI visual judgment,
+multi-page browser flows, and streaming run telemetry are
+intentionally deferred. **Manual smoke test note:** Playwright is
+imported lazily; install it with `pip install playwright` plus
+`playwright install chromium` in the backend venv before running
+against a real project. CI/unit tests mock the screenshot runner and
+process starter, so no browser binaries are needed for the test
+suite.
+
+### 06.2B.2 — Browser-verification pipe-deadlock fix (06.2B follow-up)
+Smoke-testing 06.2B on Windows surfaced a reproducible deadlock: every
+real run finished as `partial` with `url did not become reachable
+within 30s`, even after the same `npm run dev -- --host 127.0.0.1 --port
+5174` command worked when launched manually from the same `repo/`
+directory. Root cause: the dev server was started with
+`stdout=PIPE, stderr=PIPE` but nothing was reading the pipes. The
+default Windows pipe buffer (~4-8 KB) fills up during vite's startup
+output (dep pre-bundling logs, deprecation warnings) before vite ever
+calls `listen()` on its port, so the child blocks on its next `print()`
+and the URL never becomes reachable. The manual run worked because the
+user's terminal was draining the pipes for free. Fix:
+
+1. **Bounded background drainer threads.** A new `_StreamDrainer` reads
+   `proc.stdout` and `proc.stderr` line-by-line in daemon threads with a
+   bounded in-memory buffer (`_BROWSER_OUTPUT_PREVIEW_CHARS * 2`). The OS
+   pipe buffer can no longer fill up regardless of how chatty the dev
+   server is, so vite reaches its `listen()` call normally.
+2. **Server output surfaced on every failure path.** Drained
+   stdout/stderr is now included in `output_preview` for the
+   url-unreachable, dev-server-crashed, screenshot-failed, and
+   missing-screenshot branches — not just the previous
+   process-already-died case. Future failures will tell us whether vite
+   printed a port-conflict error, hung in dep optimization, or simply
+   never bound the socket.
+3. **Fast-fail on dev-server early exit.** New `_wait_for_url_or_exit`
+   wrapper polls `proc.poll()` in between URL probes, so a dev server
+   that dies at second 1 (port conflict, missing dep) no longer burns
+   the full 30s readiness budget before being reported as failed.
+4. **Categorical phase label in the failure message.** The
+   url-unreachable branch now says `(dev server still running; last
+   probe: …)` so the operator can distinguish "server crashed" from
+   "server up but not responding" at a glance.
+
+No public API changes; the `process_starter` and `screenshot_runner`
+test seams keep the same signatures. New regression test
+`test_drainer_surfaces_server_output_on_unreachable_url` locks in the
+behavior: a still-running process that produces noisy stdout/stderr
+must have its output appear in `result.output_preview` even though the
+caller never reads `proc.stdout`/`proc.stderr` directly.
+
+### 06.2B.3 — Playwright on worker thread fix (06.2B follow-up)
+With 06.2B.2 in place, the dev server now reaches its `ready` state
+reliably and URL polling succeeds — but the very next phase failed
+with a bare ``screenshot capture failed: NotImplementedError:`` (no
+message at all). Root cause: ``CodingAgentRunner.run_task`` runs inside
+a ``BackgroundRunManager`` worker thread, and Playwright's sync API
+ends up invoking ``asyncio.create_subprocess_exec`` to spawn its
+Node.js driver. On Windows in a non-main thread, that lands on
+``SelectorEventLoop``'s subprocess methods, which raise a *messageless*
+``NotImplementedError()`` — and ``f"{exc}"`` collapses that to an empty
+string, which is why the preview had nothing after the colon. Fix:
+
+1. **Playwright now runs in a Python subprocess.** The default screenshot
+   runner shells out to ``sys.executable -c <inline script>`` so
+   Playwright always executes on the main thread of a fresh interpreter
+   with the platform-default asyncio policy. Side-steps the
+   thread/event-loop interaction entirely. ~200-500 ms overhead is
+   trivial for a smoke check that already takes seconds.
+2. **Structured error categorization.** The inline script writes a JSON
+   blob to stderr — ``{"error": "<tag>", "message": "..."}`` — and uses
+   distinct exit codes (2 = playwright missing, 3 = chromium missing, 4 =
+   generic capture failure). The caller translates those into actionable
+   operator messages (``"Run: pip install playwright && python -m
+   playwright install chromium"`` / ``"Run: python -m playwright install
+   chromium"``) instead of letting raw stack traces leak into
+   ``output_preview``.
+3. **Messageless-exception preview formatting.** A new ``_format_exception``
+   helper falls back to ``repr(exc)`` when ``str(exc)`` is empty, so a
+   bare ``NotImplementedError()`` now renders as
+   ``NotImplementedError()`` in the preview — not a dangling
+   ``NotImplementedError:`` with nothing after. Wired into the
+   dev-server-start, screenshot-failure, and outer-crash paths.
+
+No public API changes; ``screenshot_runner`` and ``process_starter``
+test seams keep the same signatures. New regression tests
+(``test_screenshot_messageless_exception_does_not_render_blank_colon``,
+``test_default_runner_clean_error_when_playwright_missing``,
+``test_default_runner_clean_error_when_chromium_missing``) lock in the
+diagnostics-clarity contract.
+
+### 06.2C — Project / conversation delete cleanup
+Manual smoke testing surfaced two real deletion bugs:
+
+1. **Conversation delete silently failed** for any conversation that had
+   ever held a confirmable plan. `pending_executions` has an FK on
+   `conversations.id` and the DB enables `PRAGMA foreign_keys=ON`, but
+   `delete_conversation` / `delete_conversations_for_project` only
+   removed rows from `messages` and `conversations` — leaving the FK
+   child intact, so the parent DELETE raised `IntegrityError`. The
+   FastAPI endpoint surfaced it as a 500, but the frontend's
+   conversation handler had `if (!res.ok) return` with no `alert`, so
+   the user saw nothing happen. Affected projects became permanently
+   undeletable from the UI.
+2. **Project delete left the execution workspace orphaned.**
+   `api_delete_project` removed the `projects/{id}/` memory dir and the
+   DB rows, but never touched `execution_workspaces/{id}/`. Backend-only
+   projects looked clean; frontend projects with `repo/node_modules/`
+   stayed on disk forever.
+
+Fix:
+
+- `delete_conversation` and `delete_conversations_for_project` now
+  clear `pending_executions` first (child-before-parent order).
+  Regression tests in `test_pending_execution_db.py` lock this in.
+- `api_delete_project` now also removes
+  `execution_workspaces/{id}/` via a Windows-safe `rmtree` (`onexc`
+  callback strips read-only attrs on retry — the common failure mode
+  for `node_modules/` on Windows). Memory dir is removed first so the
+  DB and `projects/` cleanup happens even if a dev server still has
+  files open in the workspace. A best-effort workspace removal
+  failure is reported as `{"status": "partial", "warning": ...}`
+  rather than rolling back the memory delete.
+- Frontend conversation-delete handler now surfaces non-OK responses
+  via `alert(...)` instead of silently returning, so future DB-side
+  failures are visible.
+
 ### 06.1 — On-demand main-agent file inspection
 The main agent now has a bounded, sandboxed path to inspect specific
 files inside a project's execution workspace `repo/` directory **only
@@ -228,6 +415,7 @@ surfaces which files were read.
 | `memory_reconciliation.py` | Post-run memory reconciliation (06.0)              |
 | `inspect.py`               | Main-agent file inspection (06.1)                  |
 | `verification.py`          | Post-run command verification (06.2A)              |
+| `browser_verification.py`  | Post-run browser verification MVP (06.2B)          |
 
 ### Execution-trigger contract
 
@@ -254,12 +442,17 @@ surfaces which files were read.
 ## Current Constraints
 
 - **No streaming** on `/api/chat` — full response returned in one shot.
-- **Command-based verification only (06.2A).** After each Coding Agent
-  run, an optional project-defined `## Verification` shell command runs
-  through the existing sandbox and downgrades a `completed` run to
-  `partial` on failure. **No browser-based verification yet** — the
-  runner does not spin up a dev server, drive a headless browser, or
-  capture screenshots. That remains the open piece of 06.2.
+- **Command verification + opt-in browser verification (06.2A + 06.2B).**
+  After each Coding Agent run, an optional project-defined
+  `## Verification` shell command runs through the existing sandbox.
+  A separate, opt-in `## Browser Verification` block in `TASK.md` can
+  additionally spin up a project dev server, wait for a configured
+  URL, capture one headless-browser screenshot, and tear the server
+  down. Either failing check downgrades a `completed` run to
+  `partial`. Backend-only projects (no `## Browser Verification` block)
+  skip the browser path entirely. **No AI visual judgment yet** —
+  screenshots are stored and rendered, not analyzed. Streaming run
+  telemetry and multi-page browser flows are also still future work.
 - **Up to four LLM calls per non-`@code` project chat turn** —
   delegation judge + (optional inspection loop iterations) + chat
   response + memory judge. The inspection loop is only entered when
@@ -287,11 +480,13 @@ so no Anthropic API key is needed to run them.
 |--------------------------------------|------:|-------------------------------------------------|
 | `test_delegation_judge.py`           |    15 | 05.9 judge: decisions, fallbacks, parsing       |
 | `test_pending_execution.py`          |    17 | 05.9.5 serialization, revision LLM, renderers   |
-| `test_pending_execution_db.py`       |     4 | 05.9.5 SQLite lifecycle + metadata roundtrip    |
+| `test_pending_execution_db.py`       |     6 | 05.9.5 SQLite lifecycle + metadata roundtrip + 06.2C FK cleanup |
 | `test_memory_reconciliation.py`      |    26 | 06.0 parser, skip rules, e2e pipeline           |
 | `test_inspect.py`                    |    29 | 06.1 sandbox, parser, orchestrator loop         |
 | `test_verification.py`               |    21 | 06.2A parser, runner integration, sandbox path  |
-| **Total**                            | **112** |                                                 |
+| `test_browser_verification.py`       |    26 | 06.2B parser, lifecycle, runner integration, drainer, Playwright subprocess diagnostics |
+| `test_runner_diagnostics.py`         |     9 | 06.2B.1 observed activity, sweep_stuck_runs     |
+| **Total**                            | **149** |                                                 |
 
 Run all:
 ```bash
@@ -302,38 +497,36 @@ python tests/test_pending_execution_db.py
 python tests/test_memory_reconciliation.py
 python tests/test_inspect.py
 python tests/test_verification.py
+python tests/test_browser_verification.py
+python tests/test_runner_diagnostics.py
 ```
 
 ---
 
 ## Recommended Next Steps
 
-### Next up: Task 06.2B — Browser-based verification
-Command-based verification (06.2A) has landed. The remaining piece is
-visual / UI verification for projects that ship a frontend:
+### Next up: AI-assisted visual review
+Browser verification (06.2B) captures a screenshot but does not judge
+it. The natural follow-on is a small model-judged pass over the
+captured screenshot + the original task card + the rendered
+`result.md`, producing a structured "looks right / looks wrong / can't
+tell" verdict with a one-paragraph reason. Open questions:
 
-- Spawn a headless browser (Playwright likely) against a project-managed
-  dev server, drive a short check-list, and attach screenshots to
-  `result.md`. Opt-in per project — no auto-running for backend-only
-  projects.
+- Should it be a third post-run step or fold into 06.0's memory
+  reconciliation judge?
+- Cost gate: only run it on `completed` runs with a passing browser
+  verification, to avoid paying for a vision call on every failure?
+- How to surface the verdict in `RunDetailModal` — alongside the
+  screenshot, or as a separate "Visual review" section?
 
-Open questions before starting:
-- How does Agent OS know how to start the dev server? Another optional
-  block in `TASK.md` (e.g. `## Dev Server`) parsed the same way as
-  `## Verification`?
-- Where do screenshots live — under `runs/{id}/screenshots/` so the run
-  artifact directory stays self-contained?
-- Should browser verification be a second `verify_status` field on
-  `RunRecord`, or fold into the existing `VerificationResult` with a
-  richer payload?
-
-### After 06.2B
+### After AI visual review
 - **Streaming responses.** Server-Sent Events on `/api/chat` for
   longer replies. Touches `llm.py`, `orchestrator.py`, the chat
   endpoint, and `ChatPanel.tsx`.
 - **Run event stream.** Replace 2s polling on the Runs panel with a
-  per-project SSE stream of status transitions and event-log appends.
-  Shares plumbing with streaming responses.
+  per-project SSE stream of status transitions, event-log appends,
+  and verification/browser-verification phase transitions. Shares
+  plumbing with streaming responses.
 - **Improve cost / latency.** The current 3–4 LLM calls per turn is
   the obvious cost lever. Plausible reductions: cache the delegation
   judge on idempotent messages; merge the memory judge into the main
