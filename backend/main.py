@@ -238,17 +238,30 @@ def _rmtree_force(path: Path) -> None:
         shutil.rmtree(path, onerror=_force_writable_and_retry)
 
 
+@app.get("/api/projects/{project_id}/workspace-status")
+def api_project_workspace_status(project_id: str):
+    """Report whether an execution workspace exists on disk for this project.
+
+    Used by the delete-project confirmation modal to decide whether to offer
+    the "Delete its workspace too" checkbox — there's no point showing it for
+    a backend-only project that never had a workspace materialized.
+    """
+    _require_project(project_id)
+    return {"exists": get_project_execution_dir(project_id).exists()}
+
+
 @app.delete("/api/projects/{project_id}")
-def api_delete_project(project_id: str):
+def api_delete_project(project_id: str, delete_workspace: bool = False):
     project_path = PROJECTS_DIR / project_id
     if not project_path.exists() or not project_path.is_dir():
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Order: tear down DB rows (FK-aware via delete_conversations_for_project)
-    # first, then the memory dir, then the execution workspace. The workspace
-    # is removed last because it's the most likely to fail on Windows when a
-    # dev server, file watcher, or editor still has a handle open — we want
-    # the DB and memory state cleaned even if the workspace removal raises.
+    # first, then the memory dir, then (optionally) the execution workspace.
+    # The workspace is removed last because it's the most likely to fail on
+    # Windows when a dev server, file watcher, or editor still has a handle
+    # open — we want the DB and memory state cleaned even if the workspace
+    # removal raises.
     delete_conversations_for_project(project_id)
     try:
         _rmtree_force(project_path)
@@ -261,9 +274,13 @@ def api_delete_project(project_id: str):
             ),
         )
 
+    # The execution workspace holds the project's repo/ (its actual codebase).
+    # Only remove it when the caller explicitly opts in (delete_workspace=true)
+    # so a user can drop the project's conversations + memory while keeping the
+    # sandboxed codebase on disk for later use.
     workspace_dir = get_project_execution_dir(project_id)
     workspace_error: str | None = None
-    if workspace_dir.exists():
+    if delete_workspace and workspace_dir.exists():
         try:
             _rmtree_force(workspace_dir)
         except OSError as exc:
@@ -277,6 +294,8 @@ def api_delete_project(project_id: str):
 
     if workspace_error:
         return {"status": "partial", "warning": workspace_error}
+    if not delete_workspace and workspace_dir.exists():
+        return {"status": "ok", "workspace_kept": True}
     return {"status": "ok"}
 
 

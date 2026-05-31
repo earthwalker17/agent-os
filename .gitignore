@@ -18,12 +18,32 @@ backend/*.db
 backend/*.sqlite
 backend/*.sqlite3
 
-# User/project memory - private local state
-memory/
-projects/
+# User/project memory - private local state.
+# Ignore everything inside these folders, but keep the committed example
+# templates + README explainers (and the public, non-private SOUL.md) so the
+# repo documents the layout without leaking personal projects or memory.
+memory/*
+!memory/README.md
+!memory/SOUL.md
+!memory/USER.example.md
+!memory/WORKSTYLE.example.md
+!memory/MEMORY.example.md
 
-# Execution workspaces - generated agent artifacts, logs, repo sandboxes
-execution_workspaces/
+projects/*
+!projects/README.md
+!projects/PROJECT.example.md
+!projects/STATUS.example.md
+!projects/TASK_QUEUE.example.md
+!projects/DECISIONS.example.md
+!projects/RESEARCH.example.md
+
+# Execution workspaces - generated agent artifacts, logs, repo sandboxes.
+# Same treatment: real per-project workspaces stay private; the example
+# templates + README explainer are committed.
+execution_workspaces/*
+!execution_workspaces/README.md
+!execution_workspaces/AGENT.example.md
+!execution_workspaces/TASK.example.md
 
 # Runtime logs
 logs/

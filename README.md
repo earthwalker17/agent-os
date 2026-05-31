@@ -145,9 +145,9 @@ agent-os/
 │   ├── database.py        # SQLite (conversations + messages + pending exec)
 │   ├── execution/         # sandbox, runner, judges, reconciliation, inspect
 │   └── tests/             # backend test suite (stubbed LLM, no API key needed)
-├── memory/                # global markdown memory  (gitignored)
-├── projects/              # per-project markdown memory  (gitignored)
-├── execution_workspaces/  # Coding Agent workspaces  (gitignored)
+├── memory/                # global markdown memory  (private; ships SOUL.md + *.example.md templates + README)
+├── projects/              # per-project markdown memory  (private; ships *.example.md templates + README)
+├── execution_workspaces/  # Coding Agent workspaces  (private; ships *.example.md templates + README)
 ├── README.md              # this file (public landing page)
 ├── ROADMAP.md             # detailed status + task log + next steps
 └── CLAUDE.md              # stable operating guide for coding agents

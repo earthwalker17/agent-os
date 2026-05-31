@@ -35,7 +35,7 @@ function App() {
 
   // Modal state
   const [editModal, setEditModal] = useState<{ filename: string; content: string } | null>(null)
-  const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: () => void } | null>(null)
+  const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: (checked: boolean) => void; checkboxLabel?: string } | null>(null)
   const [globalMemoryModal, setGlobalMemoryModal] = useState(false)
   const [globalMemory, setGlobalMemory] = useState<Record<string, string>>({})
 
@@ -256,17 +256,39 @@ function App() {
       .catch(err => console.error('Rename project error:', err))
   }, [activeProject, loadProjects, loadConversations])
 
-  const handleDeleteProject = useCallback((projectId: string) => {
+  const handleDeleteProject = useCallback(async (projectId: string) => {
+    // Only offer the "delete workspace too" checkbox when a workspace
+    // actually exists on disk for this project.
+    let workspaceExists = false
+    try {
+      const res = await fetch(`/api/projects/${projectId}/workspace-status`)
+      if (res.ok) {
+        const data = await res.json()
+        workspaceExists = !!data.exists
+      }
+    } catch (err) {
+      console.error('Workspace status check failed:', err)
+    }
+
     setConfirmDialog({
-      message: `Delete project "${projectId}" and all its conversations? This cannot be undone.`,
-      onConfirm: () => {
+      message: workspaceExists
+        ? `Delete project "${projectId}" and all its conversations? This cannot be undone. ` +
+          `Its codebase workspace is kept unless you tick the box below.`
+        : `Delete project "${projectId}" and all its conversations? This cannot be undone.`,
+      checkboxLabel: workspaceExists ? 'Delete its workspace too' : undefined,
+      onConfirm: (deleteWorkspace: boolean) => {
         setConfirmDialog(null)
-        fetch(`/api/projects/${projectId}`, { method: 'DELETE' })
+        const url = `/api/projects/${projectId}${deleteWorkspace ? '?delete_workspace=true' : ''}`
+        fetch(url, { method: 'DELETE' })
           .then(async res => {
             if (!res.ok) {
               const err = await res.json()
               alert(err.detail || 'Failed to delete project')
               return
+            }
+            const data = await res.json().catch(() => ({}))
+            if (data.status === 'partial' && data.warning) {
+              alert(data.warning)
             }
             setConversations(prev => prev.filter(c => c.project_id !== projectId))
             if (activeProject === projectId) {
@@ -596,6 +618,7 @@ function App() {
           message={confirmDialog.message}
           onConfirm={confirmDialog.onConfirm}
           onCancel={() => setConfirmDialog(null)}
+          checkboxLabel={confirmDialog.checkboxLabel}
         />
       )}
       {globalMemoryModal && (

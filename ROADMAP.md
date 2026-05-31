@@ -355,6 +355,49 @@ Fix:
   via `alert(...)` instead of silently returning, so future DB-side
   failures are visible.
 
+### 06.2C.1 — Opt-in workspace deletion (06.2C follow-up)
+The original 06.2C always deleted `execution_workspaces/{id}/` when a
+project was deleted. That's the right default for a clean teardown, but
+it also throws away the project's actual codebase (`repo/`), which the
+user may still want even after dropping the conversations + memory. The
+delete flow is now a two-part choice:
+
+- `api_delete_project` takes a `delete_workspace: bool = False` query
+  param. DB rows + the `projects/{id}/` memory dir are always removed;
+  the execution workspace is removed **only** when `delete_workspace=true`.
+  When the workspace is kept, the response includes `workspace_kept: true`.
+- A new `GET /api/projects/{id}/workspace-status` returns
+  `{"exists": bool}` so the UI knows whether a workspace is on disk.
+- The delete-project confirmation modal (`ConfirmDialog`) gained an
+  optional checkbox. The frontend checks `workspace-status` first and,
+  when a workspace exists, shows a **"Delete its workspace too"** tick
+  box (default unchecked) plus copy noting the codebase is kept unless
+  ticked. The checkbox value is threaded back through `onConfirm` into
+  the `?delete_workspace=true` query param. A `partial` response (best-
+  effort workspace removal failed) now surfaces its warning via `alert`.
+
+### 06.2C.2 — Public example templates for the private data folders
+`memory/`, `projects/`, and `execution_workspaces/` were fully
+gitignored for privacy, which left newcomers with no on-repo picture of
+their layout. The `.gitignore` now ignores each folder's *contents*
+(`dir/*`) while un-ignoring a small set of committed explainers:
+
+- `memory/`: real `SOUL.md` (contains no private data, loaded as the
+  identity anchor) + `README.md` + `USER.example.md` /
+  `WORKSTYLE.example.md` / `MEMORY.example.md`.
+- `projects/`: `README.md` + `PROJECT.example.md` / `STATUS.example.md` /
+  `TASK_QUEUE.example.md` / `DECISIONS.example.md` / `RESEARCH.example.md`
+  (mirroring `DEFAULT_MEMORY_CONTENT`).
+- `execution_workspaces/`: `README.md` + `AGENT.example.md` /
+  `TASK.example.md` (mirroring `templates.py`).
+
+Personal projects (current and future) and the real `USER.md` /
+`WORKSTYLE.md` / `MEMORY.md` stay ignored. The example files use inert
+names (flat `*.example.md` + `README.md`) that the backend never reads —
+`list_projects` only enumerates *directories* — so they document the
+layout without polluting the project list or being mistaken for real
+state. No backend behavior change was needed for this.
+
 ### 06.1 — On-demand main-agent file inspection
 The main agent now has a bounded, sandboxed path to inspect specific
 files inside a project's execution workspace `repo/` directory **only

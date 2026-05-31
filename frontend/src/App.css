@@ -757,6 +757,22 @@ html, body, #root {
   color: var(--text);
 }
 
+.confirm-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 20px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.confirm-checkbox input[type='checkbox'] {
+  cursor: pointer;
+  margin: 0;
+}
+
 .btn-danger {
   padding: 6px 16px;
   font-size: 13px;
