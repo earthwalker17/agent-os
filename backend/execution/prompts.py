@@ -144,6 +144,33 @@ Decide your next action. Respond with one JSON action only.
 """
 
 
+REPAIR_USER_PROMPT_TEMPLATE = """# Verification failed — one repair pass
+
+Your build pass finished, but the automatic command verification that runs
+afterwards FAILED. You now have a single, bounded repair pass to fix the
+code so verification passes. Use up to {max_steps} steps, then emit
+`action: "final"`.
+
+The failing verification command(s) and their output:
+
+<VERIFICATION_FAILURE>
+{failures}
+</VERIFICATION_FAILURE>
+
+Rules for this repair pass:
+- Edit only the files needed to make the failing command(s) pass.
+- Do NOT re-run the verification command yourself, do NOT start a dev server,
+  and do NOT run the full test suite — Agent OS reruns verification
+  automatically after you finalize.
+- If the failure is not something you can fix from the repo (missing external
+  service, ambiguous requirement), finalize with status `partial` and explain
+  the blocker. Otherwise finalize with status `completed` once you've applied
+  the fix.
+
+Respond with one JSON action only.
+"""
+
+
 CORRECTION_USER_PROMPT_TEMPLATE = """Your previous response was not valid JSON
 matching the required schema. Error: {error}
 
@@ -178,3 +205,10 @@ def build_tool_result_prompt(tool_name: str, success: bool, result_text: str) ->
 
 def build_correction_prompt(error: str) -> str:
     return CORRECTION_USER_PROMPT_TEMPLATE.format(error=error)
+
+
+def build_repair_user_prompt(failures: str, max_steps: int) -> str:
+    return REPAIR_USER_PROMPT_TEMPLATE.format(
+        failures=failures.strip() or "(no output captured)",
+        max_steps=max_steps,
+    )

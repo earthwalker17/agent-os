@@ -98,14 +98,22 @@ should accomplish)
 ## Verification
 
 ```bash
-# Optional: a single shell command run after every Coding Agent run
-# finishes. Leave the block empty (or every line commented) to skip
-# verification. Lines starting with `#` are ignored; the first
-# uncommented line is used as the verify command.
+# Optional: shell command(s) run automatically after every Coding Agent run.
+#
+# You usually do NOT need to fill this in. When this block is empty (or every
+# line is commented), Agent OS infers safe verification from the repo:
+#   - package.json with a build script -> npm install (if needed) + npm run build
+#   - a Python project with tests       -> python -m pytest
+#   - a Python project without tests     -> a lightweight compileall syntax check
+# If verification fails, the Coding Agent gets one bounded repair pass before
+# the run settles. A run is only marked `completed` once verification passes.
+#
+# Fill this in only to OVERRIDE the inference. Lines starting with `#` are
+# ignored; every uncommented line becomes a verification command, run in order.
 #
 # Examples:
 #   python -m pytest tests/
-#   npm test --silent
+#   npm run build
 #   tsc --noEmit
 ```
 

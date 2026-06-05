@@ -28,30 +28,58 @@ function VerificationBlock({ v }: { v: VerificationResult | null | undefined }):
       <div className="run-detail-verification">
         <div>
           <span className={`run-verify-status status-skipped`}>skipped</span>
-          <span className="run-detail-verify-meta">no verify command configured</span>
+          <span className="run-detail-verify-meta">
+            {v.mode === 'skipped'
+              ? 'no safe verify command could be inferred'
+              : 'no verify command configured'}
+          </span>
         </div>
       </div>
     )
   }
+  const commands = v.commands ?? []
   return (
     <div className="run-detail-verification">
       <div>
         <span className={`run-verify-status status-${v.status}`}>{v.status}</span>
-        {typeof v.exit_code === 'number' && (
-          <span className="run-detail-verify-meta">exit {v.exit_code}</span>
+        {v.mode && <span className="run-detail-verify-meta">{v.mode}</span>}
+        {(v.repair_attempts ?? 0) > 0 && (
+          <span className="run-detail-verify-meta">
+            {v.repair_attempts} repair pass{(v.repair_attempts ?? 0) === 1 ? '' : 'es'}
+          </span>
         )}
         {typeof v.duration_ms === 'number' && (
           <span className="run-detail-verify-meta">{v.duration_ms} ms</span>
         )}
       </div>
-      {v.command && (
-        <div className="run-detail-verify-cmd">
-          <span className="run-detail-label">Command</span>
-          <code>{v.command}</code>
-        </div>
-      )}
-      {v.output_preview && (
-        <pre className="run-detail-verify-output">{v.output_preview}</pre>
+      {commands.length > 0 ? (
+        <ul className="run-detail-verify-cmd-list">
+          {commands.map((c, i) => (
+            <li key={i}>
+              <span className={`run-verify-status status-${c.status}`}>{c.status}</span>
+              <span className="run-detail-verify-meta">{c.kind}</span>
+              <code>{c.command}</code>
+              {typeof c.exit_code === 'number' && (
+                <span className="run-detail-verify-meta">exit {c.exit_code}</span>
+              )}
+              {c.status === 'failed' && c.output_preview && (
+                <pre className="run-detail-verify-output">{c.output_preview}</pre>
+              )}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <>
+          {v.command && (
+            <div className="run-detail-verify-cmd">
+              <span className="run-detail-label">Command</span>
+              <code>{v.command}</code>
+            </div>
+          )}
+          {v.output_preview && (
+            <pre className="run-detail-verify-output">{v.output_preview}</pre>
+          )}
+        </>
       )}
     </div>
   )

@@ -282,6 +282,19 @@ def test_status_reports_has_package_json():
     _run(body)
 
 
+def test_status_reports_deps_installed_from_node_modules():
+    def body(layout: _TempLayout):
+        repo = layout.init_workspace("p", with_package_json=True)
+        # Before install: node_modules absent.
+        assert preview.get_preview_status("p")["deps_installed"] is False
+        # After a command-verification `npm install` (here just simulate the
+        # on-disk result): node_modules present -> preview-ready.
+        (repo / "node_modules").mkdir()
+        assert preview.get_preview_status("p")["deps_installed"] is True
+
+    _run(body)
+
+
 # ---------- adopt / shutdown ----------
 
 

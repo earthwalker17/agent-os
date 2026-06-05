@@ -62,11 +62,15 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
     load()
   }, [load])
 
-  // Poll while the build run is in flight, or while a browser verification is
-  // running (the backend writes a 'running' sub-status during that window).
+  // Poll while the build run is in flight, while the automatic command
+  // verification / repair phase runs (verification_state), or while a browser
+  // verification is running (the backend writes 'running' sub-statuses during
+  // those windows).
   const isRunning = record?.status === 'running'
+  const commandVerifyingState =
+    record?.verification_state === 'verifying' || record?.verification_state === 'repairing'
   const isVerifyingState = record?.browser_verification_state === 'running'
-  const shouldPoll = isRunning || isVerifyingState || verifying
+  const shouldPoll = isRunning || commandVerifyingState || isVerifyingState || verifying
   useEffect(() => {
     if (!shouldPoll) return
     const id = window.setInterval(load, POLL_INTERVAL_MS)
@@ -109,9 +113,20 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
 
   const status = record.status
   const bv = record.browser_verification
+  const cv = record.verification
   const verifyingNow = verifying || record.browser_verification_state === 'running'
+  // Task 06.2E — the automatic command-verification phase still in flight.
+  const commandVerifying =
+    record.verification_state === 'verifying' || record.verification_state === 'repairing'
+  const commandVerifyFailed = !!cv && cv.enabled && cv.status === 'failed'
+  const commandVerifyPassed = !!cv && cv.enabled && cv.status === 'passed'
   const isTerminal = TERMINAL.has(status)
-  const canVerify = status === 'completed' || status === 'partial'
+  // Browser verification is only offered once command verification is clean
+  // (passed or safely skipped) — never while it's still running or has failed.
+  const canVerify =
+    (status === 'completed' || status === 'partial') &&
+    !commandVerifying &&
+    !commandVerifyFailed
   const hadVerifyAttempt = !!bv && bv.enabled && (bv.status === 'passed' || bv.status === 'failed')
   const screenshotUrl = bv?.screenshot_path
     ? `/api/projects/${projectId}/execution/runs/${runId}/screenshot`
@@ -158,6 +173,35 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
             <p className="run-chat-muted">Browser verification has not been run yet.</p>
           )}
         </div>
+      )}
+
+      {/* --- command verification: in-progress phase (Task 06.2E) --- */}
+      {commandVerifying && (
+        <div className="run-chat-verify-progress">
+          <span className="run-chat-dot" />
+          {record.verification_state === 'repairing'
+            ? 'Command verification found an issue — the Coding Agent is making a repair pass.'
+            : 'Command verification is running (build / tests).'}
+        </div>
+      )}
+
+      {/* --- command verification: settled result (Task 06.2E) --- */}
+      {!commandVerifying && commandVerifyPassed && (
+        <p className="run-chat-muted">
+          Command verification passed
+          {cv && (cv.repair_attempts ?? 0) > 0 ? ' after a repair pass' : ''}.
+        </p>
+      )}
+      {!commandVerifying && commandVerifyFailed && (
+        <p className="run-chat-muted">
+          Command verification failed
+          {cv && (cv.repair_attempts ?? 0) > 0
+            ? ' even after a repair pass'
+            : ''}
+          {cv?.command ? ': ' : '.'}
+          {cv?.command ? <code>{cv.command}</code> : null} See Details for the
+          command output.
+        </p>
       )}
 
       {/* --- browser verification: progress --- */}

@@ -24,9 +24,24 @@ function formatTime(iso: string | undefined | null): string {
 }
 
 // A run is "active" (panel should auto-refresh + look busy) while the build
-// loop runs OR while a user-triggered browser verification is in flight.
+// loop runs, while the automatic command verification / repair phase runs, OR
+// while a user-triggered browser verification is in flight.
 function isActive(run: RunRecord): boolean {
-  return run.status === 'running' || run.browser_verification_state === 'running'
+  return (
+    run.status === 'running' ||
+    run.verification_state === 'verifying' ||
+    run.verification_state === 'repairing' ||
+    run.browser_verification_state === 'running'
+  )
+}
+
+// Compact phase label for the run row: surfaces the in-flight sub-phase
+// (verifying / repairing) over the underlying settled status.
+function phaseLabel(run: RunRecord): string | null {
+  if (run.verification_state === 'repairing') return 'repairing'
+  if (run.verification_state === 'verifying') return 'verifying'
+  if (run.browser_verification_state === 'running') return 'verifying'
+  return null
 }
 
 function RunsSection({ projectId, refreshSignal }: Props) {
@@ -146,13 +161,14 @@ function RunsSection({ projectId, refreshSignal }: Props) {
 
   // The preview control is shown for any frontend app (has package.json) and
   // stays put — the button just toggles between Start and Stop. Start is only
-  // clickable once dependencies have installed successfully at least once (a
-  // browser verification's install step proves the dev server is openable —
-  // independent of whether that verification itself passed), and no run is
-  // currently active.
-  const installedAtLeastOnce = runs.some(
-    (r) => r.browser_verification?.install_status === 'passed',
-  )
+  // clickable once dependencies are installed, and no run is currently active.
+  // "Installed" is true as soon as node_modules exists on disk (deps_installed)
+  // — which the 06.2E command-verification `npm install` produces — or, as a
+  // fallback for older records, once a browser verification's install step
+  // passed.
+  const installedAtLeastOnce =
+    !!preview?.deps_installed ||
+    runs.some((r) => r.browser_verification?.install_status === 'passed')
   const previewRunning = !!preview?.running
   const showPreviewControl = !!preview?.has_package_json
   const startDisabled = previewBusy || hasActive || !installedAtLeastOnce
@@ -256,7 +272,7 @@ function RunsSection({ projectId, refreshSignal }: Props) {
             const filesCount = run.files_changed?.length ?? 0
             const cmdsCount = run.commands_run?.length ?? 0
             const time = formatTime(run.completed_at) || formatTime(run.created_at)
-            const verifying = run.browser_verification_state === 'running'
+            const phase = phaseLabel(run)
             return (
               <li key={run.run_id}>
                 <button
@@ -267,8 +283,8 @@ function RunsSection({ projectId, refreshSignal }: Props) {
                 >
                   <div className="run-row-top">
                     <span className="run-title">{run.task_title || '(untitled run)'}</span>
-                    <span className={`run-status status-${verifying ? 'running' : run.status}`}>
-                      {verifying ? 'verifying' : run.status}
+                    <span className={`run-status status-${phase ? 'running' : run.status}`}>
+                      {phase ?? run.status}
                     </span>
                   </div>
                   <div className="run-row-meta">

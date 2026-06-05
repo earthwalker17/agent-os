@@ -95,6 +95,20 @@ def _has_package_json(project_id: str) -> bool:
         return False
 
 
+def _deps_installed(project_id: str) -> bool:
+    """True when ``node_modules`` exists — i.e. the dev server can be started.
+
+    This is the on-disk source of truth for "deps are installed", independent
+    of *how* they got there (the 06.2E command-verification ``npm install``, a
+    browser verification, or a manual install). The Runs panel uses it to
+    enable Start preview as soon as the project is preview-ready.
+    """
+    try:
+        return (ProjectSandbox(project_id).repo_dir / "node_modules").is_dir()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _status_dict(project_id: str, server: Optional[PreviewServer]) -> dict:
     running = _is_alive(server)
     return {
@@ -104,6 +118,7 @@ def _status_dict(project_id: str, server: Optional[PreviewServer]) -> dict:
         "command": server.command if (running and server is not None) else None,
         "started_at": server.started_at if (running and server is not None) else None,
         "has_package_json": _has_package_json(project_id),
+        "deps_installed": _deps_installed(project_id),
     }
 
 

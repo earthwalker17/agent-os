@@ -49,15 +49,49 @@ class TaskSpec(BaseModel):
     created_by: str = "manual"
 
 
-class VerificationResult(BaseModel):
-    """Outcome of the optional post-run verify command (Task 06.2A).
+class VerificationCommandResult(BaseModel):
+    """Outcome of a single verification command (Task 06.2E).
 
-    ``enabled`` is False when the project did not configure a verify
-    command (or it failed to parse). When ``enabled`` is True, ``status``
-    distinguishes ``"passed"`` (exit 0), ``"failed"`` (non-zero exit or
-    sandbox/runtime error), and ``"skipped"`` (recorded as a no-op for
-    completeness — e.g. ``enabled`` but the command was rejected before
-    execution and we want the UI to surface the reason).
+    A run may verify with more than one command (e.g. a full-stack project
+    runs both ``python -m pytest`` and ``npm run build``). Each command's
+    individual outcome is captured here; the aggregate lives on the parent
+    :class:`VerificationResult`.
+
+    ``kind`` is a coarse label for the command's role —
+    ``"install"`` / ``"build"`` / ``"test"`` / ``"syntax"`` / ``"manual"`` —
+    so the UI can explain *why* a command ran. ``status`` is
+    ``"passed"`` (exit 0), ``"failed"`` (non-zero exit or sandbox/runtime
+    error), or ``"skipped"`` (not run because an earlier command in the
+    chain already failed).
+    """
+
+    command: str
+    kind: str = "manual"
+    status: str = "skipped"  # "passed" | "failed" | "skipped"
+    exit_code: Optional[int] = None
+    output_preview: str = ""
+    duration_ms: Optional[int] = None
+
+
+class VerificationResult(BaseModel):
+    """Outcome of the post-run command verification (Task 06.2A + 06.2E).
+
+    ``enabled`` is False when no safe verify command was configured or could
+    be inferred. When ``enabled`` is True, ``status`` distinguishes
+    ``"passed"`` (every command exited 0), ``"failed"`` (any command failed
+    or hit a sandbox/runtime error), and ``"skipped"``.
+
+    Task 06.2E adds three fields:
+
+      - ``mode`` — how the commands were chosen: ``"manual"`` (an explicit
+        ``## Verification`` block in TASK.md), ``"inferred"`` (derived from
+        the repo contents), or ``"skipped"`` (nothing safe to run).
+      - ``commands`` — the per-command results. For backward compatibility
+        the top-level ``command`` / ``exit_code`` / ``output_preview`` /
+        ``duration_ms`` fields mirror the *aggregate* (the first failing
+        command when failed, otherwise the last command).
+      - ``repair_attempts`` — how many bounded repair passes the runner made
+        after an initial failure (0 or 1 for this task).
     """
 
     enabled: bool = False
@@ -66,6 +100,10 @@ class VerificationResult(BaseModel):
     exit_code: Optional[int] = None
     output_preview: str = ""
     duration_ms: Optional[int] = None
+    # Task 06.2E.
+    mode: str = "manual"  # "manual" | "inferred" | "skipped"
+    commands: list[VerificationCommandResult] = Field(default_factory=list)
+    repair_attempts: int = 0
 
 
 class BrowserVerificationResult(BaseModel):
@@ -145,6 +183,13 @@ class RunRecord(BaseModel):
     # populated with ``enabled=False, status="skipped"`` so the UI can
     # still display a consistent block.
     browser_verification: Optional[BrowserVerificationResult] = None
+    # Task 06.2E — transient sub-status for the automatic post-run command
+    # verification phase. ``None`` outside that phase; ``"verifying"`` while
+    # the inferred/manual commands run, ``"repairing"`` during the one bounded
+    # repair pass. The runner clears it once the run settles. The frontend
+    # treats these as in-progress so the chat thread + Runs panel show the
+    # right phase instead of a premature terminal status.
+    verification_state: Optional[str] = None
     # Task 06.2D — transient sub-status for the user-triggered browser
     # verification flow. ``None`` when no UI verification has been requested,
     # ``"running"`` while install + dev server + screenshot is in flight (the

@@ -48,6 +48,16 @@ export type RunStatus = 'running' | 'completed' | 'partial' | 'blocked' | 'faile
 
 export type VerificationStatus = 'passed' | 'failed' | 'skipped'
 
+/** Task 06.2E — per-command verification outcome. */
+export interface VerificationCommandResult {
+  command: string
+  kind: string
+  status: VerificationStatus
+  exit_code?: number | null
+  output_preview?: string
+  duration_ms?: number | null
+}
+
 export interface VerificationResult {
   enabled: boolean
   command?: string | null
@@ -55,6 +65,10 @@ export interface VerificationResult {
   exit_code?: number | null
   output_preview?: string
   duration_ms?: number | null
+  /** Task 06.2E — how commands were chosen + the per-command breakdown. */
+  mode?: 'manual' | 'inferred' | 'skipped'
+  commands?: VerificationCommandResult[]
+  repair_attempts?: number
 }
 
 export interface BrowserVerificationResult {
@@ -86,6 +100,13 @@ export interface RunRecord {
   verification?: VerificationResult | null
   browser_verification?: BrowserVerificationResult | null
   /**
+   * Task 06.2E — transient sub-status for the automatic command-verification
+   * phase: 'verifying' while inferred/manual commands run, 'repairing' during
+   * the one bounded repair pass, null once settled. The UI treats both as
+   * in-progress.
+   */
+  verification_state?: 'verifying' | 'repairing' | null
+  /**
    * Task 06.2D — transient sub-status for the user-triggered browser
    * verification flow: 'running' while install + dev server + screenshot is in
    * flight, then the terminal verification status. Only 'running' is treated as
@@ -102,4 +123,9 @@ export interface PreviewStatus {
   command?: string | null
   started_at?: string | null
   has_package_json?: boolean
+  /**
+   * Task 06.2E — node_modules is present on disk, so the project is
+   * preview-ready regardless of whether browser verification was run.
+   */
+  deps_installed?: boolean
 }

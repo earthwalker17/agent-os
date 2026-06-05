@@ -23,6 +23,7 @@ Every repo operation goes through `ToolRuntime`. The runner never imports
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,11 +31,12 @@ from typing import Any
 import llm
 
 from .manager import get_execution_workspace, read_task_state, update_task_state
-from .models import RunRecord, RunStatus, ResultSummary, TaskSpec
+from .models import RunRecord, RunStatus, ResultSummary, TaskSpec, VerificationResult
 from .memory_reconciliation import reconcile_run_memory
 from .prompts import (
     build_correction_prompt,
     build_initial_user_prompt,
+    build_repair_user_prompt,
     build_system_prompt,
     build_tool_result_prompt,
 )
@@ -49,16 +51,25 @@ from .tool_models import (
     ToolResult,
     WriteFileRequest,
 )
-from .verification import run_verification
+from .verification import plan_verification, run_verification_specs
 from .browser_verification import run_browser_verification
 
 
-# Bumped from 8 -> 16: scaffolding tasks (write package.json + index.html +
-# 2-3 src files + finalize) routinely need 5-8 write_file steps after any
-# exploration, which left no room for a final action under the old budget.
-# Verification + browser verification run AFTER the loop, so the agent
-# shouldn't spend steps running dev servers or test suites — see prompts.py.
-MAX_STEPS = 16
+log = logging.getLogger(__name__)
+
+
+# Bumped from 16 -> 24 (Task 06.2E): a minimal full-stack scaffold (backend
+# files + a Vite frontend: package.json, vite config, index.html, a couple of
+# src files) can need a dozen-plus write_file steps after any exploration, and
+# still leave room for a final action. Verification + repair + browser
+# verification all run AFTER the loop, so the agent shouldn't spend steps
+# running dev servers or test suites — see prompts.py.
+MAX_STEPS = 24
+
+# Bounded budget for the single post-verification repair pass (Task 06.2E).
+# Repairs are targeted fixes informed by the failing command output, so they
+# need far fewer steps than the initial build.
+MAX_REPAIR_STEPS = 10
 
 # The LLM transcript can grow; cap any single tool-result payload that we
 # round-trip back into the LLM. ToolRuntime already caps individual outputs at
@@ -93,6 +104,8 @@ class CodingAgentRunner:
         # are absent or empty.
         self._observed_files_changed: list[str] = []
         self._observed_commands_run: list[str] = []
+        # AGENT.md text, captured during run_task for the repair pass.
+        self._agent_md: str = ""
 
     def run_task(self, task: TaskSpec, run_id: str | None = None) -> ResultSummary:
         """Execute the Coding Agent loop and finalize artifacts.
@@ -155,6 +168,9 @@ class CodingAgentRunner:
         )
 
         agent_md = Path(ws.agent_md).read_text(encoding="utf-8") if Path(ws.agent_md).exists() else ""
+        # Stashed for the bounded repair pass (Task 06.2E), which builds its
+        # own system prompt after verification fails.
+        self._agent_md = agent_md
         task_md = read_task_state(self.project_id) or ""
 
         system_prompt = build_system_prompt(agent_md, self.project_id, MAX_STEPS)
@@ -433,16 +449,24 @@ class CodingAgentRunner:
             )
             update_task_state(self.project_id, existing + auto)
 
-        # Task 06.2A — optional verification. Runs after the agent's
-        # normal final action; never raises. A failing verify command
-        # downgrades a `completed` run to `partial`; non-completed
-        # statuses (failed/blocked/partial) are preserved either way.
-        verification = run_verification(
-            self.project_id,
-            runtime=self.runtime,
-            task_md_override=pre_update_task_md,
+        # Task 06.2A + 06.2E — automatic command verification with one bounded
+        # repair pass. Runs after the agent's normal final action; never
+        # raises. Verification commands are taken from a manual ``##
+        # Verification`` block when present, otherwise inferred from the repo.
+        # A failing verification on an otherwise-`completed` run triggers a
+        # single repair pass; if it still fails the run is downgraded to
+        # `partial`. Non-completed statuses are preserved either way.
+        observed_before_verify = set(self._observed_files_changed)
+        verification = self._verify_with_repair(
+            run_id, record, task, pre_update_task_md
         )
         record.verification = verification
+        # The repair pass may have written new files; reflect those (and only
+        # those) so the run record + result.md stay accurate without clobbering
+        # the agent's explicit final-action file list.
+        for path in self._observed_files_changed:
+            if path not in observed_before_verify and path not in record.files_changed:
+                record.files_changed.append(path)
         if (
             verification.enabled
             and verification.status == "failed"
@@ -452,6 +476,8 @@ class CodingAgentRunner:
             blocker_msg = f"verification failed: {verification.command or '(unknown command)'}"
             if blocker_msg not in record.blockers:
                 record.blockers.append(blocker_msg)
+        # Settle the transient verification sub-status now that the phase is done.
+        record.verification_state = None
         run_store.append_event(
             self.project_id,
             run_id,
@@ -459,11 +485,17 @@ class CodingAgentRunner:
                 "type": "verification",
                 "enabled": verification.enabled,
                 "status": verification.status,
+                "mode": verification.mode,
                 "command": verification.command,
                 "exit_code": verification.exit_code,
+                "repair_attempts": verification.repair_attempts,
                 "duration_ms": verification.duration_ms,
             },
         )
+        # Persist the settled verification result + cleared sub-status before
+        # the (potentially slow) automatic browser verification runs, so a poll
+        # during that window doesn't see a stale "verifying" sub-status.
+        run_store.write_run_json(self.project_id, run_id, record)
 
         # Task 06.2B — optional browser verification. Same posture as
         # command verification: runs after the agent's final action,
@@ -554,8 +586,157 @@ class CodingAgentRunner:
             browser_verification=browser_verification,
         )
 
+    # ---------- verification + repair (Task 06.2E) ----------
+
+    def _verify_with_repair(
+        self,
+        run_id: str,
+        record: RunRecord,
+        task: TaskSpec,
+        pre_update_task_md: str,
+    ) -> VerificationResult:
+        """Run command verification, with one bounded repair pass on failure.
+
+        Returns the final :class:`VerificationResult`. Never raises — any
+        unexpected error is folded into a ``failed`` aggregate so background
+        finalization is never interrupted.
+        """
+        try:
+            mode, specs = plan_verification(
+                self.project_id, pre_update_task_md, runtime=self.runtime
+            )
+        except Exception:  # noqa: BLE001
+            return VerificationResult(enabled=False, status="skipped", mode="skipped")
+
+        if not specs:
+            return VerificationResult(enabled=False, status="skipped", mode="skipped")
+
+        # Signal the "verifying" phase so a concurrent poll sees the run is
+        # still busy (the agent loop has finished, but the run isn't settled).
+        record.verification_state = "verifying"
+        run_store.write_run_json(self.project_id, run_id, record)
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {"type": "verification_started", "mode": mode, "commands": len(specs)},
+        )
+
+        verification = run_verification_specs(
+            self.project_id, specs, mode=mode, runtime=self.runtime
+        )
+
+        # Only attempt a repair when the run would otherwise be `completed` and
+        # verification actually failed. Other terminal statuses are left alone.
+        if not (verification.status == "failed" and record.status == RunStatus.COMPLETED):
+            return verification
+
+        record.verification_state = "repairing"
+        run_store.write_run_json(self.project_id, run_id, record)
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {"type": "verification_repair_started", "command": verification.command},
+        )
+
+        repaired = self._run_repair_pass(run_id, verification)
+        if not repaired:
+            # Repair could not run (e.g. LLM unavailable) or changed nothing —
+            # keep the original failed verification, just record the attempt.
+            verification.repair_attempts = 1
+            return verification
+
+        # Re-run the same specs after the repair pass.
+        reverified = run_verification_specs(
+            self.project_id, specs, mode=mode, runtime=self.runtime, repair_attempts=1
+        )
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {
+                "type": "verification_reverified",
+                "status": reverified.status,
+                "command": reverified.command,
+            },
+        )
+        return reverified
+
+    def _run_repair_pass(self, run_id: str, verification: VerificationResult) -> bool:
+        """Give the Coding Agent one bounded pass to fix a failed verification.
+
+        Returns True when the repair pass applied at least one successful file
+        mutation (so a re-verify is worthwhile) — including overwriting an
+        existing file, which is the common repair shape. Returns False when the
+        LLM is unavailable or the agent changed nothing. Never raises.
+        """
+        try:
+            failures = _format_verification_failures(verification)
+            system_prompt = build_system_prompt(
+                self._agent_md, self.project_id, MAX_REPAIR_STEPS
+            )
+            messages: list[dict[str, str]] = [
+                {"role": "user", "content": build_repair_user_prompt(failures, MAX_REPAIR_STEPS)}
+            ]
+            mutations = 0
+
+            for step in range(1, MAX_REPAIR_STEPS + 1):
+                try:
+                    action = self._llm_step(run_id, step, system_prompt, messages)
+                except _LLMProtocolError as e:
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {"type": "verification_repair_failed", "step": step, "error": str(e)},
+                    )
+                    break
+
+                if action.get("action") == "final":
+                    break
+
+                if action.get("action") == "tool_call":
+                    tool_result, dispatched = self._dispatch_tool(run_id, step, action)
+                    self._observe_tool_result(action, tool_result)
+                    if tool_result.success and dispatched["tool_name"] in {
+                        "write_file",
+                        "append_file",
+                    }:
+                        mutations += 1
+                    tool_payload = _format_tool_result_for_llm(tool_result)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": build_tool_result_prompt(
+                                dispatched["tool_name"], tool_result.success, tool_payload
+                            ),
+                        }
+                    )
+                    continue
+
+                # Unknown action shape — stop the repair pass.
+                break
+
+            return mutations > 0
+        except Exception:  # noqa: BLE001
+            log.exception("Repair pass crashed for run %s", run_id)
+            return False
+
 
 # ---------- helpers ----------
+
+
+def _format_verification_failures(verification: VerificationResult) -> str:
+    """Render the failing verification command(s) + output for the repair prompt."""
+    failed = [c for c in verification.commands if c.status == "failed"]
+    if not failed:
+        # Fall back to the aggregate single command (older shape).
+        cmd = verification.command or "(unknown command)"
+        return f"$ {cmd}\n{verification.output_preview or '(no output captured)'}"
+    blocks: list[str] = []
+    for cmd in failed:
+        head = f"$ {cmd.command}"
+        if cmd.exit_code is not None:
+            head += f"   (exit {cmd.exit_code})"
+        blocks.append(head + "\n" + (cmd.output_preview or "(no output captured)"))
+    return "\n\n".join(blocks)
 
 
 def _truncate(text: str, limit: int) -> str:
