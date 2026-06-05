@@ -319,84 +319,80 @@ test seams keep the same signatures. New regression tests
 ``test_default_runner_clean_error_when_chromium_missing``) lock in the
 diagnostics-clarity contract.
 
-### 06.2C — Project / conversation delete cleanup
-Manual smoke testing surfaced two real deletion bugs:
+### 06.2C — User-triggered browser verification flow
+06.2B made browser verification an *automatic* post-run step gated on a
+hand-written `## Browser Verification` block in `TASK.md`. 06.2C turns it
+into a **user-triggered UI flow** so a completed frontend run can be
+verified with one click — no manual `TASK.md` editing for the happy path.
 
-1. **Conversation delete silently failed** for any conversation that had
-   ever held a confirmable plan. `pending_executions` has an FK on
-   `conversations.id` and the DB enables `PRAGMA foreign_keys=ON`, but
-   `delete_conversation` / `delete_conversations_for_project` only
-   removed rows from `messages` and `conversations` — leaving the FK
-   child intact, so the parent DELETE raised `IntegrityError`. The
-   FastAPI endpoint surfaced it as a 500, but the frontend's
-   conversation handler had `if (!res.ok) return` with no `alert`, so
-   the user saw nothing happen. Affected projects became permanently
-   undeletable from the UI.
-2. **Project delete left the execution workspace orphaned.**
-   `api_delete_project` removed the `projects/{id}/` memory dir and the
-   DB rows, but never touched `execution_workspaces/{id}/`. Backend-only
-   projects looked clean; frontend projects with `repo/node_modules/`
-   stayed on disk forever.
+- **New endpoint.** `POST /api/projects/{id}/execution/runs/{run_id}/browser-verify`
+  runs verification against an existing run and writes the result back
+  into the same artifacts (`run.json`, `result.md`, `screenshots/`). It
+  rejects non-terminal runs (only `completed` / `partial` are eligible)
+  with a 409. Runs synchronously — install + dev server + screenshot is
+  seconds for a small Vite app, and the modal shows a verifying state
+  while it awaits.
+- **`run_ui_browser_verification()`** (in `browser_verification.py`)
+  reuses 06.2B's dev-server → readiness → screenshot → teardown
+  lifecycle (extracted into a shared `_core_browser_verification`) but:
+  - falls back to a default Vite command on a **non-conflicting port**
+    (`npm run dev -- --host 127.0.0.1 --port 5174`, URL
+    `http://127.0.0.1:5174`) when `TASK.md` has no block — Agent OS
+    itself uses 5173. An explicit block still wins, so advanced users
+    keep control.
+  - runs **`npm install` first** when `repo/package.json` exists,
+    capturing output. A failed (or crashing) install short-circuits the
+    flow: no dev server, no screenshot, a clear `dependency install
+    failed` preview. Missing `package.json` => install `skipped`, flow
+    proceeds. The install command also goes through
+    `ProjectSandbox.validate_command`.
+- **Status recompute.** `apply_ui_browser_verification_to_record()`
+  mirrors 06.2B (a failing verification downgrades `completed` →
+  `partial` + adds a `browser verification failed:` blocker) and adds
+  retry semantics: a prior browser blocker is cleared before recomputing,
+  and a now-passing verification restores `partial` → `completed` only
+  when no other blockers remain.
+- **Model fields.** `BrowserVerificationResult` gains optional
+  `install_command` / `install_status` / `install_output_preview`
+  (`None` on the 06.2B runner path, so no regression).
+- **UI.** `RunDetailModal` shows a **Run browser verification** button on
+  `completed` / `partial` runs (re-labelled "Re-run…" after a prior
+  attempt), with a verifying state and error surfacing; the browser block
+  now also renders the dependency-install status + output.
+- **Safety preserved.** Commands route through the sandbox; screenshot
+  path stays inside the run artifact dir; previews stay bounded; no
+  arbitrary frontend-supplied shell. AI visual judgment, multi-page
+  flows, and streaming telemetry remain out of scope. `result.md` is
+  re-rendered via `run_store.rerender_result_md`, which preserves the
+  original summary/notes.
 
-Fix:
+**Manual smoke test note:** as with 06.2B, the real screenshot path needs
+`pip install playwright` + `playwright install chromium` in the backend
+venv. Unit tests stub the installer, process starter, screenshot runner,
+and readiness probe, so no `npm`/browser binaries are needed.
 
-- `delete_conversation` and `delete_conversations_for_project` now
-  clear `pending_executions` first (child-before-parent order).
-  Regression tests in `test_pending_execution_db.py` lock this in.
-- `api_delete_project` now also removes
-  `execution_workspaces/{id}/` via a Windows-safe `rmtree` (`onexc`
-  callback strips read-only attrs on retry — the common failure mode
-  for `node_modules/` on Windows). Memory dir is removed first so the
-  DB and `projects/` cleanup happens even if a dev server still has
-  files open in the workspace. A best-effort workspace removal
-  failure is reported as `{"status": "partial", "warning": ...}`
-  rather than rolling back the memory delete.
-- Frontend conversation-delete handler now surfaces non-OK responses
-  via `alert(...)` instead of silently returning, so future DB-side
-  failures are visible.
+### Housekeeping — deletion cleanup + public example templates (non-phase)
+A batch of small maintenance changes landed alongside 06.2B. These are
+unrelated to the verification loop, so they are deliberately left
+**unnumbered** to keep the next `06.2C` slot reserved for the real
+verification-loop milestone. Brief record:
 
-### 06.2C.1 — Opt-in workspace deletion (06.2C follow-up)
-The original 06.2C always deleted `execution_workspaces/{id}/` when a
-project was deleted. That's the right default for a clean teardown, but
-it also throws away the project's actual codebase (`repo/`), which the
-user may still want even after dropping the conversations + memory. The
-delete flow is now a two-part choice:
-
-- `api_delete_project` takes a `delete_workspace: bool = False` query
-  param. DB rows + the `projects/{id}/` memory dir are always removed;
-  the execution workspace is removed **only** when `delete_workspace=true`.
-  When the workspace is kept, the response includes `workspace_kept: true`.
-- A new `GET /api/projects/{id}/workspace-status` returns
-  `{"exists": bool}` so the UI knows whether a workspace is on disk.
-- The delete-project confirmation modal (`ConfirmDialog`) gained an
-  optional checkbox. The frontend checks `workspace-status` first and,
-  when a workspace exists, shows a **"Delete its workspace too"** tick
-  box (default unchecked) plus copy noting the codebase is kept unless
-  ticked. The checkbox value is threaded back through `onConfirm` into
-  the `?delete_workspace=true` query param. A `partial` response (best-
-  effort workspace removal failed) now surfaces its warning via `alert`.
-
-### 06.2C.2 — Public example templates for the private data folders
-`memory/`, `projects/`, and `execution_workspaces/` were fully
-gitignored for privacy, which left newcomers with no on-repo picture of
-their layout. The `.gitignore` now ignores each folder's *contents*
-(`dir/*`) while un-ignoring a small set of committed explainers:
-
-- `memory/`: real `SOUL.md` (contains no private data, loaded as the
-  identity anchor) + `README.md` + `USER.example.md` /
-  `WORKSTYLE.example.md` / `MEMORY.example.md`.
-- `projects/`: `README.md` + `PROJECT.example.md` / `STATUS.example.md` /
-  `TASK_QUEUE.example.md` / `DECISIONS.example.md` / `RESEARCH.example.md`
-  (mirroring `DEFAULT_MEMORY_CONTENT`).
-- `execution_workspaces/`: `README.md` + `AGENT.example.md` /
-  `TASK.example.md` (mirroring `templates.py`).
-
-Personal projects (current and future) and the real `USER.md` /
-`WORKSTYLE.md` / `MEMORY.md` stay ignored. The example files use inert
-names (flat `*.example.md` + `README.md`) that the backend never reads —
-`list_projects` only enumerates *directories* — so they document the
-layout without polluting the project list or being mistaken for real
-state. No backend behavior change was needed for this.
+- **Delete-path fixes.** `delete_conversation` /
+  `delete_conversations_for_project` now clear the `pending_executions`
+  FK child before the parent rows (fixes silently-failing conversation
+  deletes; regression-tested in `test_pending_execution_db.py`).
+  `api_delete_project` now also removes `execution_workspaces/{id}/`
+  via a Windows-safe `rmtree`, and the frontend surfaces non-OK
+  delete responses via `alert(...)` instead of silently returning.
+- **Opt-in workspace deletion.** `api_delete_project` takes
+  `delete_workspace: bool = False`; the codebase under `repo/` is kept
+  unless the user ticks "Delete its workspace too" in the confirm
+  modal. `GET /api/projects/{id}/workspace-status` reports whether a
+  workspace is on disk.
+- **Public example templates.** `.gitignore` now ignores each private
+  folder's *contents* while committing `README.md` + `*.example.md`
+  explainers under `memory/`, `projects/`, and `execution_workspaces/`,
+  so the layout is visible on-repo without exposing private data.
 
 ### 06.1 — On-demand main-agent file inspection
 The main agent now has a bounded, sandboxed path to inspect specific
@@ -523,13 +519,14 @@ so no Anthropic API key is needed to run them.
 |--------------------------------------|------:|-------------------------------------------------|
 | `test_delegation_judge.py`           |    15 | 05.9 judge: decisions, fallbacks, parsing       |
 | `test_pending_execution.py`          |    17 | 05.9.5 serialization, revision LLM, renderers   |
-| `test_pending_execution_db.py`       |     6 | 05.9.5 SQLite lifecycle + metadata roundtrip + 06.2C FK cleanup |
+| `test_pending_execution_db.py`       |     6 | 05.9.5 SQLite lifecycle + metadata roundtrip + delete-path FK cleanup |
 | `test_memory_reconciliation.py`      |    26 | 06.0 parser, skip rules, e2e pipeline           |
 | `test_inspect.py`                    |    29 | 06.1 sandbox, parser, orchestrator loop         |
 | `test_verification.py`               |    21 | 06.2A parser, runner integration, sandbox path  |
 | `test_browser_verification.py`       |    26 | 06.2B parser, lifecycle, runner integration, drainer, Playwright subprocess diagnostics |
 | `test_runner_diagnostics.py`         |     9 | 06.2B.1 observed activity, sweep_stuck_runs     |
-| **Total**                            | **149** |                                                 |
+| `test_ui_browser_verification.py`    |    12 | 06.2C UI-triggered flow: default port 5174, install step, status recompute, artifact write |
+| **Total**                            | **161** |                                                 |
 
 Run all:
 ```bash
@@ -542,6 +539,7 @@ python tests/test_inspect.py
 python tests/test_verification.py
 python tests/test_browser_verification.py
 python tests/test_runner_diagnostics.py
+python tests/test_ui_browser_verification.py
 ```
 
 ---

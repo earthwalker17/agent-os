@@ -14,6 +14,7 @@ owns the loop logic; the API endpoints query through this store.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -189,6 +190,44 @@ def sweep_stuck_runs() -> list[str]:
             except Exception:  # noqa: BLE001
                 continue
     return swept
+
+
+_PLACEHOLDER_VALUES = {"_(no summary provided)_", "_(none)_"}
+
+
+def _extract_md_section(text: str, name: str) -> str:
+    """Return the body of a ``## {name}`` section from rendered result.md.
+
+    Captures everything between the heading and the next ``## `` heading (or
+    EOF). Returns ``""`` when the section is absent or holds only a
+    placeholder marker. Used to preserve the human-written Summary / Notes
+    when re-rendering result.md after a post-hoc verification step.
+    """
+    if not text:
+        return ""
+    match = re.search(
+        rf"^## {re.escape(name)}\n(.*?)(?=^## |\Z)",
+        text,
+        re.DOTALL | re.MULTILINE,
+    )
+    if match is None:
+        return ""
+    body = match.group(1).strip()
+    return "" if body in _PLACEHOLDER_VALUES else body
+
+
+def rerender_result_md(project_id: str, run_id: str, record: RunRecord) -> None:
+    """Regenerate result.md from ``record`` while preserving Summary / Notes.
+
+    The runner is the normal author of result.md; this is for endpoints that
+    update a finalized run in place (e.g. Task 06.2C's user-triggered browser
+    verification) and need the rendered verification blocks refreshed without
+    losing the original summary text.
+    """
+    existing = read_result_md(project_id, run_id) or ""
+    summary = _extract_md_section(existing, "Summary")
+    notes = _extract_md_section(existing, "Notes for Main Agent")
+    write_result_md(project_id, run_id, render_result_md(record, summary, notes=notes))
 
 
 def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:

@@ -90,6 +90,18 @@ function BrowserVerificationBlock({
           <span className="run-detail-verify-meta">{v.duration_ms} ms</span>
         )}
       </div>
+      {v.install_status && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Install</span>
+          <span className={`run-verify-status status-${v.install_status}`}>
+            {v.install_status}
+          </span>
+          {v.install_command && <code>{v.install_command}</code>}
+        </div>
+      )}
+      {v.install_output_preview && (
+        <pre className="run-detail-verify-output">{v.install_output_preview}</pre>
+      )}
       {v.command && (
         <div className="run-detail-verify-cmd">
           <span className="run-detail-label">Command</span>
@@ -126,6 +138,8 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
   const [resultMd, setResultMd] = useState<string>('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [verifying, setVerifying] = useState(false)
+  const [verifyError, setVerifyError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -155,6 +169,34 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
   useEffect(() => {
     load()
   }, [load])
+
+  const runBrowserVerification = useCallback(async () => {
+    setVerifying(true)
+    setVerifyError(null)
+    try {
+      const res = await fetch(
+        `/api/projects/${projectId}/execution/runs/${runId}/browser-verify`,
+        { method: 'POST' },
+      )
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`
+        try {
+          const body = await res.json()
+          if (body?.detail) detail = body.detail
+        } catch {
+          // non-JSON error body — keep the status code message
+        }
+        throw new Error(detail)
+      }
+      // Refresh the record + result.md to reflect the new verification.
+      await load()
+    } catch (err) {
+      console.error('Browser verification failed:', err)
+      setVerifyError(err instanceof Error ? err.message : 'Browser verification failed')
+    } finally {
+      setVerifying(false)
+    }
+  }, [projectId, runId, load])
 
   // Close on Escape, matching EditModal's pattern
   useEffect(() => {
@@ -228,6 +270,25 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
                   runId={runId}
                   v={record.browser_verification}
                 />
+                {(record.status === 'completed' || record.status === 'partial') && (
+                  <div className="run-detail-browser-actions">
+                    <button
+                      type="button"
+                      className="run-browser-verify-btn"
+                      onClick={runBrowserVerification}
+                      disabled={verifying}
+                      title="Install dependencies, start the dev server on port 5174, and capture a screenshot"
+                    >
+                      {verifying
+                        ? 'Verifying… (installing deps + starting dev server)'
+                        : record.browser_verification?.status === 'passed' ||
+                          record.browser_verification?.status === 'failed'
+                        ? 'Re-run browser verification'
+                        : 'Run browser verification'}
+                    </button>
+                    {verifyError && <div className="runs-error">{verifyError}</div>}
+                  </div>
+                )}
               </section>
 
               <section className="run-detail-result">

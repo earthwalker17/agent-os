@@ -1315,3 +1315,31 @@ html, body, #root {
   background: var(--bg);
   object-fit: contain;
 }
+
+.run-detail-browser-actions {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.run-browser-verify-btn {
+  align-self: flex-start;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.run-browser-verify-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.run-browser-verify-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}

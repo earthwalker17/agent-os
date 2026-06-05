@@ -65,6 +65,10 @@ export interface BrowserVerificationResult {
   screenshot_path?: string | null
   output_preview?: string
   duration_ms?: number | null
+  /** Task 06.2C — dependency install step (UI-triggered flow only). */
+  install_command?: string | null
+  install_status?: VerificationStatus | null
+  install_output_preview?: string
 }
 
 export interface RunRecord {

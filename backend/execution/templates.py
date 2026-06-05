@@ -112,15 +112,23 @@ should accomplish)
 ## Browser Verification
 
 ```bash
-# Optional (Task 06.2B): opt-in headless-browser smoke check.
-# Uncomment both lines below to enable for a frontend project.
-# Agent OS will start the command, wait for the URL to become
-# reachable, take one screenshot, and tear the server back down.
+# Optional (Task 06.2B): opt-in headless-browser smoke check that runs
+# automatically after every Coding Agent run.
+#
+# For a frontend project you usually do NOT need to fill this in: after a
+# run completes, open it in the Runs panel and click "Run browser
+# verification" (Task 06.2C). That flow installs dependencies, starts the
+# dev server on port 5174, captures a screenshot, and shows the result —
+# no TASK.md edits required.
+#
+# Uncomment both lines below only to override the command/URL or to run
+# the check automatically after every run. Agent OS uses port 5173 for
+# itself, so the verified app must use a different port (5174 by default).
 # Leave commented out for backend-only projects.
 #
 # Example:
-#   npm run dev -- --host 127.0.0.1
-#   url: http://127.0.0.1:5173
+#   npm run dev -- --host 127.0.0.1 --port 5174
+#   url: http://127.0.0.1:5174
 ```
 """
 

@@ -57,8 +57,12 @@ from execution.tool_models import (
     SearchFilesRequest,
     RunShellRequest,
 )
-from execution.models import TaskSpec
+from execution.models import TaskSpec, RunRecord, RunStatus
 from execution import run_store
+from execution.browser_verification import (
+    run_ui_browser_verification,
+    apply_ui_browser_verification_to_record,
+)
 from execution.inspect import (
     list_repo_files,
     read_repo_file,
@@ -931,6 +935,63 @@ def api_get_run_screenshot(project_id: str, run_id: str):
     if not screenshot.exists() or not screenshot.is_file():
         raise HTTPException(status_code=404, detail="screenshot not found")
     return FileResponse(str(screenshot), media_type="image/png")
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/browser-verify")
+def api_run_browser_verification(project_id: str, run_id: str):
+    """User-triggered browser verification for an existing run (Task 06.2C).
+
+    Reuses the 06.2B browser-verification infrastructure but adds a frontend
+    dependency-install step and a sensible default dev command (port 5174),
+    so a completed frontend run can be verified from the UI without editing
+    TASK.md. Writes the result back into the same run artifacts (run.json,
+    result.md, screenshots/) and updates run status consistently — a failing
+    verification downgrades a ``completed`` run to ``partial``.
+
+    Runs synchronously: install + dev-server + screenshot takes seconds for a
+    small Vite app, and the caller (RunDetailModal) shows a verifying state
+    while awaiting the response.
+    """
+    _require_workspace(project_id)
+    raw = run_store.read_run_json(project_id, run_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        record = RunRecord(**raw)
+    except Exception:
+        raise HTTPException(status_code=500, detail="run record is corrupt")
+    if record.status not in (RunStatus.COMPLETED, RunStatus.PARTIAL):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "browser verification can only run on a completed run "
+                f"(status={record.status.value})"
+            ),
+        )
+
+    result = run_ui_browser_verification(
+        project_id,
+        run_dir=run_store.get_run_dir(project_id, run_id),
+    )
+    apply_ui_browser_verification_to_record(record, result)
+
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.rerender_result_md(project_id, run_id, record)
+    run_store.append_event(
+        project_id,
+        run_id,
+        {
+            "type": "browser_verification_ui",
+            "enabled": result.enabled,
+            "status": result.status,
+            "command": result.command,
+            "url": result.url,
+            "install_status": result.install_status,
+            "screenshot_path": result.screenshot_path,
+            "duration_ms": result.duration_ms,
+        },
+    )
+    return record.model_dump()
 
 
 # --- Main-agent file inspection endpoints (Task 06.1) ---

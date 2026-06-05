@@ -94,6 +94,15 @@ class BrowserVerificationResult(BaseModel):
     screenshot_path: Optional[str] = None
     output_preview: str = ""
     duration_ms: Optional[int] = None
+    # Task 06.2C — optional dependency-install step for the UI-triggered
+    # flow. ``None`` for the TASK.md-driven runner path (06.2B), which does
+    # not install anything. For the user-triggered flow, ``install_status``
+    # is ``"passed"`` (install succeeded), ``"failed"`` (install failed —
+    # browser screenshot capture is skipped), or ``"skipped"`` (no
+    # ``package.json`` in the repo, so nothing to install).
+    install_command: Optional[str] = None
+    install_status: Optional[str] = None  # "passed" | "failed" | "skipped"
+    install_output_preview: str = ""
 
 
 class RunRecord(BaseModel):

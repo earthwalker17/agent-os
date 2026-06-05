@@ -273,9 +273,9 @@ function App() {
     setConfirmDialog({
       message: workspaceExists
         ? `Delete project "${projectId}" and all its conversations? This cannot be undone. ` +
-          `Its codebase workspace is kept unless you tick the box below.`
+          `Its execution workspace is kept unless you tick the box below.`
         : `Delete project "${projectId}" and all its conversations? This cannot be undone.`,
-      checkboxLabel: workspaceExists ? 'Delete its workspace too' : undefined,
+      checkboxLabel: workspaceExists ? 'Delete its execution workspace too' : undefined,
       onConfirm: (deleteWorkspace: boolean) => {
         setConfirmDialog(null)
         const url = `/api/projects/${projectId}${deleteWorkspace ? '?delete_workspace=true' : ''}`

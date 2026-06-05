@@ -48,15 +48,18 @@ on purpose.
 
 **Phase 1 & 2** (workspace + memory + orchestration + semantic
 writeback) are complete. **Phase 3 — Execution Layer** is complete
-through **Task 06.2B** (opt-in browser verification MVP). The Coding
+through **Task 06.2C** (user-triggered browser verification). The Coding
 Agent runs sandboxed jobs in the background, the runs panel
 auto-refreshes, inferred coding intent is surfaced as a confirmable
 plan, terminal runs reconcile back into project memory, the main
 agent can inspect specific repo files on demand through a bounded
 sandboxed channel, and post-run verification now covers both a
 project-defined verify command (06.2A) and an opt-in headless-browser
-screenshot of a project-managed dev server (06.2B). Either failing
-check downgrades `completed` to `partial`.
+screenshot of a project-managed dev server (06.2B). After a frontend run
+completes, one click in the run detail view (06.2C) installs
+dependencies, starts the dev server on port 5174, and captures a
+screenshot — no manual `TASK.md` editing. Either failing check
+downgrades `completed` to `partial`.
 
 Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 
