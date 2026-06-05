@@ -439,15 +439,21 @@ function App() {
         return
       }
       const data = await res.json()
+      // Task 06.2D — a dispatched run id (from an @code message) is echoed on
+      // the response; carry it in metadata so the chat-first run follow-up card
+      // attaches to this message (and survives a reload via persisted metadata).
+      const newMsgMeta: Record<string, unknown> | null = data.run_id
+        ? { run_id: data.run_id }
+        : data.pending_execution
+        ? { pending_execution_id: data.pending_execution.pending_execution_id }
+        : null
       const newMsg: Message = {
         id: data.message_id ?? undefined,
         role: data.role,
         content: data.content,
         timestamp: data.timestamp,
         pending_execution: data.pending_execution ?? null,
-        metadata: data.pending_execution
-          ? { pending_execution_id: data.pending_execution.pending_execution_id }
-          : null,
+        metadata: newMsgMeta,
       }
       setMessages(prev => [...prev, newMsg])
 
@@ -598,6 +604,7 @@ function App() {
         revisingPendingId={revisingPendingId}
         revisingPendingTitle={revisingPendingTitle}
         onCancelRevise={handleCancelRevise}
+        onRunsChanged={() => setRunsRefreshKey(k => k + 1)}
       />
       <ContextPanel
         projectId={isGeneralActive ? null : activeProject}

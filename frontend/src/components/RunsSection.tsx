@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { RunRecord } from '../types'
+import type { PreviewStatus, RunRecord } from '../types'
 import RunDetailModal from './RunDetailModal'
 
 interface Props {
@@ -23,11 +23,20 @@ function formatTime(iso: string | undefined | null): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+// A run is "active" (panel should auto-refresh + look busy) while the build
+// loop runs OR while a user-triggered browser verification is in flight.
+function isActive(run: RunRecord): boolean {
+  return run.status === 'running' || run.browser_verification_state === 'running'
+}
+
 function RunsSection({ projectId, refreshSignal }: Props) {
   const [runs, setRuns] = useState<RunRecord[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [openRunId, setOpenRunId] = useState<string | null>(null)
+  const [preview, setPreview] = useState<PreviewStatus | null>(null)
+  const [previewBusy, setPreviewBusy] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
 
   const loadRuns = useCallback(async () => {
     setLoading(true)
@@ -54,31 +63,113 @@ function RunsSection({ projectId, refreshSignal }: Props) {
     }
   }, [projectId])
 
+  const loadPreview = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/preview/status`)
+      if (!res.ok) {
+        setPreview(null)
+        return
+      }
+      setPreview(await res.json())
+    } catch (err) {
+      console.error('Failed to load preview status:', err)
+      setPreview(null)
+    }
+  }, [projectId])
+
   // Initial load + reload on project switch + manual refresh signal.
   useEffect(() => {
     loadRuns()
-  }, [loadRuns, refreshSignal])
+    loadPreview()
+  }, [loadRuns, loadPreview, refreshSignal])
 
-  // Auto-poll while any run is in `running` state. The effect re-binds only
-  // when the *presence* of running runs flips, not on every fetch tick, so
-  // the interval keeps a steady cadence.
-  const runningCount = runs.filter((r) => r.status === 'running').length
-  const hasRunning = runningCount > 0
+  // Auto-poll while any run is active. The effect re-binds only when the
+  // *presence* of active runs flips, not on every fetch tick, so the interval
+  // keeps a steady cadence. We refresh preview status alongside so a kept-alive
+  // preview (after a passing verification) surfaces promptly.
+  const activeCount = runs.filter(isActive).length
+  const hasActive = activeCount > 0
 
   useEffect(() => {
-    if (!hasRunning) return
+    if (!hasActive) return
     const id = window.setInterval(() => {
       loadRuns()
+      loadPreview()
     }, POLL_INTERVAL_MS)
     return () => window.clearInterval(id)
-  }, [hasRunning, loadRuns])
+  }, [hasActive, loadRuns, loadPreview])
+
+  const startPreview = useCallback(async () => {
+    setPreviewBusy(true)
+    setPreviewError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/preview/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data?.detail || `HTTP ${res.status}`)
+      }
+      setPreview(data)
+      // Open the preview in the user's browser tab once it's reachable.
+      if (data?.url) window.open(data.url, '_blank', 'noopener')
+    } catch (err) {
+      console.error('Start preview failed:', err)
+      setPreviewError(err instanceof Error ? err.message : 'Failed to start preview')
+    } finally {
+      setPreviewBusy(false)
+    }
+  }, [projectId])
+
+  const stopPreview = useCallback(async () => {
+    setPreviewBusy(true)
+    setPreviewError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/preview/stop`, { method: 'POST' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data?.detail || `HTTP ${res.status}`)
+      }
+      // Re-read the full status (the stop response omits has_package_json, so
+      // trusting it directly would hide the control). loadPreview keeps the
+      // control in place, now showing a (disabled-until-deps) Start button.
+      await loadPreview()
+    } catch (err) {
+      console.error('Stop preview failed:', err)
+      setPreviewError(err instanceof Error ? err.message : 'Failed to stop preview')
+    } finally {
+      setPreviewBusy(false)
+    }
+  }, [projectId, loadPreview])
+
+  // The preview control is shown for any frontend app (has package.json) and
+  // stays put — the button just toggles between Start and Stop. Start is only
+  // clickable once dependencies have installed successfully at least once (a
+  // browser verification's install step proves the dev server is openable —
+  // independent of whether that verification itself passed), and no run is
+  // currently active.
+  const installedAtLeastOnce = runs.some(
+    (r) => r.browser_verification?.install_status === 'passed',
+  )
+  const previewRunning = !!preview?.running
+  const showPreviewControl = !!preview?.has_package_json
+  const startDisabled = previewBusy || hasActive || !installedAtLeastOnce
+  const startTitle = !installedAtLeastOnce
+    ? 'Install dependencies first — run browser verification on a completed run'
+    : hasActive
+    ? 'Wait for the current run to finish'
+    : 'Start the dev server and open the preview'
+
+  const runningCount = activeCount
 
   return (
     <details className="runs-section" open>
       <summary>
         <span className="runs-summary-left">
           <span>Runs</span>
-          {hasRunning && (
+          {hasActive && (
             <span
               className="runs-running-indicator"
               title={`${runningCount} run${runningCount === 1 ? '' : 's'} in progress — auto-refreshing every ${POLL_INTERVAL_MS / 1000}s`}
@@ -96,11 +187,60 @@ function RunsSection({ projectId, refreshSignal }: Props) {
             e.preventDefault()
             e.stopPropagation()
             loadRuns()
+            loadPreview()
           }}
         >
           {loading ? '…' : '↻'}
         </button>
       </summary>
+
+      {showPreviewControl && (
+        <div className="preview-control">
+          {previewRunning ? (
+            <>
+              <div className="preview-control-row">
+                <span className="preview-running-badge">
+                  <span className="runs-running-dot" /> Preview running
+                </span>
+                <button
+                  type="button"
+                  className="preview-stop-btn"
+                  onClick={stopPreview}
+                  disabled={previewBusy}
+                >
+                  {previewBusy ? '…' : 'Stop preview'}
+                </button>
+              </div>
+              {preview?.url && (
+                <a
+                  className="preview-url-link"
+                  href={preview.url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {preview.url}
+                </a>
+              )}
+            </>
+          ) : (
+            <div className="preview-control-row">
+              <button
+                type="button"
+                className="preview-start-btn"
+                onClick={startPreview}
+                disabled={startDisabled}
+                title={startTitle}
+              >
+                {previewBusy ? 'Starting…' : 'Start preview'}
+              </button>
+              {!installedAtLeastOnce && (
+                <span className="preview-hint">Install deps first</span>
+              )}
+            </div>
+          )}
+          {previewError && <div className="runs-error">{previewError}</div>}
+        </div>
+      )}
 
       {error && <div className="runs-error">{error}</div>}
 
@@ -116,6 +256,7 @@ function RunsSection({ projectId, refreshSignal }: Props) {
             const filesCount = run.files_changed?.length ?? 0
             const cmdsCount = run.commands_run?.length ?? 0
             const time = formatTime(run.completed_at) || formatTime(run.created_at)
+            const verifying = run.browser_verification_state === 'running'
             return (
               <li key={run.run_id}>
                 <button
@@ -126,7 +267,9 @@ function RunsSection({ projectId, refreshSignal }: Props) {
                 >
                   <div className="run-row-top">
                     <span className="run-title">{run.task_title || '(untitled run)'}</span>
-                    <span className={`run-status status-${run.status}`}>{run.status}</span>
+                    <span className={`run-status status-${verifying ? 'running' : run.status}`}>
+                      {verifying ? 'verifying' : run.status}
+                    </span>
                   </div>
                   <div className="run-row-meta">
                     {time && <span>{time}</span>}

@@ -57,15 +57,20 @@ def handle_code_delegation(
     project_id: str,
     project_name: str | None,
     user_message: str,
-) -> str:
-    """Dispatch the Coding Agent for a `@code …` chat message and return the
-    immediate assistant-facing markdown reply (a placeholder while the run
-    executes in the background). Pre-condition: caller has confirmed the
-    project is not the GENERAL workspace and the message starts with `@code`.
+) -> tuple[str, str | None]:
+    """Dispatch the Coding Agent for a `@code …` chat message.
+
+    Returns ``(reply_markdown, run_id)`` where ``reply_markdown`` is the
+    immediate assistant-facing message (a natural "Coding Agent is running"
+    note while the run executes in the background) and ``run_id`` is the
+    dispatched run's id (``None`` on the empty-task / dispatch-error paths so
+    the chat-first run follow-up card is not attached). Pre-condition: caller
+    has confirmed the project is not the GENERAL workspace and the message
+    starts with `@code`.
     """
     task_card = extract_task_card(user_message)
     if not task_card:
-        return EMPTY_TASK_MESSAGE
+        return EMPTY_TASK_MESSAGE, None
 
     # Idempotent — creates folders and seeds AGENT.md/TASK.md only if missing.
     init_execution_workspace(project_id, project_name)
@@ -76,9 +81,9 @@ def handle_code_delegation(
     try:
         record = get_default_manager().dispatch(project_id, spec)
     except Exception as e:
-        return _format_dispatch_error(e)
+        return _format_dispatch_error(e), None
 
-    return _format_dispatch_placeholder(project_id, record)
+    return _format_dispatch_placeholder(record), record.run_id
 
 
 # ---------- helpers ----------
@@ -91,17 +96,17 @@ def _derive_title(task_card: str) -> str:
     return first_line or "Untitled coding task"
 
 
-def _format_dispatch_placeholder(project_id: str, record: RunRecord) -> str:
+def _format_dispatch_placeholder(record: RunRecord) -> str:
+    """Natural chat-first placeholder (Task 06.2D).
+
+    The structured run-id / endpoint card is gone — the live run status, the
+    completion summary, and the browser-verification controls are rendered by
+    the chat-level run follow-up card, which keys off the message's ``run_id``
+    metadata. This text is just the conversational lead-in.
+    """
     return (
-        f"## Coding Agent Run Started\n\n"
-        f"**Run ID:** `{record.run_id}`\n"
-        f"**Status:** running\n"
-        f"**Task:** {record.task_title}\n\n"
-        f"The Coding Agent is working on this in the background. Open the "
-        f"**Runs** panel on the right and hit refresh to see the result when "
-        f"it's ready, or fetch:\n\n"
-        f"- `/api/projects/{project_id}/execution/runs/{record.run_id}` — run record\n"
-        f"- `/api/projects/{project_id}/execution/runs/{record.run_id}/result` — rendered result.md\n"
+        f"**Coding Agent is running** — _{record.task_title}_.\n\n"
+        f"I'll update this thread when the first build pass finishes."
     )
 
 

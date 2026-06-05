@@ -52,7 +52,7 @@ These were landed before the execution layer began. They are stable.
 
 ---
 
-## Phase 3 — Execution Layer (Complete through 06.2C)
+## Phase 3 — Execution Layer (Complete through 06.2D)
 
 ### 05.1 — Execution workspace foundation
 Per-project workspaces under `execution_workspaces/{project_id}/`:
@@ -371,6 +371,67 @@ verified with one click — no manual `TASK.md` editing for the happy path.
 venv. Unit tests stub the installer, process starter, screenshot runner,
 and readiness probe, so no `npm`/browser binaries are needed.
 
+### 06.2D — Chat-first run workflow + persistent preview
+06.2C put the browser-verification trigger inside `RunDetailModal`. 06.2D
+moves the **whole build-and-preview loop into the main chat thread** and
+demotes the modal to a detailed inspection view. The chat becomes the
+operating console; the Runs panel is a compact status overview; the modal
+answers "what exactly happened in this run?".
+
+- **Chat-first run lifecycle.** Both `@code` and a confirmed pending plan now
+  post a natural "**Coding Agent is running** — _title_. I'll update this
+  thread when the first build pass finishes." message instead of a structured
+  run-id/endpoint card. The dispatched `run_id` rides along in the assistant
+  message metadata (`ChatResponse.run_id` for `@code`; the confirm endpoint
+  already persisted it) so the follow-up card re-hydrates after a reload.
+  `handle_code_delegation` now returns `(reply, run_id)`.
+- **`RunChatCard` (frontend).** Attached to any assistant message carrying a
+  `run_id`, it owns the in-chat run lifecycle: a live "working…" line while the
+  build runs (polls `GET /runs/{id}` every 2s), then a natural completion
+  summary built from the run's structured fields (`status`, `summary`,
+  `files_changed`, `blockers`) — never a dump of `result.md`. For
+  `completed`/`partial` runs it renders the primary **Run browser
+  verification** button, an in-chat progress line while verifying, and on
+  success the live **preview URL + screenshot thumbnail** (click → lightbox)
+  with a short install/verification summary. A **Details** link opens the
+  modal. `RunRecord` gained a `summary` field (mirrors `ResultSummary.summary`)
+  so the card needs no `result.md` round-trip.
+- **In-progress sub-status.** The `browser-verify` endpoint writes
+  `RunRecord.browser_verification_state = "running"` *before* the blocking
+  install + dev-server + screenshot work (and appends a
+  `browser_verification_started` event), then settles it to the terminal
+  status. A concurrent Runs-panel poll therefore sees the run active again
+  ("verifying") rather than looking finished; the panel treats that state as
+  active and keeps auto-refreshing. Still synchronous, no streaming.
+- **Persistent preview (Part 6 + 8).** New `execution/preview.py` is a small
+  process-local registry of long-lived dev servers (one per project), reusing
+  06.2B's drainer / readiness / teardown helpers. On a **passing** user-triggered
+  browser verification the still-running dev server is **handed off** to the
+  registry (`keep_alive_registrar` → `adopt_preview`) instead of being torn
+  down, so the captured URL stays live. New endpoints:
+  `POST /preview/start`, `POST /preview/stop`, `GET /preview/status`
+  (sandbox-validated default `npm run dev -- --host 127.0.0.1 --port 5174`,
+  URL `http://127.0.0.1:5174`). `start_preview` only reports `running` after
+  the URL is reachable (early process exit is detected and torn down — no dead
+  URL leaks), refuses to spawn a duplicate, and the FastAPI shutdown hook calls
+  `shutdown_all_previews()` so no node processes are orphaned.
+- **Runs panel preview control (Part 7).** Above the runs list, a **Start
+  preview** / **Stop preview** control appears when the project has a
+  `package.json`, all runs are settled, and deps have installed at least once
+  (a passing browser verification proves it) or a preview is already running.
+  Start opens the URL in a new tab once reachable; the panel shows the live URL
+  while running.
+- **Modal demotion (Part 9).** `RunDetailModal` no longer renders the primary
+  **Run browser verification** button or the inline screenshot — it now shows
+  the saved screenshot path with an "open artifact" link, keeps install /
+  browser status, command, URL, output preview, and `result.md`, and points the
+  user to the chat thread for the action.
+- **Safety preserved.** Preview + dev-server commands route through
+  `ProjectSandbox.validate_command`; output previews stay bounded; the
+  screenshot path stays inside the run artifact dir; no arbitrary
+  frontend-supplied shell. AI visual judgment and streaming telemetry remain
+  out of scope.
+
 ### Housekeeping — deletion cleanup + public example templates (non-phase)
 A batch of small maintenance changes landed alongside 06.2B. These are
 unrelated to the verification loop, so they are deliberately left
@@ -454,7 +515,8 @@ surfaces which files were read.
 | `memory_reconciliation.py` | Post-run memory reconciliation (06.0)              |
 | `inspect.py`               | Main-agent file inspection (06.1)                  |
 | `verification.py`          | Post-run command verification (06.2A)              |
-| `browser_verification.py`  | Post-run browser verification MVP (06.2B)          |
+| `browser_verification.py`  | Post-run browser verification + UI flow (06.2B/C)  |
+| `preview.py`               | Managed long-lived preview dev servers (06.2D)     |
 
 ### Execution-trigger contract
 
@@ -492,6 +554,12 @@ surfaces which files were read.
   skip the browser path entirely. **No AI visual judgment yet** —
   screenshots are stored and rendered, not analyzed. Streaming run
   telemetry and multi-page browser flows are also still future work.
+  The **chat-first flow (06.2D)** drives the user-facing loop from the
+  chat thread (run note → completion summary → Run browser verification →
+  live preview URL + screenshot) and keeps the dev server alive after a
+  passing user-triggered verification via the managed `preview.py` layer
+  (Start/Stop preview from the Runs panel). At most one preview dev server
+  per project; it is sandbox-validated and torn down on backend shutdown.
 - **Up to four LLM calls per non-`@code` project chat turn** —
   delegation judge + (optional inspection loop iterations) + chat
   response + memory judge. The inspection loop is only entered when
@@ -526,7 +594,9 @@ so no Anthropic API key is needed to run them.
 | `test_browser_verification.py`       |    26 | 06.2B parser, lifecycle, runner integration, drainer, Playwright subprocess diagnostics |
 | `test_runner_diagnostics.py`         |     9 | 06.2B.1 observed activity, sweep_stuck_runs     |
 | `test_ui_browser_verification.py`    |    12 | 06.2C UI-triggered flow: default port 5174, install step, status recompute, artifact write |
-| **Total**                            | **161** |                                                 |
+| `test_preview.py`                    |    11 | 06.2D preview registry: start/stop/status, readiness gate, no-duplicate, adopt, keep-alive handoff |
+| `test_chat_first_endpoints.py`       |     3 | 06.2D HTTP: browser-verify in-progress sub-status + artifact path, preview start/status/duplicate/stop |
+| **Total**                            | **175** |                                                 |
 
 Run all:
 ```bash
@@ -540,6 +610,8 @@ python tests/test_verification.py
 python tests/test_browser_verification.py
 python tests/test_runner_diagnostics.py
 python tests/test_ui_browser_verification.py
+python tests/test_preview.py
+python tests/test_chat_first_endpoints.py
 ```
 
 ---

@@ -1343,3 +1343,276 @@ html, body, #root {
   opacity: 0.6;
   cursor: progress;
 }
+
+.run-detail-screenshot-link {
+  font-size: 12px;
+  color: #6ab3ff;
+  margin-left: 8px;
+}
+
+.run-detail-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  margin-top: 8px;
+}
+
+/* ---------- Task 06.2D — chat-first run follow-up card ---------- */
+
+.run-chat-card {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.run-chat-card p {
+  margin: 0;
+}
+
+.run-chat-status-line,
+.run-chat-verify-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #6ab3ff;
+  font-size: 12px;
+}
+
+.run-chat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6ab3ff;
+  flex-shrink: 0;
+  animation: run-chat-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes run-chat-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.run-chat-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.run-chat-files {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.run-chat-files code,
+.run-chat-verify-result code {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 11px;
+  background: var(--bg-elev, rgba(255, 255, 255, 0.05));
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.run-chat-blockers {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: #f5a06b;
+}
+
+.run-chat-muted {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.run-chat-verify-result {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+}
+
+.run-chat-verify-result.passed {
+  border-color: #2f6b42;
+  background: rgba(95, 200, 130, 0.06);
+}
+
+.run-chat-verify-result.failed {
+  border-color: #6b3f24;
+  background: rgba(245, 160, 107, 0.06);
+}
+
+.run-chat-preview-url a {
+  color: #6ab3ff;
+  word-break: break-all;
+}
+
+.run-chat-screenshot-btn {
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: zoom-in;
+  align-self: flex-start;
+}
+
+.run-chat-screenshot-thumb {
+  max-width: 240px;
+  max-height: 160px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  object-fit: contain;
+}
+
+.run-chat-verify-output {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 8px 10px;
+  background: var(--bg);
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 0;
+}
+
+.run-chat-error {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.run-chat-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.run-chat-verify-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.run-chat-verify-btn:hover {
+  filter: brightness(1.08);
+}
+
+.run-chat-details-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.run-chat-details-btn:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.run-chat-lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  cursor: zoom-out;
+  padding: 24px;
+}
+
+.run-chat-lightbox img {
+  max-width: 95%;
+  max-height: 95%;
+  border-radius: 6px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+}
+
+/* ---------- Task 06.2D — Runs panel preview control ---------- */
+
+.preview-control {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.preview-control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.preview-running-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #5fc882;
+}
+
+.preview-start-btn,
+.preview-stop-btn {
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 4px;
+  cursor: pointer;
+  border: none;
+}
+
+.preview-start-btn {
+  color: #fff;
+  background: var(--accent);
+}
+
+.preview-start-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.preview-stop-btn {
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+}
+
+.preview-stop-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.preview-url-link {
+  font-size: 11px;
+  color: #6ab3ff;
+  word-break: break-all;
+}
+
+.preview-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}

@@ -62,7 +62,10 @@ from execution import run_store
 from execution.browser_verification import (
     run_ui_browser_verification,
     apply_ui_browser_verification_to_record,
+    DEFAULT_DEV_COMMAND,
+    DEFAULT_DEV_URL,
 )
+from execution import preview
 from execution.inspect import (
     list_repo_files,
     read_repo_file,
@@ -103,6 +106,12 @@ def shutdown():
     # cleanly. In-flight runs are not awaited — their artifacts may end in an
     # inconsistent state if the server is killed mid-run.
     shutdown_default_manager(wait=False)
+    # Task 06.2D — stop any managed preview dev servers so we don't orphan
+    # long-lived node processes when the backend exits.
+    try:
+        preview.shutdown_all_previews()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[shutdown] shutdown_all_previews failed: {type(exc).__name__}: {exc}")
 
 
 # --- Project endpoints ---
@@ -438,6 +447,11 @@ class ChatResponse(BaseModel):
     # rendered message with the persisted row (used for re-rendering on
     # reload via message metadata).
     message_id: str | None = None
+    # Task 06.2D — when this chat turn dispatched a Coding Agent run (a `@code`
+    # message), echo the run id so the frontend attaches the chat-first run
+    # follow-up card (live status + browser-verification controls) to the
+    # assistant message. ``None`` for ordinary chat turns.
+    run_id: str | None = None
     # Task 06.1 — when the orchestrator inspected repo files to answer
     # the user, surface that list so the UI can clearly distinguish
     # answers grounded in memory from answers grounded in file reads.
@@ -480,14 +494,20 @@ def api_chat(req: ChatRequest):
     # is skipped: the runner already updates TASK.md, and project memory
     # judgment shouldn't be triggered by tool-style delegation requests.
     if is_code_delegation(req.message):
+        run_id: str | None = None
         if is_general:
             response_content = GENERAL_REJECTION_MESSAGE
         else:
             project_name = _project_display_name(project_id)
-            response_content = handle_code_delegation(
+            response_content, run_id = handle_code_delegation(
                 project_id, project_name, req.message
             )
-        assistant_msg = add_message(req.conversation_id, "assistant", response_content)
+        # Attach the run id to the message metadata so the chat-first run
+        # follow-up card re-hydrates after a reload.
+        meta = {"run_id": run_id} if run_id else None
+        assistant_msg = add_message(
+            req.conversation_id, "assistant", response_content, metadata=meta
+        )
         if len([m for m in messages if m["role"] == "user"]) <= 1:
             title = req.message[:60] + ("..." if len(req.message) > 60 else "")
             update_conversation_title(req.conversation_id, title)
@@ -498,6 +518,7 @@ def api_chat(req: ChatRequest):
             memory_updated=False,
             memory_updates=[],
             message_id=assistant_msg["id"],
+            run_id=run_id,
         )
 
     history = [{"role": m["role"], "content": m["content"]} for m in messages]
@@ -969,11 +990,31 @@ def api_run_browser_verification(project_id: str, run_id: str):
             ),
         )
 
+    # Task 06.2D — mark the run as actively browser-verifying BEFORE the
+    # blocking work so a concurrent Runs-panel poll (served on a separate
+    # thread) sees the run is active again rather than looking finished/stale.
+    record.browser_verification_state = "running"
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.append_event(
+        project_id, run_id, {"type": "browser_verification_started"}
+    )
+
+    # On a passing verification, hand the still-running dev server off to the
+    # managed preview layer so the captured URL stays usable (Task 06.2D).
+    def _keep_alive(proc, stdout_drainer, stderr_drainer, command, url) -> bool:
+        return preview.adopt_preview(
+            project_id, proc, stdout_drainer, stderr_drainer, command, url
+        )
+
     result = run_ui_browser_verification(
         project_id,
         run_dir=run_store.get_run_dir(project_id, run_id),
+        keep_alive_registrar=_keep_alive,
     )
     apply_ui_browser_verification_to_record(record, result)
+    # Settle the transient sub-status to the terminal verification status so
+    # the frontend stops showing the in-progress state.
+    record.browser_verification_state = result.status
 
     run_store.write_run_json(project_id, run_id, record)
     run_store.rerender_result_md(project_id, run_id, record)
@@ -992,6 +1033,47 @@ def api_run_browser_verification(project_id: str, run_id: str):
         },
     )
     return record.model_dump()
+
+
+# --- Managed preview server endpoints (Task 06.2D) ---
+# A small process-local layer that keeps a project's dev server alive so the
+# preview URL returned after a successful browser verification stays usable,
+# and so the Runs panel can explicitly Start / Stop a preview. The dev-server
+# command is sandbox-validated; at most one preview runs per project.
+
+
+@app.get("/api/projects/{project_id}/preview/status")
+def api_preview_status(project_id: str):
+    _require_workspace(project_id)
+    return preview.get_preview_status(project_id)
+
+
+class StartPreviewRequest(BaseModel):
+    # Optional overrides; both default to the standard Vite dev command on the
+    # non-conflicting 5174 port (Agent OS itself uses 5173). The command still
+    # goes through the sandbox before launch.
+    command: str = DEFAULT_DEV_COMMAND
+    url: str = DEFAULT_DEV_URL
+
+
+@app.post("/api/projects/{project_id}/preview/start")
+def api_preview_start(project_id: str, req: StartPreviewRequest):
+    _require_workspace(project_id)
+    status = preview.start_preview(
+        project_id, command=req.command, url=req.url
+    )
+    if not status.get("ok"):
+        raise HTTPException(
+            status_code=409,
+            detail=status.get("error") or "failed to start preview server",
+        )
+    return status
+
+
+@app.post("/api/projects/{project_id}/preview/stop")
+def api_preview_stop(project_id: str):
+    _require_workspace(project_id)
+    return preview.stop_preview(project_id)
 
 
 # --- Main-agent file inspection endpoints (Task 06.1) ---
@@ -1106,15 +1188,13 @@ def api_confirm_pending_execution(project_id: str, pending_id: str):
             ),
         )
 
-    # Drop an inline confirmation message into the chat so the user can see
-    # the new run id without scanning the runs panel.
+    # Drop an inline confirmation message into the chat. The live status,
+    # completion summary, and browser-verification controls are rendered by
+    # the chat-first run follow-up card, which keys off the ``run_id``
+    # metadata below — so this is just the conversational lead-in (Task 06.2D).
     confirmation_body = (
-        "## Coding Agent Run Started\n\n"
-        f"**Run ID:** `{record.run_id}`\n"
-        f"**Status:** running\n"
-        f"**Task:** {record.task_title}\n\n"
-        "The Coding Agent is working on this in the background. Open the "
-        "**Runs** panel on the right to track progress."
+        f"**Coding Agent is running** — _{record.task_title}_.\n\n"
+        "I'll update this thread when the first build pass finishes."
     )
     add_message(
         plan.conversation_id,

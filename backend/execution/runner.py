@@ -409,6 +409,9 @@ class CodingAgentRunner:
         record.files_changed = files_changed
         record.commands_run = commands_run
         record.blockers = blockers
+        # Task 06.2D — persist the summary on the record so the chat-first run
+        # follow-up card can render a natural completion message from run.json.
+        record.summary = summary
 
         # Snapshot the pre-update TASK.md so the verify command is read
         # from the project's persistent config, even when the agent's

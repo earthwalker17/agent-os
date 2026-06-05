@@ -70,6 +70,15 @@ from .memory_reconciliation import (
     TAG_SKIPPED_NON_TERMINAL,
     TAG_SKIPPED_READ_ONLY,
 )
+from . import preview
+from .preview import (
+    PreviewServer,
+    adopt_preview,
+    get_preview_status,
+    shutdown_all_previews,
+    start_preview,
+    stop_preview,
+)
 from .inspect import (
     InspectionResult,
     INSPECT_MAX_LIST_ENTRIES,
@@ -140,6 +149,13 @@ __all__ = [
     "TAG_SKIPPED_NO_VALID_UPDATES",
     "TAG_SKIPPED_NON_TERMINAL",
     "TAG_SKIPPED_READ_ONLY",
+    "preview",
+    "PreviewServer",
+    "adopt_preview",
+    "get_preview_status",
+    "shutdown_all_previews",
+    "start_preview",
+    "stop_preview",
     "InspectionResult",
     "INSPECT_MAX_LIST_ENTRIES",
     "INSPECT_MAX_READ_CHARS",

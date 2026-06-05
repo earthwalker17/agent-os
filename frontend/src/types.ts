@@ -81,6 +81,25 @@ export interface RunRecord {
   files_changed?: string[]
   commands_run?: string[]
   blockers?: string[]
+  /** Task 06.2D — concise run summary, mirrors result.md's Summary section. */
+  summary?: string
   verification?: VerificationResult | null
   browser_verification?: BrowserVerificationResult | null
+  /**
+   * Task 06.2D — transient sub-status for the user-triggered browser
+   * verification flow: 'running' while install + dev server + screenshot is in
+   * flight, then the terminal verification status. Only 'running' is treated as
+   * in-progress by the UI.
+   */
+  browser_verification_state?: 'running' | 'passed' | 'failed' | null
+}
+
+/** Task 06.2D — managed preview dev-server status. */
+export interface PreviewStatus {
+  project_id: string
+  running: boolean
+  url?: string | null
+  command?: string | null
+  started_at?: string | null
+  has_package_json?: boolean
 }

@@ -547,6 +547,19 @@ def _default_playwright_screenshot(url: str, output_path: Path, timeout_seconds:
 # ---------- public entry point ----------
 
 
+# Task 06.2D — optional keep-alive handoff. When supplied and the
+# verification passes, the still-running dev server (plus its stdout/stderr
+# drainers) is handed to this callback instead of being torn down, so the
+# preview URL stays usable. Signature:
+#   (proc, stdout_drainer, stderr_drainer, command, url) -> bool
+# Returning True means the callback now owns the process (skip teardown);
+# False (or any exception) falls back to the normal teardown.
+KeepAliveRegistrar = Callable[
+    [subprocess.Popen, Optional["_StreamDrainer"], Optional["_StreamDrainer"], str, str],
+    bool,
+]
+
+
 def _core_browser_verification(
     project_id: str,
     config: BrowserVerificationConfig,
@@ -558,6 +571,7 @@ def _core_browser_verification(
     terminate_grace_seconds: int,
     screenshot_runner: Optional[BrowserScreenshotRunner],
     process_starter: Optional[Callable[[str, Path], subprocess.Popen]],
+    keep_alive_registrar: Optional[KeepAliveRegistrar] = None,
 ) -> BrowserVerificationResult:
     """Shared dev-server -> readiness -> screenshot -> teardown lifecycle.
 
@@ -568,6 +582,11 @@ def _core_browser_verification(
     so ``duration_ms`` reflects the full operation. Unexpected exceptions
     propagate to the caller, which is responsible for the outer
     crash-to-``failed`` guard.
+
+    When ``keep_alive_registrar`` is supplied and the verification passes, the
+    still-running dev server is handed off to that callback instead of being
+    torn down (Task 06.2D persistent preview) — the ``finally`` teardown is
+    skipped only when the callback confirms ownership.
     """
     sandbox = ProjectSandbox(project_id)
     try:
@@ -607,6 +626,7 @@ def _core_browser_verification(
     extra_msg = ""
     screenshot_rel_path: Optional[str] = None
     status = "failed"
+    kept_alive = False
     try:
         try:
             proc = starter(config.command, repo_dir)
@@ -702,6 +722,18 @@ def _core_browser_verification(
         screenshot_rel_path = "screenshots/browser.png"
         status = "passed"
         extra_msg = f"screenshot captured at {screenshot_rel_path}"
+        # Task 06.2D — hand the still-running dev server off to the preview
+        # layer instead of tearing it down, so the captured URL stays live.
+        # Only the UI flow supplies a registrar; the runner path leaves it
+        # ``None`` and the server is torn down as before.
+        if keep_alive_registrar is not None and proc is not None:
+            try:
+                if keep_alive_registrar(
+                    proc, stdout_drainer, stderr_drainer, config.command, config.url
+                ):
+                    kept_alive = True
+            except Exception:  # noqa: BLE001
+                kept_alive = False
         return BrowserVerificationResult(
             enabled=True,
             command=config.command,
@@ -713,8 +745,9 @@ def _core_browser_verification(
         )
     finally:
         # Always tear the server down, even if we hit an unexpected
-        # exception path. Never leave a zombie.
-        if proc is not None and proc.poll() is None:
+        # exception path — unless it was handed off for keep-alive preview.
+        # Never leave a zombie.
+        if not kept_alive and proc is not None and proc.poll() is None:
             _terminate_dev_server(proc, terminate_grace_seconds)
 
 
@@ -834,6 +867,7 @@ def run_ui_browser_verification(
     screenshot_runner: Optional[BrowserScreenshotRunner] = None,
     process_starter: Optional[Callable[[str, Path], subprocess.Popen]] = None,
     dependency_installer: Optional[DependencyInstaller] = None,
+    keep_alive_registrar: Optional[KeepAliveRegistrar] = None,
 ) -> BrowserVerificationResult:
     """User-triggered browser verification (Task 06.2C). Never raises.
 
@@ -950,6 +984,7 @@ def run_ui_browser_verification(
             terminate_grace_seconds=terminate_grace_seconds,
             screenshot_runner=screenshot_runner,
             process_starter=process_starter,
+            keep_alive_registrar=keep_alive_registrar,
         )
         result.install_command = install_command
         result.install_status = install_status

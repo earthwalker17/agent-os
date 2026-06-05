@@ -117,6 +117,12 @@ class RunRecord(BaseModel):
     files_changed: list[str] = Field(default_factory=list)
     commands_run: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
+    # Task 06.2D — the concise human-readable run summary the agent emitted in
+    # its ``final`` action (mirrors ``ResultSummary.summary`` and the ``##
+    # Summary`` section of result.md). Surfaced here so the chat-first run
+    # follow-up card can render a natural completion message straight from
+    # run.json without re-parsing result.md. ``""`` for older records.
+    summary: str = ""
     # Task 06.0 — post-run memory reconciliation metadata. ``None`` means
     # reconciliation has not run yet for this record (e.g. a record loaded
     # from an older run). ``True``/``False`` reflect whether the reconciler
@@ -139,6 +145,14 @@ class RunRecord(BaseModel):
     # populated with ``enabled=False, status="skipped"`` so the UI can
     # still display a consistent block.
     browser_verification: Optional[BrowserVerificationResult] = None
+    # Task 06.2D — transient sub-status for the user-triggered browser
+    # verification flow. ``None`` when no UI verification has been requested,
+    # ``"running"`` while install + dev server + screenshot is in flight (the
+    # endpoint writes this before the blocking work so a concurrent Runs-panel
+    # poll can tell the run is active again), then the terminal browser
+    # verification status (``"passed"`` / ``"failed"``) once it settles. The
+    # frontend treats only ``"running"`` as in-progress.
+    browser_verification_state: Optional[str] = None
 
 
 class ResultSummary(BaseModel):

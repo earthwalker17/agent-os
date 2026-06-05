@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import type { Message, PendingExecution } from '../types'
 import RunDetailModal from './RunDetailModal'
+import RunChatCard from './RunChatCard'
 
 interface Props {
   projectId: string | null
@@ -25,6 +26,8 @@ interface Props {
   revisingPendingTitle?: string | null
   /** Drop out of revise mode without sending. */
   onCancelRevise?: () => void
+  /** Task 06.2D — notify parent that a run/preview changed so the Runs panel refreshes. */
+  onRunsChanged?: () => void
 }
 
 /** Minimal markdown-to-HTML for orchestration responses. */
@@ -71,6 +74,7 @@ function ChatPanel({
   revisingPendingId,
   revisingPendingTitle,
   onCancelRevise,
+  onRunsChanged,
 }: Props) {
   const [input, setInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -132,8 +136,17 @@ function ChatPanel({
           <div className="chat-empty">No messages yet. Start the conversation.</div>
         )}
         {messages.map((msg, i) => {
+          // Task 06.2D — a run id in message metadata drives the chat-first run
+          // follow-up card (live status + browser verification controls). Older
+          // messages without metadata fall back to the legacy regex affordance.
+          const runIdFromMeta =
+            msg.role === 'assistant'
+              ? (msg.metadata as { run_id?: string } | null | undefined)?.run_id
+              : undefined
           const runId =
-            msg.role === 'assistant' && runProjectId ? extractRunId(msg.content) : null
+            msg.role === 'assistant' && runProjectId && !runIdFromMeta
+              ? extractRunId(msg.content)
+              : null
           const pending = msg.role === 'assistant' ? msg.pending_execution ?? null : null
           const isPendingActionable =
             pending && pending.status === 'pending' && !!onConfirmPending && !!onRevisePending
@@ -151,6 +164,14 @@ function ChatPanel({
                 />
               ) : (
                 <div className="chat-message-content">{msg.content}</div>
+              )}
+              {runIdFromMeta && runProjectId && (
+                <RunChatCard
+                  projectId={runProjectId}
+                  runId={runIdFromMeta}
+                  onOpenRun={(rid) => setOpenRunId(rid)}
+                  onRunsChanged={onRunsChanged}
+                />
               )}
               {runId && (
                 <div className="chat-run-affordance-row">
@@ -199,7 +220,7 @@ function ChatPanel({
                   Revising this plan — type your changes in the input below.
                 </div>
               )}
-              {isPendingDispatched && pending && pending.run_id && (
+              {isPendingDispatched && pending && pending.run_id && !runIdFromMeta && (
                 <div className="chat-run-affordance-row">
                   <button
                     type="button"
