@@ -6,8 +6,10 @@ markdown memory and a bounded execution layer that can delegate code
 work to a sandboxed Coding Agent.
 
 > Detailed implementation status, task history, and the roadmap live in
-> [`ROADMAP.md`](./ROADMAP.md). The stable operating guide for any agent
-> working on this repo is [`CLAUDE.md`](./CLAUDE.md).
+> [`ROADMAP.md`](./ROADMAP.md); the system's shape (files, pipelines,
+> invariants) is in [`ARCHITECTURE.md`](./ARCHITECTURE.md). The stable
+> operating guide for any agent working on this repo is
+> [`CLAUDE.md`](./CLAUDE.md).
 
 ## What is Agent OS?
 
@@ -48,7 +50,7 @@ on purpose.
 
 **Phase 1 & 2** (workspace + memory + orchestration + semantic
 writeback) are complete. **Phase 3 — Execution Layer** is complete
-through **Task 06.2D** (chat-first run workflow + persistent preview).
+through **Task 06.2E** (automatic command verification + bounded repair).
 The Coding Agent runs sandboxed jobs in the background, the runs panel
 auto-refreshes, inferred coding intent is surfaced as a confirmable
 plan, terminal runs reconcile back into project memory, the main
@@ -63,6 +65,11 @@ starts the dev server on port 5174, captures a screenshot, and returns
 a live preview URL + thumbnail inline — and keeps the dev server alive
 so the URL stays usable. The Runs panel gained **Start / Stop preview**
 controls; the run detail modal is now a detailed inspection view.
+Command verification is now **automatic** (06.2E): Agent OS infers the
+right checks from the repo (`npm run build`, `pytest`, or a syntax
+check), gives the Coding Agent one bounded repair pass if they fail, and
+marks a run `completed` only after they pass — then offers browser
+verification in chat.
 
 Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 
@@ -156,6 +163,7 @@ agent-os/
 ├── execution_workspaces/  # Coding Agent workspaces  (private; ships *.example.md templates + README)
 ├── README.md              # this file (public landing page)
 ├── ROADMAP.md             # detailed status + task log + next steps
+├── ARCHITECTURE.md        # system shape: files, pipelines, invariants
 └── CLAUDE.md              # stable operating guide for coding agents
 ```
 
@@ -169,6 +177,7 @@ python tests/test_pending_execution_db.py
 python tests/test_memory_reconciliation.py
 python tests/test_inspect.py
 python tests/test_verification.py
+python tests/test_verification_inference.py
 python tests/test_browser_verification.py
 python tests/test_runner_diagnostics.py
 ```

@@ -2,7 +2,8 @@
 
 Operating guide for Claude Code and any other coding agent working on this
 repository. This file is intentionally short and phase-independent. For the
-current project status, task log, and roadmap, read `ROADMAP.md`. The public
+system's shape (files, pipelines, invariants) read `ARCHITECTURE.md`; for the
+current project status, task log, and roadmap read `ROADMAP.md`. The public
 README is deliberately kept brief and should not be used as a status file.
 
 ## 1. Project Mission
