@@ -1,3 +1,25 @@
+/** Task 07.1 — a selectable model provider and its availability. */
+export interface ProviderInfo {
+  id: string
+  label: string
+  available: boolean
+  default_model: string
+}
+
+/** Task 07.0 — metadata for a file attached to a chat message. */
+export interface ChatAttachment {
+  original_filename: string
+  stored_filename: string
+  mime_type: string
+  size: number
+  scope: 'chat' | 'workspace'
+  added_to_workspace: boolean
+  /** Chat-relative reference (chat_uploads/{conv}/{file}); for bookkeeping. */
+  chat_path?: string | null
+  /** repo/uploads/{file} when also copied into the project workspace. */
+  workspace_path?: string | null
+}
+
 export interface Message {
   id?: string
   role: 'user' | 'assistant'

@@ -1,47 +1,36 @@
 """
 Thin LLM wrapper for Agent OS.
 
-Handles Anthropic API calls with a clean interface.
-All context assembly happens in orchestrator.py — this module
-only knows how to send messages and return text.
+A single `chat(system, messages, ...)` entry point. As of Task 07.1 it
+delegates to the pluggable provider layer (`providers.py`) so the same call
+can route to Claude / GPT / Gemini / DeepSeek. All context assembly still
+happens in the callers (orchestrator + execution modules) — this module only
+knows how to send messages and return text.
+
+Backward compatibility: callers that don't pass `provider` get the default
+provider (Claude when `ANTHROPIC_API_KEY` is set, otherwise the first
+available), so existing Anthropic-only behavior is unchanged.
 """
 
-import os
-from anthropic import Anthropic
-
-_client: Anthropic | None = None
-
-
-def _get_client() -> Anthropic:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY not set. "
-                "Add it to backend/.env or export it in your shell."
-            )
-        _client = Anthropic(api_key=api_key)
-    return _client
+import providers
 
 
 def chat(
     system: str,
     messages: list[dict],
-    model: str = "claude-sonnet-4-20250514",
+    model: str | None = None,
     max_tokens: int = 2048,
+    provider: str | None = None,
 ) -> str:
-    """Send a chat request and return the assistant's text response."""
-    client = _get_client()
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=messages,
+    """Send a chat request and return the assistant's text response.
+
+    ``provider`` is a provider id (``claude`` / ``gpt`` / ``gemini`` /
+    ``deepseek``); when omitted, the default provider is used. ``model`` is an
+    optional per-call override — when omitted, the provider's default model is
+    used. Raises ``providers.ProviderError`` if the provider is unknown or its
+    API key is not configured.
+    """
+    provider_id = provider or providers.default_provider()
+    return providers.complete(
+        provider_id, system, messages, model=model, max_tokens=max_tokens
     )
-    # Extract text from content blocks
-    parts = []
-    for block in response.content:
-        if block.type == "text":
-            parts.append(block.text)
-    return "\n".join(parts)

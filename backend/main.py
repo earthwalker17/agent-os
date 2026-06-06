@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import re
+import mimetypes
 
 # Load .env before anything that needs ANTHROPIC_API_KEY
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -71,6 +72,13 @@ from execution.inspect import (
     read_repo_file,
     search_repo_files,
 )
+from uploads import (
+    save_chat_attachment,
+    resolve_chat_attachment,
+    UploadError,
+    ALLOWED_EXTENSIONS,
+)
+import providers
 
 app = FastAPI(title="Agent OS Backend")
 
@@ -422,6 +430,23 @@ def api_update_global_file(req: UpdateGlobalFileRequest):
     return {"status": "ok"}
 
 
+# --- Model provider endpoints (Task 07.1) ---
+
+
+@app.get("/api/providers")
+def api_list_model_providers():
+    """Report provider availability for the UI selector.
+
+    Returns all four providers (always visible) with an ``available`` flag
+    derived purely from API-key presence, plus the resolved default provider
+    the frontend should pre-select.
+    """
+    return {
+        "providers": providers.list_providers(),
+        "default": providers.default_provider(),
+    }
+
+
 # --- Chat endpoint ---
 
 class ChatRequest(BaseModel):
@@ -431,6 +456,15 @@ class ChatRequest(BaseModel):
     # typing revision instructions, the frontend echoes the pending id here
     # so the backend routes to the revision flow instead of the orchestrator.
     revise_pending_id: str | None = None
+    # Task 07.0 — attachment metadata returned by ``/api/chat/upload`` for files
+    # the user attached to this message. Stored verbatim on the user message so
+    # the chat re-renders the file chips (and their chat/workspace scope) on
+    # reload. Empty for ordinary text-only turns.
+    attachments: list[dict] = []
+    # Task 07.1 — selected model provider id (claude / gpt / gemini / deepseek).
+    # None falls back to the default provider (Claude when available). An unknown
+    # or unavailable provider yields a clean 400.
+    provider: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -467,9 +501,50 @@ def api_chat(req: ChatRequest):
     project_id = conv["project_id"]
     is_general = project_id == GENERAL_PROJECT_ID
 
+    # Task 07.0 — a turn may carry text, attachments, or both. Reject only the
+    # truly empty case (no text and no files). When text is empty but files are
+    # attached, we synthesize a short note so the orchestrator/judge/memory
+    # calls have something coherent to reason about; the stored user message
+    # keeps the literal (possibly empty) text and renders chips from metadata.
+    if not req.message.strip() and not req.attachments:
+        raise HTTPException(status_code=400, detail="Message or an attachment is required")
+
+    # Task 07.1 — resolve + validate the model provider for this turn. Done up
+    # front so every path (chat, @code, revise) returns a clean error on a bad
+    # provider; only the orchestrated chat response is actually routed to it.
+    provider_id = (req.provider or "").strip() or providers.default_provider()
+    if not providers.is_known(provider_id):
+        raise HTTPException(
+            status_code=400, detail=f"Unknown model provider: {provider_id!r}"
+        )
+    if not providers.is_available(provider_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model provider '{providers.label(provider_id)}' is not available "
+                "— its API key is not configured on the server."
+            ),
+        )
+
+    attachment_note = ""
+    if req.attachments:
+        names = ", ".join(
+            str(a.get("original_filename") or "file") for a in req.attachments
+        )
+        in_workspace = any(a.get("added_to_workspace") for a in req.attachments)
+        attachment_note = (
+            f"[Attached {len(req.attachments)} file(s): {names}"
+            + ("; also added to the project workspace" if in_workspace else "")
+            + "]"
+        )
+    effective_message = req.message.strip() or attachment_note
+
     # Persist user message. We capture its id so the pending-execution row
-    # can link back to the message that triggered it.
-    user_msg = add_message(req.conversation_id, "user", req.message)
+    # can link back to the message that triggered it. Task 07.0 — attachment
+    # metadata rides along in the message metadata so the chat re-renders the
+    # file chips on reload.
+    user_meta = {"attachments": req.attachments} if req.attachments else None
+    user_msg = add_message(req.conversation_id, "user", req.message, metadata=user_meta)
 
     # Load conversation history for orchestration context
     messages = list_messages(req.conversation_id)
@@ -535,7 +610,7 @@ def api_chat(req: ChatRequest):
         decision = judge_delegation(
             project_id=project_id,
             project_name=project_name,
-            user_message=req.message,
+            user_message=effective_message,
             history=history,
             is_general=False,
         )
@@ -549,8 +624,9 @@ def api_chat(req: ChatRequest):
             )
 
     # Generate orchestration response (with optional on-demand file inspection).
+    # Task 07.1 — route the main response to the selected provider.
     response_content, inspected_files = orchestrate(
-        project_id, req.message, history=history
+        project_id, effective_message, history=history, provider=provider_id
     )
 
     # Persist assistant reply. When inspections happened, include them in the
@@ -563,15 +639,15 @@ def api_chat(req: ChatRequest):
     # Memory judgment: route to global or project writeback
     ctx = load_memory(project_id)
     if is_general:
-        proposed = judge_global_memory_updates(ctx, req.message, response_content)
+        proposed = judge_global_memory_updates(ctx, effective_message, response_content)
         applied = apply_global_memory_updates(proposed)
     else:
-        proposed = judge_memory_updates(ctx, req.message, response_content)
+        proposed = judge_memory_updates(ctx, effective_message, response_content)
         applied = apply_memory_updates(project_id, proposed)
 
     # Auto-title: if this is the first user message, set conversation title from it
     if len([m for m in messages if m["role"] == "user"]) <= 1:
-        title = req.message[:60] + ("..." if len(req.message) > 60 else "")
+        title = effective_message[:60] + ("..." if len(effective_message) > 60 else "")
         update_conversation_title(req.conversation_id, title)
 
     return ChatResponse(
@@ -731,6 +807,77 @@ def _handle_revise_pending(
         pending_execution=refreshed.to_dict(),
         message_id=assistant_msg["id"],
     )
+
+
+# --- Chat attachment upload endpoints (Task 07.0) ---
+
+
+@app.post("/api/chat/upload")
+async def api_chat_upload(
+    conversation_id: str = Form(...),
+    add_to_workspace: bool = Form(False),
+    files: list[UploadFile] = File(...),
+):
+    """Upload one or more attachments for a chat message (multipart form data).
+
+    The owning project is derived from the conversation (never trusted from the
+    client). Every file is stored chat-only; when ``add_to_workspace`` is set
+    and the conversation belongs to a real project, each is additionally copied
+    into ``repo/uploads/`` via the sandbox. Returns per-file metadata the
+    frontend echoes back on the subsequent ``/api/chat`` send.
+
+    A rejected file (bad name/type or oversize) fails the whole request with a
+    400 so the user fixes it before sending — partial uploads would be
+    confusing in the composer.
+    """
+    conv = get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    project_id = conv["project_id"]
+    is_general = project_id == GENERAL_PROJECT_ID
+    # "Add to workspace too" is only meaningful in project conversations — the
+    # GENERAL workspace has no execution workspace to copy into.
+    effective_add = bool(add_to_workspace) and not is_general
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    attachments: list[dict] = []
+    for upload in files:
+        data = await upload.read()
+        try:
+            meta = save_chat_attachment(
+                conversation_id=conversation_id,
+                project_id=project_id,
+                is_general=is_general,
+                original_filename=upload.filename or "file",
+                data=data,
+                content_type=upload.content_type,
+                add_to_workspace=effective_add,
+            )
+        except UploadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        attachments.append(meta)
+
+    return {"attachments": attachments, "added_to_workspace": effective_add}
+
+
+@app.get("/api/conversations/{conversation_id}/attachments/{stored_filename}")
+def api_get_chat_attachment(conversation_id: str, stored_filename: str):
+    """Serve a previously uploaded chat-only attachment for inline preview.
+
+    The filename is reduced to a bare leaf and re-resolved under the
+    conversation's uploads dir, so the path can't escape it.
+    """
+    conv = get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    path = resolve_chat_attachment(conversation_id, stored_filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    mime, _ = mimetypes.guess_type(str(path))
+    return FileResponse(str(path), media_type=mime or "application/octet-stream")
 
 
 # --- Memory update endpoints ---

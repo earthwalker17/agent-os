@@ -81,6 +81,8 @@ Agent OS/
 │  ├─ runs/{run_id}/            task_card.md, events.jsonl, run.json, result.md,
 │  │                            screenshots/browser.png
 │  ├─ logs/  AGENT.md  TASK.md
+│  └─ repo/uploads/             chat files copied in via "add to workspace" (07.0)
+├─ chat_uploads/{conversation}/ chat-only attachments (07.0, gitignored)
 ├─ backend/                     FastAPI + execution layer (Python)
 └─ frontend/                    React + TypeScript (Vite)
 ```
@@ -98,8 +100,10 @@ conversations, messages, and pending executions.
 |-------------------|-------------------------------------------------------------------------|
 | `main.py`         | FastAPI app + all HTTP endpoints (projects, conversations, chat, memory, execution, inspection, verification, preview). Wires everything together. |
 | `orchestrator.py` | The chat brain. Loads SOUL + memory, assembles context, produces the reply, runs the bounded inspection loop, then the memory-writeback judge. |
-| `llm.py`          | Thin Anthropic SDK wrapper: `chat(system, messages, model?) -> str`. No context assembly — callers own that. |
+| `llm.py`          | Thin LLM entry point: `chat(system, messages, model?, provider?) -> str`. Delegates to `providers.py` (07.1); no context assembly — callers own that. |
+| `providers.py`    | Task 07.1 — pluggable model providers (Claude / GPT / Gemini / DeepSeek). Key-presence availability, default-provider preference (Claude first), per-provider default model (env-overridable), and a `complete()` dispatcher. Anthropic via SDK; the rest via `urllib` HTTPS (no new deps). |
 | `database.py`     | SQLite persistence: conversations, messages, `pending_executions`. |
+| `uploads.py`      | Task 07.0 — chat attachment storage: filename sanitization + allow-list, per-dir dedup, chat-only storage under `chat_uploads/{conv}/`, optional workspace copy via `ProjectSandbox`. HTTP-agnostic (takes bytes). |
 
 ### Execution layer (`backend/execution/`)
 | File                       | Purpose                                                                |
@@ -132,10 +136,10 @@ conversations, messages, and pending executions.
 
 | File                         | Purpose                                                              |
 |------------------------------|---------------------------------------------------------------------|
-| `main.tsx` / `App.tsx`       | Entry + three-column layout and all top-level state (projects, conversations, messages, context, modals). |
+| `main.tsx` / `App.tsx`       | Entry + three-column layout and all top-level state (projects, conversations, messages, context, modals, model provider, color theme). Theme (07.2) is applied via `data-theme` on `<html>` and persisted to `localStorage`. |
 | `types.ts`                   | Shared TS types mirroring backend models.                           |
 | `components/ProjectList.tsx` | Left column: projects + conversations + create/rename/delete.       |
-| `components/ChatPanel.tsx`   | Center column: message thread, send box; renders `RunChatCard` on messages carrying a `run_id`. |
+| `components/ChatPanel.tsx`   | Center column: header (provider selector top-left 07.1, theme selector top-right 07.2) + message thread + the **multi-modal composer** (07.0 — auto-growing textarea, `Ctrl/Cmd+Enter` send, `+` file upload with chips + "add to workspace too", Web Speech voice button); renders `RunChatCard` on messages carrying a `run_id` and attachment chips on messages carrying `metadata.attachments`. |
 | `components/ContextPanel.tsx`| Right column: project memory files (editable) + `RunsSection`.       |
 | `components/RunsSection.tsx` | Runs list (auto-polls while active) + Start/Stop **preview** control. |
 | `components/RunChatCard.tsx` | The in-chat run lifecycle: build progress → verification phases → completion summary → **Run browser verification** → live preview URL + screenshot. |
@@ -157,6 +161,13 @@ conversations, messages, and pending executions.
    policy-filters them (SOUL + non-writable files excluded) before disk writes.
 
 → Up to 3–4 LLM calls per turn.
+
+**Provider routing (07.1).** The chat request carries a `provider` id
+(`claude`/`gpt`/`gemini`/`deepseek`); the endpoint validates it (unknown /
+unavailable → 400) and the **main response** (step 3) routes to it via
+`orchestrate(..., provider=)`. Internal subsystem calls (judge, delegation,
+Coding Agent) use the default provider. Availability is key-presence; see
+`providers.py`.
 
 ### B. Delegation → run
 `@code` → `chat_delegation` → `BackgroundRunManager.dispatch()`.
@@ -195,6 +206,16 @@ User clicks **Run browser verification** → `POST …/browser-verify`:
 `npm install` → dev server (port 5174) → poll URL → Playwright screenshot. On
 pass, the still-running server is **handed off to `preview.py`** so the URL
 stays live (Start/Stop from the Runs panel; torn down on backend shutdown).
+
+### F. Chat attachment upload (07.0) — `uploads.py`
+Composer sends files to `POST /api/chat/upload` (multipart) **before** the
+chat send. The project is derived from the conversation; each file is
+sanitized + de-duped and written chat-only under `chat_uploads/{conv}/`, and —
+when "add to workspace too" is set on a project conversation — also copied into
+`repo/uploads/` through `ProjectSandbox.resolve_repo_path`. Returned metadata
+is echoed back on the `/api/chat` body and stored on the user message, so chips
+re-hydrate on reload. Images re-serve read-only via
+`GET /api/conversations/{id}/attachments/{name}`.
 
 ---
 

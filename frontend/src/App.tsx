@@ -5,7 +5,7 @@ import ContextPanel from './components/ContextPanel'
 import EditModal from './components/EditModal'
 import ConfirmDialog from './components/ConfirmDialog'
 import GlobalMemoryModal from './components/GlobalMemoryModal'
-import type { Message, Conversation, ProjectContext, PendingExecution } from './types'
+import type { Message, Conversation, ProjectContext, PendingExecution, ChatAttachment, ProviderInfo } from './types'
 
 const GENERAL_PROJECT_ID = '__GENERAL__'
 
@@ -32,6 +32,16 @@ function App() {
   // GENERAL workspace state
   const [isGeneralActive, setIsGeneralActive] = useState(false)
   const [generalConversations, setGeneralConversations] = useState<Conversation[]>([])
+
+  // Task 07.1 — model provider selection.
+  const [providersList, setProvidersList] = useState<ProviderInfo[]>([])
+  const [selectedProvider, setSelectedProvider] = useState<string>('claude')
+
+  // Task 07.2 — color theme (dark default), persisted across reloads.
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const saved = localStorage.getItem('agentos-theme')
+    return saved === 'light' ? 'light' : 'dark'
+  })
 
   // Modal state
   const [editModal, setEditModal] = useState<{ filename: string; content: string } | null>(null)
@@ -98,6 +108,28 @@ function App() {
   useEffect(() => {
     loadGeneralConversations()
   }, [loadGeneralConversations])
+
+  // Task 07.2 — apply the theme to <html> (CSS variables cascade from there to
+  // everything, modals included) and remember the choice.
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('agentos-theme', theme)
+  }, [theme])
+
+  // Task 07.1 — load provider availability once and pre-select the default
+  // (Claude when available, otherwise the first available provider).
+  useEffect(() => {
+    fetch('/api/providers')
+      .then(res => res.json())
+      .then((data: { providers: ProviderInfo[]; default: string }) => {
+        const list = data.providers ?? []
+        setProvidersList(list)
+        const fallback = list.find(p => p.available)?.id
+        const def = list.find(p => p.id === data.default && p.available)?.id
+        if (def || fallback) setSelectedProvider(def || fallback!)
+      })
+      .catch(console.error)
+  }, [])
 
   useEffect(() => {
     if (activeProject) loadConversations(activeProject)
@@ -396,7 +428,7 @@ function App() {
 
   // --- Chat ---
 
-  const handleSend = useCallback(async (message: string) => {
+  const handleSend = useCallback(async (message: string, attachments?: ChatAttachment[]) => {
     if (!activeConversation) return
 
     // Snapshot revise-mode at the start of the send; clear it eagerly so the
@@ -412,16 +444,27 @@ function App() {
       role: 'user',
       content: message,
       timestamp: new Date().toISOString(),
+      // Task 07.0 — show the just-uploaded attachments on the optimistic
+      // bubble; they re-hydrate from server metadata on the next load.
+      metadata: attachments && attachments.length ? { attachments } : null,
     }
     setMessages(prev => [...prev, userMsg])
     setLoading(true)
 
     try {
-      const body: { conversation_id: string; message: string; revise_pending_id?: string } = {
+      const body: {
+        conversation_id: string
+        message: string
+        revise_pending_id?: string
+        attachments?: ChatAttachment[]
+        provider?: string
+      } = {
         conversation_id: activeConversation,
         message,
+        provider: selectedProvider,
       }
       if (revisingId) body.revise_pending_id = revisingId
+      if (attachments && attachments.length) body.attachments = attachments
 
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -489,7 +532,7 @@ function App() {
     } finally {
       setLoading(false)
     }
-  }, [activeConversation, activeProject, isGeneralActive, loadConversations, loadGeneralConversations, refreshContext, loadGlobalMemory, revisingPendingId, revisingPendingTitle])
+  }, [activeConversation, activeProject, isGeneralActive, loadConversations, loadGeneralConversations, refreshContext, loadGlobalMemory, revisingPendingId, revisingPendingTitle, selectedProvider])
 
   // Task 05.9.5: confirm a pending execution plan. Dispatches the stored
   // task card through the same path as `@code`, marks the pending row as
@@ -605,6 +648,11 @@ function App() {
         revisingPendingTitle={revisingPendingTitle}
         onCancelRevise={handleCancelRevise}
         onRunsChanged={() => setRunsRefreshKey(k => k + 1)}
+        providers={providersList}
+        selectedProvider={selectedProvider}
+        onSelectProvider={setSelectedProvider}
+        theme={theme}
+        onSelectTheme={setTheme}
       />
       <ContextPanel
         projectId={isGeneralActive ? null : activeProject}

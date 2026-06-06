@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from 'react'
-import type { Message, PendingExecution } from '../types'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import type { Message, PendingExecution, ChatAttachment, ProviderInfo } from '../types'
 import RunDetailModal from './RunDetailModal'
 import RunChatCard from './RunChatCard'
 
@@ -7,13 +7,16 @@ interface Props {
   projectId: string | null
   conversationId: string | null
   messages: Message[]
-  onSend: (message: string) => void
+  /** Send a message with optional uploaded attachments (Task 07.0). */
+  onSend: (message: string, attachments?: ChatAttachment[]) => void
   loading?: boolean
   headerLabel?: string | null
   /**
    * Real project id for run-detail navigation, or null when the chat is the
    * GENERAL workspace. Distinct from `projectId` which is also used as the
    * "is the chat open" sentinel and can be the literal string "general".
+   * Also gates the "Add to workspace too" upload option — only real projects
+   * have an execution workspace to copy into.
    */
   runProjectId?: string | null
   /** Confirm a pending execution plan — dispatches the stored task card. */
@@ -28,6 +31,13 @@ interface Props {
   onCancelRevise?: () => void
   /** Task 06.2D — notify parent that a run/preview changed so the Runs panel refreshes. */
   onRunsChanged?: () => void
+  /** Task 07.1 — model providers + current selection for the header dropdown. */
+  providers?: ProviderInfo[]
+  selectedProvider?: string
+  onSelectProvider?: (providerId: string) => void
+  /** Task 07.2 — active color theme + setter for the top-right theme dropdown. */
+  theme?: 'dark' | 'light'
+  onSelectTheme?: (theme: 'dark' | 'light') => void
 }
 
 /** Minimal markdown-to-HTML for orchestration responses. */
@@ -61,6 +71,45 @@ function extractRunId(content: string): string | null {
   return m ? m[1] : null
 }
 
+// Max composer height before it scrolls instead of growing further.
+const MAX_TEXTAREA_HEIGHT = 200
+
+// Accepted upload types, mirroring the backend allow-list (uploads.py).
+const ACCEPT_TYPES = 'image/*,.txt,.md,.pdf,.doc,.docx'
+
+function isImage(mime: string | undefined): boolean {
+  return !!mime && mime.startsWith('image/')
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+// Web Speech API is non-standard and unprefixed only in some browsers; reach
+// for either spelling and treat its absence as "voice unsupported".
+function getSpeechRecognition(): (new () => SpeechRecognition) | null {
+  const w = window as unknown as {
+    SpeechRecognition?: new () => SpeechRecognition
+    webkitSpeechRecognition?: new () => SpeechRecognition
+  }
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null
+}
+
+// Chrome streams audio to a remote speech service, so a flaky connection throws
+// a transient "network" error. Auto-retry a couple times before giving up.
+const MAX_VOICE_NETWORK_RETRIES = 2
+
+// Append dictated text to whatever is already there, with a single separating
+// space (and never a leading space on the addition).
+function joinTranscript(base: string, addition: string): string {
+  const add = addition.replace(/^\s+/, '')
+  if (!add) return base
+  if (!base) return add
+  return /\s$/.test(base) ? base + add : `${base} ${add}`
+}
+
 function ChatPanel({
   projectId,
   conversationId,
@@ -75,12 +124,39 @@ function ChatPanel({
   revisingPendingTitle,
   onCancelRevise,
   onRunsChanged,
+  providers,
+  selectedProvider,
+  onSelectProvider,
+  theme,
+  onSelectTheme,
 }: Props) {
   const [input, setInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [openRunId, setOpenRunId] = useState<string | null>(null)
   const [showTaskCardFor, setShowTaskCardFor] = useState<string | null>(null)
+
+  // Task 07.0 — composer attachment + voice state.
+  const [files, setFiles] = useState<File[]>([])
+  const [addToWorkspace, setAddToWorkspace] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const [recording, setRecording] = useState(false)
+  const [voiceError, setVoiceError] = useState<string | null>(null)
+  const recognitionRef = useRef<SpeechRecognition | null>(null)
+  // Refs mirror live recording state for use inside recognition callbacks
+  // (which capture a stale closure), and carry the dictation session's text.
+  const recordingRef = useRef(false)
+  const manualStopRef = useRef(false)
+  const baseTextRef = useRef('')         // input text when this session started
+  const finalTextRef = useRef('')        // finalized transcript so far this session
+  const networkErrorRef = useRef(false)  // a "network" error fired this session
+  const networkRetryRef = useRef(0)
+
+  // Real project conversations get the "add to workspace" option; GENERAL does not.
+  const isProjectConversation = !!runProjectId
+  const voiceSupported = getSpeechRecognition() !== null
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -97,15 +173,269 @@ function ChatPanel({
     if (revisingPendingId) inputRef.current?.focus()
   }, [revisingPendingId])
 
+  // Auto-grow the textarea to fit its content, up to a cap.
+  const resizeInput = useCallback(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT)}px`
+  }, [])
+
+  useEffect(() => {
+    resizeInput()
+  }, [input, resizeInput])
+
+  // Switching conversations clears the composer's pending attachments + voice
+  // state so files don't bleed across threads.
+  useEffect(() => {
+    setFiles([])
+    setUploadError(null)
+    setVoiceError(null)
+    manualStopRef.current = true
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort() } catch { /* already stopped */ }
+    }
+    recordingRef.current = false
+    setRecording(false)
+  }, [conversationId])
+
+  // The "add to workspace" toggle is meaningless outside a project; keep it off.
+  useEffect(() => {
+    if (!isProjectConversation) setAddToWorkspace(false)
+  }, [isProjectConversation])
+
+  const handleFilesPicked = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = e.target.files ? Array.from(e.target.files) : []
+    if (picked.length) {
+      setFiles(prev => [...prev, ...picked])
+      setUploadError(null)
+    }
+    // Reset so picking the same file again re-fires onChange.
+    e.target.value = ''
+  }
+
+  const removeFile = (index: number) => {
+    setFiles(prev => prev.filter((_, i) => i !== index))
+  }
+
+  const setRecordingState = useCallback((val: boolean) => {
+    recordingRef.current = val
+    setRecording(val)
+  }, [])
+
+  // Spin up one recognition session. We run in continuous + interim mode so
+  // text appears live and the engine keeps listening through natural pauses;
+  // when a session ends on its own (silence/timeout) we transparently restart
+  // it, so the only thing that actually stops recording is the user (or a
+  // hard error). Returns false if the session couldn't be created.
+  const startVoiceSession = useCallback((): boolean => {
+    const SR = getSpeechRecognition()
+    if (!SR) {
+      setVoiceError('Voice input is not supported in this browser.')
+      return false
+    }
+    const recognition = new SR()
+    recognition.lang = 'en-US'
+    recognition.continuous = true
+    recognition.interimResults = true
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      // `results` is cumulative for the session: rebuild final + interim each
+      // time so the textarea reflects the live transcript as it's spoken.
+      let finalText = ''
+      let interimText = ''
+      for (let i = 0; i < event.results.length; i++) {
+        const result = event.results[i]
+        if (result.isFinal) finalText += result[0].transcript
+        else interimText += result[0].transcript
+      }
+      finalTextRef.current = finalText
+      setInput(joinTranscript(baseTextRef.current, finalText + interimText))
+    }
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      // 'no-speech' (a quiet pause) and 'aborted' (our own stop) are benign —
+      // let onend decide whether to keep listening.
+      if (event.error === 'no-speech' || event.error === 'aborted') return
+      if (event.error === 'network') {
+        // Transient: Chrome lost its connection to the speech service. Flag it
+        // so onend can retry; only surface a message once retries are spent.
+        networkErrorRef.current = true
+        return
+      }
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        manualStopRef.current = true // a permissions failure won't self-heal
+        setVoiceError('Microphone access was blocked. Allow mic access and try again.')
+        return
+      }
+      setVoiceError(`Voice input error: ${event.error}`)
+    }
+
+    recognition.onend = () => {
+      // Commit the finalized text (drop any trailing interim) into the base so
+      // a restart continues appending from the right place.
+      const committed = joinTranscript(baseTextRef.current, finalTextRef.current)
+      baseTextRef.current = committed
+      finalTextRef.current = ''
+      setInput(committed)
+
+      // Keep listening unless the user stopped us.
+      if (!manualStopRef.current && recordingRef.current) {
+        if (networkErrorRef.current) {
+          networkErrorRef.current = false
+          if (networkRetryRef.current < MAX_VOICE_NETWORK_RETRIES) {
+            networkRetryRef.current += 1
+            try { recognition.start(); return } catch { /* fall through */ }
+          } else {
+            setVoiceError(
+              'Voice recognition keeps losing its connection. Chrome sends ' +
+              'audio to an online speech service, so this needs a stable ' +
+              'internet connection — please try again.',
+            )
+          }
+        } else {
+          // Natural end (pause/timeout) → seamlessly resume.
+          try { recognition.start(); return } catch { /* fall through */ }
+        }
+      }
+
+      recognitionRef.current = null
+      setRecordingState(false)
+      inputRef.current?.focus()
+    }
+
+    recognitionRef.current = recognition
+    try {
+      recognition.start()
+      return true
+    } catch {
+      setVoiceError('Could not start voice input.')
+      recognitionRef.current = null
+      return false
+    }
+  }, [setRecordingState])
+
+  const toggleVoice = () => {
+    setVoiceError(null)
+    if (!getSpeechRecognition()) {
+      setVoiceError('Voice input is not supported in this browser.')
+      return
+    }
+    // Already listening → stop immediately. Flip the UI now (optimistic) and
+    // abort the engine so re-click always ends recording without waiting.
+    if (recordingRef.current) {
+      manualStopRef.current = true
+      setRecordingState(false)
+      const rec = recognitionRef.current
+      if (rec) {
+        try { rec.stop() } catch { try { rec.abort() } catch { /* noop */ } }
+      }
+      return
+    }
+    // Start a fresh session, appending to the current input.
+    manualStopRef.current = false
+    networkErrorRef.current = false
+    networkRetryRef.current = 0
+    baseTextRef.current = input
+    finalTextRef.current = ''
+    if (startVoiceSession()) setRecordingState(true)
+  }
+
+  // Stop any in-flight recognition on unmount.
+  useEffect(() => {
+    return () => {
+      manualStopRef.current = true
+      if (recognitionRef.current) {
+        try { recognitionRef.current.abort() } catch { /* noop */ }
+      }
+    }
+  }, [])
+
+  const doSend = async () => {
+    const trimmed = input.trim()
+    if (!conversationId || loading || uploading) return
+    // Nothing to send: no text and no files.
+    if (!trimmed && files.length === 0) return
+
+    let attachments: ChatAttachment[] | undefined
+    if (files.length > 0) {
+      setUploading(true)
+      setUploadError(null)
+      try {
+        const form = new FormData()
+        form.append('conversation_id', conversationId)
+        form.append('add_to_workspace', String(addToWorkspace && isProjectConversation))
+        for (const f of files) form.append('files', f)
+        const res = await fetch('/api/chat/upload', { method: 'POST', body: form })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          setUploadError(err.detail || 'File upload failed')
+          return
+        }
+        const data = await res.json()
+        attachments = data.attachments as ChatAttachment[]
+      } catch (err) {
+        console.error('Upload error:', err)
+        setUploadError('File upload failed — see console for details.')
+        return
+      } finally {
+        setUploading(false)
+      }
+    }
+
+    onSend(trimmed, attachments)
+    setInput('')
+    setFiles([])
+  }
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    const trimmed = input.trim()
-    if (!trimmed || !conversationId || loading) return
-    onSend(trimmed)
-    setInput('')
+    void doSend()
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Ctrl/Cmd + Enter sends; plain Enter inserts a newline (default behavior).
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault()
+      void doSend()
+    }
   }
 
   const label = headerLabel || projectId
+
+  // Task 07.1 — provider dropdown shown top-left in the chat header. All four
+  // providers are listed; ones without a configured key render disabled.
+  const providerSelector =
+    providers && providers.length > 0 ? (
+      <select
+        className="provider-select"
+        value={selectedProvider ?? ''}
+        onChange={e => onSelectProvider && onSelectProvider(e.target.value)}
+        title="Model provider"
+        aria-label="Model provider"
+      >
+        {providers.map(p => (
+          <option key={p.id} value={p.id} disabled={!p.available}>
+            {p.label}
+            {p.available ? '' : ' — no key'}
+          </option>
+        ))}
+      </select>
+    ) : null
+
+  // Task 07.2 — light/dark theme dropdown, shown top-right in the chat header.
+  const themeSelector = onSelectTheme ? (
+    <select
+      className="theme-select"
+      value={theme ?? 'dark'}
+      onChange={e => onSelectTheme(e.target.value as 'dark' | 'light')}
+      title="Color theme"
+      aria-label="Color theme"
+    >
+      <option value="dark">Dark</option>
+      <option value="light">Light</option>
+    </select>
+  ) : null
 
   if (!projectId) {
     return (
@@ -126,10 +456,16 @@ function ChatPanel({
     )
   }
 
+  const sendDisabled = loading || uploading || (!input.trim() && files.length === 0)
+
   return (
     <main className="chat-panel">
       <div className="chat-header">
-        <h2>{label}</h2>
+        <div className="chat-header-row">
+          {providerSelector}
+          <h2>{label}</h2>
+        </div>
+        {themeSelector}
       </div>
       <div className="chat-messages">
         {messages.length === 0 && (
@@ -154,6 +490,9 @@ function ChatPanel({
           const isBeingRevised = pending && pending.pending_execution_id === revisingPendingId
           const taskCardKey = pending?.pending_execution_id ?? null
           const taskCardOpen = taskCardKey !== null && showTaskCardFor === taskCardKey
+          // Task 07.0 — attachments attached to a (user) message.
+          const attachments =
+            (msg.metadata as { attachments?: ChatAttachment[] } | null | undefined)?.attachments ?? []
           return (
             <div key={msg.id || i} className={`chat-message ${msg.role}`}>
               <div className="chat-message-role">{msg.role === 'user' ? 'You' : 'Agent OS'}</div>
@@ -163,7 +502,30 @@ function ChatPanel({
                   dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
                 />
               ) : (
-                <div className="chat-message-content">{msg.content}</div>
+                msg.content && <div className="chat-message-content">{msg.content}</div>
+              )}
+              {attachments.length > 0 && (
+                <div className="chat-attachments">
+                  {attachments.map((att, ai) => (
+                    <div className="chat-attachment" key={ai} title={att.original_filename}>
+                      {isImage(att.mime_type) && conversationId ? (
+                        <img
+                          className="chat-attachment-thumb"
+                          src={`/api/conversations/${conversationId}/attachments/${encodeURIComponent(att.stored_filename)}`}
+                          alt={att.original_filename}
+                        />
+                      ) : (
+                        <span className="chat-attachment-icon">📄</span>
+                      )}
+                      <span className="chat-attachment-name">{att.original_filename}</span>
+                      <span
+                        className={`chat-attachment-scope ${att.added_to_workspace ? 'workspace' : 'chat'}`}
+                      >
+                        {att.added_to_workspace ? 'chat + workspace' : 'chat only'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               )}
               {runIdFromMeta && runProjectId && (
                 <RunChatCard
@@ -264,18 +626,98 @@ function ChatPanel({
           </button>
         </div>
       )}
-      <form className="chat-input" onSubmit={handleSubmit}>
+      {/* Task 07.0 — selected file chips + "add to workspace" toggle, shown
+          above the composer before sending. */}
+      {(files.length > 0 || uploadError || voiceError) && (
+        <div className="composer-tray">
+          {voiceError && <div className="composer-voice-error">{voiceError}</div>}
+          {uploadError && <div className="composer-upload-error">{uploadError}</div>}
+          {files.length > 0 && (
+            <>
+              <div className="composer-chips">
+                {files.map((f, i) => (
+                  <div className="composer-chip" key={i} title={f.name}>
+                    <span className="composer-chip-name">{f.name}</span>
+                    <span className="composer-chip-size">{formatSize(f.size)}</span>
+                    <button
+                      type="button"
+                      className="composer-chip-remove"
+                      onClick={() => removeFile(i)}
+                      disabled={uploading}
+                      aria-label={`Remove ${f.name}`}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+              {isProjectConversation && (
+                <label className="composer-workspace-toggle">
+                  <input
+                    type="checkbox"
+                    checked={addToWorkspace}
+                    onChange={e => setAddToWorkspace(e.target.checked)}
+                    disabled={uploading}
+                  />
+                  Add to workspace too
+                </label>
+              )}
+            </>
+          )}
+        </div>
+      )}
+      <form className="chat-input composer" onSubmit={handleSubmit}>
         <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept={ACCEPT_TYPES}
+          style={{ display: 'none' }}
+          onChange={handleFilesPicked}
+        />
+        <button
+          type="button"
+          className="composer-icon-btn composer-attach-btn"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={loading || uploading}
+          title="Attach files"
+          aria-label="Attach files"
+        >
+          +
+        </button>
+        <textarea
           ref={inputRef}
-          type="text"
+          className="composer-textarea"
           value={input}
           onChange={e => setInput(e.target.value)}
-          placeholder={revisingPendingId ? 'Describe what to change about the plan...' : 'Type a message...'}
+          onKeyDown={handleKeyDown}
+          placeholder={
+            revisingPendingId
+              ? 'Describe what to change about the plan...  (Ctrl+Enter to send)'
+              : 'Type a message...  (Enter for newline, Ctrl+Enter to send)'
+          }
+          rows={1}
           autoFocus
           disabled={loading}
         />
-        <button type="submit" disabled={loading}>
-          {revisingPendingId ? 'Send revision' : 'Send'}
+        <button
+          type="button"
+          className={`composer-icon-btn composer-voice-btn${recording ? ' recording' : ''}`}
+          onClick={toggleVoice}
+          disabled={loading || uploading || !voiceSupported}
+          title={
+            voiceSupported
+              ? recording
+                ? 'Stop listening'
+                : 'Start voice input'
+              : 'Voice input not supported in this browser'
+          }
+          aria-label="Voice input"
+        >
+          {recording ? '■' : '🎤'}
+        </button>
+        <button type="submit" className="composer-send-btn" disabled={sendDisabled}>
+          {uploading ? 'Uploading...' : revisingPendingId ? 'Send revision' : 'Send'}
         </button>
       </form>
       {openRunId && runProjectId && (

@@ -264,6 +264,7 @@ def orchestrate(
     history: list[dict] | None = None,
     *,
     llm_caller: Optional[Callable] = None,
+    provider: Optional[str] = None,
 ) -> tuple[str, list[dict]]:
     """
     Main orchestration entry point.
@@ -284,11 +285,17 @@ def orchestrate(
     ``inspected_files == []``.
 
     ``llm_caller`` is an optional injection seam for tests; the default is
-    the live LLM.
+    the live LLM. ``provider`` selects the model provider for the main
+    response (Task 07.1); when omitted the default provider is used. It is
+    ignored when ``llm_caller`` is supplied.
     """
     ctx = load_memory(project_id, history=history)
     inspection_enabled = _inspection_enabled_for(project_id)
-    caller = llm_caller or llm_chat
+    # Bind the selected provider to the default caller so every LLM call in the
+    # response loop routes to it. Tests pass ``llm_caller`` to bypass entirely.
+    caller = llm_caller or (
+        lambda **kwargs: llm_chat(provider=provider, **kwargs)
+    )
 
     if not inspection_enabled:
         system_prompt = _build_system_prompt(ctx, inspection_enabled=False)

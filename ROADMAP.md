@@ -168,6 +168,88 @@ loop with automatic verification and a live preview.
 
 ---
 
+## Phase 4 — Interface & UX
+
+### 07.0 — Multi-modal chat composer
+Replaced the single-line chat input with a modern composer (`ChatPanel.tsx`
++ `uploads.py`):
+- **Auto-growing multiline textarea.** Grows to a 200px cap then scrolls.
+  `Enter` inserts a newline; **`Ctrl`/`Cmd`+`Enter`** sends. Sent user
+  messages render with `white-space: pre-wrap`, so line breaks / blank lines /
+  indentation survive round-trip.
+- **Voice input** (left of Send) via the Web Speech API — feature-detected
+  (`SpeechRecognition` / `webkitSpeechRecognition`), pulsing record state,
+  transcript **appended live** (never auto-sent), disabled with a tooltip on
+  unsupported browsers. Runs **continuous + interim** so text streams in as you
+  speak and listening continues through pauses until you click stop (re-click
+  ends immediately via an optimistic UI flip + `abort()`); ref-mirrored state
+  avoids stale-closure races in the recognition callbacks. Chrome's transient
+  `"network"` errors (it streams audio to a remote service) are auto-retried up
+  to twice before surfacing a clear message. Minimal ambient types live in
+  `frontend/src/speech.d.ts` (the API isn't in this TS release's `lib.dom`).
+- **File upload** via a `+` button: native picker, allow-listed types
+  (images + `.txt`/`.md`/`.pdf`/`.doc`/`.docx`), removable chips shown before
+  send. A message can carry text, files, or both (empty-text-with-files
+  synthesizes a short note for the orchestrator/judge/memory calls).
+- **"Add to workspace too"** toggle — project conversations only (GENERAL has
+  no workspace). Off → chat-only; on → also copied into `repo/uploads/`. Each
+  sent attachment shows a **chat only** / **chat + workspace** badge.
+- **Backend.** `POST /api/chat/upload` (multipart: `conversation_id`,
+  `add_to_workspace`, `files`) returns per-file metadata (original + stored
+  name, MIME, size, scope, workspace path). The owning project is derived from
+  the conversation, never trusted from the client. Filenames are sanitized
+  (basename only, safe charset, allow-listed ext) and de-duplicated per
+  directory; the workspace copy routes through `ProjectSandbox.resolve_repo_path`
+  so it can't escape `repo/`. Chat-only files live under
+  `chat_uploads/{conversation_id}/` (gitignored) and are re-served read-only via
+  `GET /api/conversations/{id}/attachments/{name}`. Attachment metadata rides on
+  the user message so chips re-hydrate on reload. New dep: `python-multipart`.
+  No document parsing / RAG — upload + storage + UX plumbing only.
+
+### 07.1 — Pluggable model-provider selection
+Extended the Anthropic-only setup into a small provider layer (`providers.py`
++ `llm.py` delegate):
+- **Four providers** — Claude / GPT / Gemini / DeepSeek, in a stable registry
+  (label, key env var, default model). Only Anthropic uses an SDK (already a
+  dep); GPT, Gemini, and DeepSeek are called over plain HTTPS via `urllib`
+  (OpenAI shape for GPT + DeepSeek; `generateContent` for Gemini) so **no new
+  Python dependencies**. Calls are lazy — an unused provider never runs.
+- **Availability = key presence.** `is_available()` is true iff the provider's
+  env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` /
+  `DEEPSEEK_API_KEY`) is set. `default_provider()` picks the first available in
+  order, **Claude preferred** (preserves pre-07.1 behavior). Default models are
+  overridable via `AGENT_OS_{CLAUDE,OPENAI,GEMINI,DEEPSEEK}_MODEL`.
+- **`GET /api/providers`** returns all four with an `available` flag + the
+  resolved default for the UI. **`/api/chat`** gained a `provider` field;
+  it's validated up front (unknown / unavailable → clean 400) and the
+  **orchestrated main response** routes to it via `orchestrate(..., provider=)`.
+  Internal subsystem calls (memory judge, delegation judge, Coding Agent) stay
+  on the default provider — minimal scope, no per-call routing.
+- **UI.** A dropdown top-left in the chat header lists all four; missing-key
+  providers render disabled (`— no key`). Selection lives in `App` state,
+  defaults to the backend's preferred-available provider, and ships with every
+  chat request. Existing Claude-only setups are unchanged.
+- **Out of scope (per task):** per-project model memory, provider fallback,
+  cost tracking, advanced settings, streaming, provider-specific UI tuning.
+
+### 07.2 — Light theme + theme switcher
+Added a second color theme (frontend-only):
+- **Theme tokens.** The dark palette already lived in CSS variables on `:root`;
+  added a `:root[data-theme='light']` block (higher specificity than bare
+  `:root`, so it wins when the attribute is set; no attribute → dark default).
+  Two previously hard-coded values were variabilized so they flip with the
+  theme: bold response text (`--text-strong`) and the elevated code surface
+  (`--bg-elev`). Everything else already referenced variables, so the whole UI
+  (sidebars, chat, composer, modals, runs panel) re-themes with no per-component
+  changes.
+- **Switcher.** A Dark/Light dropdown sits **top-right** of the chat header
+  (mirroring the provider selector top-left). `App` owns the theme state,
+  defaults to dark, persists to `localStorage` (`agentos-theme`), and applies it
+  by setting `data-theme` on `<html>` so the variables cascade everywhere
+  (modals included). Behavior is otherwise identical to dark mode.
+
+---
+
 ## Execution-trigger contract (invariant)
 
 - **`@code <task>`** in a project chat starts a run immediately; the task card
@@ -219,7 +301,9 @@ Anthropic key is needed. Each file is runnable standalone.
 | `test_ui_browser_verification.py` |    12 | 06.2C UI flow: default port, install step, status recompute  |
 | `test_preview.py`                 |    12 | 06.2D preview registry; 06.2E `deps_installed`               |
 | `test_chat_first_endpoints.py`    |     3 | 06.2D HTTP: browser-verify sub-status, preview start/stop    |
-| **Total**                         | **199** |                                                            |
+| `test_uploads.py`                 |    14 | 07.0 sanitize/dedup/storage, workspace copy, upload HTTP      |
+| `test_providers.py`               |    19 | 07.1 availability, default order, dispatch/parse, chat routing |
+| **Total**                         | **232** |                                                            |
 
 Run all (from `backend/`): `python tests/<file>.py` for each row above.
 

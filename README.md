@@ -71,6 +71,19 @@ check), gives the Coding Agent one bounded repair pass if they fail, and
 marks a run `completed` only after they pass — then offers browser
 verification in chat.
 
+**Phase 4 — Interface & UX** has begun with **Task 07.0**: a modern
+multi-modal chat composer — auto-growing multiline input (`Enter` for a
+newline, `Ctrl`/`Cmd`+`Enter` to send), voice dictation via the Web Speech
+API, and file attachments (images, `.txt`/`.md`/`.pdf`/`.doc`/`.docx`) that
+can be attached to the chat message and optionally copied into the project's
+sandboxed workspace. **Task 07.1** added pluggable **model providers** —
+Claude, GPT, Gemini, and DeepSeek — selectable from a dropdown in the chat
+header. A provider is available when its API key is set; missing-key providers
+show disabled, and Claude stays the default for backward compatibility.
+**Task 07.2** added a light color theme alongside the original dark one,
+switchable from a dropdown top-right in the chat header and remembered
+across reloads.
+
 Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 
 ## Architecture
@@ -133,7 +146,9 @@ Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 cd backend
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env and add ANTHROPIC_API_KEY
+# Edit .env and add at least one provider key:
+#   ANTHROPIC_API_KEY (Claude), OPENAI_API_KEY (GPT),
+#   GOOGLE_API_KEY (Gemini), DEEPSEEK_API_KEY (DeepSeek)
 uvicorn main:app --reload --port 8000
 ```
 
@@ -180,6 +195,8 @@ python tests/test_verification.py
 python tests/test_verification_inference.py
 python tests/test_browser_verification.py
 python tests/test_runner_diagnostics.py
+python tests/test_uploads.py
+python tests/test_providers.py
 ```
 
 All tests stub the LLM caller, so no Anthropic API key is needed to

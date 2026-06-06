@@ -14,6 +14,27 @@
   --border: #2a2a4a;
   --msg-user: #0f3460;
   --msg-assistant: #1a1a3e;
+  /* Strong/bold text inside rendered responses + subtle elevated surfaces.
+     Variabilized (Task 07.2) so they flip with the theme. */
+  --text-strong: #ffffff;
+  --bg-elev: rgba(255, 255, 255, 0.05);
+}
+
+/* Task 07.2 — light theme. Applied when <html data-theme="light">. The
+   :root[data-theme=...] selector outranks plain :root, so these win whenever
+   the attribute is set; with no attribute the dark defaults above apply. */
+:root[data-theme='light'] {
+  --bg: #f4f5fa;
+  --bg-surface: #ffffff;
+  --bg-input: #e9ecf4;
+  --text: #1d2030;
+  --text-muted: #5f6477;
+  --accent: #e94560;
+  --border: #d6d9e4;
+  --msg-user: #e4ebfb;
+  --msg-assistant: #ffffff;
+  --text-strong: #11131c;
+  --bg-elev: rgba(0, 0, 0, 0.05);
 }
 
 html, body, #root {
@@ -148,11 +169,55 @@ html, body, #root {
 .chat-header {
   padding: 16px 20px;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .chat-header h2 {
   font-size: 16px;
   font-weight: 600;
+}
+
+/* Task 07.1 — provider selector sits top-left of the chat header. */
+.chat-header-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.provider-select,
+.theme-select {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.provider-select:hover,
+.provider-select:focus,
+.theme-select:hover,
+.theme-select:focus {
+  border-color: var(--accent);
+}
+
+.provider-select option:disabled {
+  color: var(--text-muted);
+}
+
+/* Theme select options always render on the OS-native dropdown surface, so
+   pin readable colors regardless of the active theme. */
+.theme-select option {
+  background: var(--bg-surface);
+  color: var(--text);
 }
 
 .chat-messages {
@@ -392,6 +457,266 @@ html, body, #root {
   opacity: 0.85;
 }
 
+/* ---------- Task 07.0 — multi-modal composer ---------- */
+
+/* The composer is a flex row; align to the bottom so the growing textarea
+   pushes upward while the +, mic, and Send controls stay anchored. */
+.chat-input.composer {
+  align-items: flex-end;
+}
+
+.composer-textarea {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  outline: none;
+  resize: none;
+  overflow-y: auto;
+  max-height: 200px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.composer-textarea:focus {
+  border-color: var(--accent);
+}
+
+.composer-textarea:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Round icon buttons for attach + voice — override the generic
+   `.chat-input button` rule via higher specificity (`.composer …`). */
+.composer .composer-icon-btn {
+  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.composer .composer-attach-btn {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.composer .composer-icon-btn:hover:not(:disabled) {
+  background: var(--bg);
+  border-color: var(--accent);
+}
+
+.composer .composer-icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Recording state — pulsing red ring on the mic button. */
+.composer .composer-voice-btn.recording {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  animation: composer-rec-pulse 1.3s ease-out infinite;
+}
+
+@keyframes composer-rec-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(233, 69, 96, 0.55); }
+  70% { box-shadow: 0 0 0 7px rgba(233, 69, 96, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(233, 69, 96, 0); }
+}
+
+.composer .composer-send-btn {
+  flex-shrink: 0;
+  height: 38px;
+  padding: 0 18px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.composer .composer-send-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.composer .composer-send-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Tray above the composer: file chips, workspace toggle, inline errors. */
+.composer-tray {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 20px 0;
+}
+
+.composer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 240px;
+  padding: 4px 6px 4px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  font-size: 12px;
+}
+
+.composer-chip-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.composer-chip-size {
+  color: var(--text-muted);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.composer-chip-remove {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.composer-chip-remove:hover:not(:disabled) {
+  background: var(--accent);
+  color: #fff;
+}
+
+.composer-chip-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.composer-workspace-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  width: fit-content;
+}
+
+.composer-workspace-toggle input[type='checkbox'] {
+  cursor: pointer;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.composer-upload-error,
+.composer-voice-error {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+/* Attachments rendered under a sent message bubble. */
+.chat-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chat-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.chat-attachment-thumb {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.chat-attachment-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.chat-attachment-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.chat-attachment-scope {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 6px;
+  border-radius: 10px;
+}
+
+.chat-attachment-scope.chat {
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+}
+
+.chat-attachment-scope.workspace {
+  color: #7fd17f;
+  background: rgba(127, 209, 127, 0.1);
+  border: 1px solid #335f33;
+}
+
 /* Context panel */
 .context-panel {
   border-right: none;
@@ -533,7 +858,7 @@ html, body, #root {
 }
 
 .orch-response strong {
-  color: #fff;
+  color: var(--text-strong);
 }
 
 .orch-response blockquote {
@@ -1446,7 +1771,7 @@ html, body, #root {
 .run-chat-verify-result code {
   font-family: 'Consolas', 'Monaco', monospace;
   font-size: 11px;
-  background: var(--bg-elev, rgba(255, 255, 255, 0.05));
+  background: var(--bg-elev);
   padding: 1px 4px;
   border-radius: 3px;
 }

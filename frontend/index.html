@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent OS</title>
+    <!-- Task 07.2 — apply the saved theme before first paint to avoid a
+         dark-to-light flash on reload. React keeps this in sync afterward. -->
+    <script>
+      try {
+        var t = localStorage.getItem('agentos-theme');
+        document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

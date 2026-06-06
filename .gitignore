@@ -45,6 +45,10 @@ execution_workspaces/*
 !execution_workspaces/AGENT.example.md
 !execution_workspaces/TASK.example.md
 
+# Chat attachments (Task 07.0) - user-uploaded files attached to chat messages.
+# Private local state, same as memory and workspaces.
+chat_uploads/
+
 # Runtime logs
 logs/
 *.log
