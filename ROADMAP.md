@@ -250,6 +250,52 @@ Added a second color theme (frontend-only):
 
 ---
 
+## Phase 5 — Execution Orchestration (plan → tasks → execute)
+
+Upgraded the Coding Agent from one flat bounded tool loop into a phased,
+inspectable orchestration: **plan → execute task-by-task → finalize**. The
+run record, role separation, sandbox chokepoint, explicit-dispatch contract,
+and the whole verification / browser / preview / reconciliation tail are
+unchanged; the new layer is additive.
+
+- **Planning phase** (`planner.py`, new). A cheap, pure heuristic
+  (`looks_complex`) gates the cost: simple task cards skip the planner entirely
+  (no extra LLM call — legacy behavior + every existing test preserved), while
+  complex cards run a **bounded read-only inspection loop** (`MAX_PLAN_STEPS=6`,
+  `list_files`/`read_file`/`search_files` only, enforced not prompt-only) that
+  ends in a `plan` action. The plan — goal, analysis, risks, and an ordered set
+  of `ExecutionTask` units with `depends_on` — is parsed tolerantly and
+  **always falls back to a single-task plan** on any failure (parse error,
+  zero/over-cap tasks, planner LLM unavailable). Never fails the run.
+- **Structured task graph** (`models.py`). New `ExecutionPlan` / `ExecutionTask`
+  / `TaskStatus` (`pending`/`running`/`completed`/`failed`/`skipped`). The plan
+  rides on `RunRecord.plan` (so run.json carries it) and is also persisted as a
+  standalone `plan.json` artifact, rewritten as task statuses settle.
+- **Multi-step execution** (`runner.py`). A single-task plan runs the *original*
+  loop verbatim (`MAX_STEPS=24`) and passes the agent's `final` (incl.
+  `task_md_update`) straight to `_finalize` — byte-identical legacy path. A
+  multi-task plan runs each unit in topological order (`MAX_TASK_STEPS=12`,
+  cycle-safe), skips tasks whose dependency failed, records per-task
+  status/summary/files/commands/blockers, and aggregates a run status
+  (all completed → `completed`, so command verification still gates it;
+  mixed → `partial`; none → `failed`). Single-threaded, but `depends_on` leaves
+  the door open for future parallel/subagent execution. Observed-activity stays
+  run-scoped; per-task attribution uses snapshot deltas.
+- **Observability**. Richer `events.jsonl`: a `phase` tag
+  (`planning`/`execution`/`repair`) on tool/LLM events plus
+  `plan_started` / `plan_ready` / `plan_failed` / `task_started` / `task_status`.
+  `result.md` gains an **Execution Plan + per-task** section for multi-task runs
+  (single-task result.md is unchanged). New read-only endpoint
+  `GET …/runs/{run_id}/plan`. Minimal additive UI: TS types + a read-only
+  "Plan & Tasks" block in `RunDetailModal` (Runs panel + chat card untouched).
+- **Design references** (architecture only, no code copied): `HKUDS/OpenHarness`,
+  `Gitlawb/openclaude`, `anomalyco/opencode` — plan/build split, task tools,
+  observable execution. Kept strictly local-first (no queues/cloud).
+- **Budgets, not bloat.** We added structure (per-task loops + a small planning
+  budget), not a bigger flat `MAX_STEPS`.
+
+---
+
 ## Execution-trigger contract (invariant)
 
 - **`@code <task>`** in a project chat starts a run immediately; the task card
@@ -278,6 +324,11 @@ Added a second color theme (frontend-only):
   pass adds a bounded loop only when verification fails on a `completed` run.
 - **Main agent never auto-reads repo contents** — only via the bounded 06.1
   inspection loop (max 3 reads/turn).
+- **Execution is planned then task-by-task (Phase 5).** Complex runs decompose
+  into a persisted task graph and execute single-threaded in topological order;
+  simple runs still take the original single-loop path. Planning is read-only
+  and best-effort (always falls back to one task). No parallel/subagent
+  execution yet — `depends_on` is recorded but the runner is single-threaded.
 - **Single-user, single-process.** No auth, no shared deploy.
 
 ---
@@ -303,7 +354,9 @@ Anthropic key is needed. Each file is runnable standalone.
 | `test_chat_first_endpoints.py`    |     3 | 06.2D HTTP: browser-verify sub-status, preview start/stop    |
 | `test_uploads.py`                 |    14 | 07.0 sanitize/dedup/storage, workspace copy, upload HTTP      |
 | `test_providers.py`               |    19 | 07.1 availability, default order, dispatch/parse, chat routing |
-| **Total**                         | **232** |                                                            |
+| `test_planner.py`                 |    26 | Phase 5 heuristic gate, plan parse/fallback, graph + aggregation |
+| `test_runner_planning.py`         |     6 | Phase 5 plan→tasks integration: decompose, skip, fallback, gate |
+| **Total**                         | **264** |                                                            |
 
 Run all (from `backend/`): `python tests/<file>.py` for each row above.
 
@@ -328,9 +381,11 @@ to surface the verdict in the UI.
   structured output, gate the inspection loop behind a heuristic.
 
 ### Longer-term, not committed
-Run cancellation; run retry ("rerun this task card"); cross-project memory
-linking; multi-user / shared deploy (needs auth + per-user workspaces + a
-different DB story).
+Parallel / subagent task execution (Phase 5 records `depends_on` but runs
+single-threaded); a streaming run-event UI over the richer `events.jsonl`
+(plan/task transitions); run cancellation; run retry ("rerun this task card");
+cross-project memory linking; multi-user / shared deploy (needs auth + per-user
+workspaces + a different DB story).
 
 ---
 

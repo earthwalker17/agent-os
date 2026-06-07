@@ -18,10 +18,10 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .manager import get_execution_root, get_project_execution_dir
-from .models import RunRecord, RunStatus
+from .models import ExecutionPlan, RunRecord, RunStatus
 from .verification import render_verification_section
 from .browser_verification import render_browser_verification_section
 
@@ -72,6 +72,27 @@ def write_run_json(project_id: str, run_id: str, record: RunRecord) -> None:
 
 def read_run_json(project_id: str, run_id: str) -> dict | None:
     path = get_run_dir(project_id, run_id) / "run.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def write_plan_json(project_id: str, run_id: str, plan: ExecutionPlan) -> None:
+    """Persist the run's execution plan as a standalone ``plan.json`` artifact.
+
+    The plan is also embedded in run.json (``RunRecord.plan``); this dedicated
+    artifact gives a clean, machine-readable task-graph view that the runner
+    re-writes as task statuses settle (Phase 5).
+    """
+    path = get_run_dir(project_id, run_id) / "plan.json"
+    path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+
+
+def read_plan_json(project_id: str, run_id: str) -> dict | None:
+    path = get_run_dir(project_id, run_id) / "plan.json"
     if not path.exists():
         return None
     try:
@@ -230,6 +251,40 @@ def rerender_result_md(project_id: str, run_id: str, record: RunRecord) -> None:
     write_result_md(project_id, run_id, render_result_md(record, summary, notes=notes))
 
 
+def _render_plan_section(plan: Optional[ExecutionPlan]) -> str:
+    """Render the Execution Plan + per-task summary for a multi-task run.
+
+    Returns ``""`` for runs with no plan or a single-task (simple/fallback)
+    plan, so result.md for simple runs stays byte-identical to the legacy
+    output. Multi-task runs get a readable task-by-task execution summary.
+    """
+    if plan is None or len(plan.tasks) <= 1:
+        return ""
+    lines: list[str] = ["## Execution Plan"]
+    if plan.goal:
+        lines.append(f"**Goal:** {plan.goal}")
+    if plan.analysis:
+        lines.append("")
+        lines.append(plan.analysis)
+    if plan.risks:
+        lines.append("")
+        lines.append("**Risks:**")
+        lines.extend(f"- {r}" for r in plan.risks)
+    lines.append("")
+    lines.append("## Tasks")
+    for i, t in enumerate(plan.tasks, start=1):
+        lines.append(f"{i}. [{t.status.value}] {t.id} — {t.title}")
+        if t.summary:
+            lines.append(f"   - {t.summary}")
+        if t.files_changed:
+            lines.append(f"   - files: {', '.join(t.files_changed)}")
+        if t.commands_run:
+            lines.append(f"   - commands: {', '.join(t.commands_run)}")
+        if t.blockers:
+            lines.append(f"   - blockers: {', '.join(t.blockers)}")
+    return "\n".join(lines) + "\n\n"
+
+
 def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
     def _bullets(items: list[str]) -> str:
         return "\n".join(f"- {x}" for x in items) if items else "_(none)_"
@@ -243,5 +298,6 @@ def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
         f"## Blockers\n{_bullets(record.blockers)}\n\n"
         f"{render_verification_section(record.verification)}\n"
         f"{render_browser_verification_section(record.browser_verification)}\n"
+        f"{_render_plan_section(record.plan)}"
         f"## Notes for Main Agent\n{notes.strip() or '_(none)_'}\n"
     )

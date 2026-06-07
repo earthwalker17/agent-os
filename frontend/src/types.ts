@@ -107,6 +107,34 @@ export interface BrowserVerificationResult {
   install_output_preview?: string
 }
 
+/** Phase 5 — per-task status inside a run's execution plan. */
+export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
+
+/** Phase 5 — one task unit in a run's execution plan/graph. */
+export interface ExecutionTask {
+  id: string
+  title: string
+  description?: string
+  status: TaskStatus
+  depends_on?: string[]
+  summary?: string
+  files_changed?: string[]
+  commands_run?: string[]
+  blockers?: string[]
+  steps_used?: number
+}
+
+/** Phase 5 — the run's persisted plan + task graph. */
+export interface ExecutionPlan {
+  goal?: string
+  analysis?: string
+  risks?: string[]
+  tasks?: ExecutionTask[]
+  /** 'planned' (LLM-decomposed), 'simple' (single task), 'fallback' (planning failed). */
+  mode?: 'planned' | 'simple' | 'fallback'
+  created_at?: string
+}
+
 export interface RunRecord {
   run_id: string
   project_id: string
@@ -135,6 +163,8 @@ export interface RunRecord {
    * in-progress by the UI.
    */
   browser_verification_state?: 'running' | 'passed' | 'failed' | null
+  /** Phase 5 — the run's execution plan + task graph (null for older runs). */
+  plan?: ExecutionPlan | null
 }
 
 /** Task 06.2D — managed preview dev-server status. */

@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { BrowserVerificationResult, RunRecord, VerificationResult } from '../types'
+import type {
+  BrowserVerificationResult,
+  ExecutionPlan,
+  RunRecord,
+  VerificationResult,
+} from '../types'
 
 interface Props {
   projectId: string
@@ -169,6 +174,48 @@ function BrowserVerificationBlock({
   )
 }
 
+function PlanBlock({ plan }: { plan: ExecutionPlan | null | undefined }): JSX.Element | null {
+  const tasks = plan?.tasks ?? []
+  if (!plan || tasks.length === 0) return null
+  return (
+    <div className="run-detail-plan">
+      {plan.goal && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Goal</span>
+          <span>{plan.goal}</span>
+        </div>
+      )}
+      <div>
+        {plan.mode && <span className="run-detail-verify-meta">{plan.mode}</span>}
+        <span className="run-detail-verify-meta">
+          {tasks.length} task{tasks.length === 1 ? '' : 's'}
+        </span>
+      </div>
+      {plan.risks && plan.risks.length > 0 && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Risks</span>
+          {bullets(plan.risks)}
+        </div>
+      )}
+      <ol className="run-detail-task-list">
+        {tasks.map((t) => (
+          <li key={t.id}>
+            <span className={`run-verify-status status-${t.status}`}>{t.status}</span>
+            <span className="run-detail-task-title">{t.title}</span>
+            {t.depends_on && t.depends_on.length > 0 && (
+              <span className="run-detail-verify-meta">after {t.depends_on.join(', ')}</span>
+            )}
+            {t.summary && <div className="run-detail-task-summary">{t.summary}</div>}
+            {t.blockers && t.blockers.length > 0 && (
+              <div className="run-detail-task-blockers">{t.blockers.join('; ')}</div>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
+  )
+}
+
 function RunDetailModal({ projectId, runId, onClose }: Props) {
   const [record, setRecord] = useState<RunRecord | null>(null)
   const [resultMd, setResultMd] = useState<string>('')
@@ -248,6 +295,13 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
                   <span>{record.task_title || '(untitled)'}</span>
                 </div>
               </div>
+
+              {record.plan && (record.plan.tasks?.length ?? 0) > 1 && (
+                <section className="run-detail-result">
+                  <h4>Plan &amp; Tasks</h4>
+                  <PlanBlock plan={record.plan} />
+                </section>
+              )}
 
               <div className="run-detail-grid">
                 <section>

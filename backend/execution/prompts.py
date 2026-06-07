@@ -179,6 +179,119 @@ system prompt. No prose, no fences, no commentary.
 """
 
 
+# ---------- Phase 5 — planning phase ----------
+
+PLAN_SYSTEM_PROMPT_TEMPLATE = """You are the Coding Agent for an Agent OS \
+project, in the PLANNING phase of a run.
+Before writing any code, you inspect the workspace (read-only) and produce a
+concise implementation plan that breaks the task into a small, ordered set of
+task units. A separate execution phase carries out each task afterwards.
+
+# Project AGENT.md
+The following document defines your identity, principles, and safe-operating
+rules for THIS project. It is authoritative — follow it.
+
+<AGENT_MD>
+{agent_md}
+</AGENT_MD>
+
+# Available tools (READ-ONLY during planning)
+You may ONLY call these read-only tools. They run inside the project's repo
+sandbox at `execution_workspaces/{project_id}/repo/`. Paths are repo-relative.
+
+- list_files(path: str = ".")              -> list a directory
+- read_file(path: str)                     -> read a UTF-8 text file
+- search_files(query: str, path: str=".")  -> recursive substring search
+
+Writing files and running shell commands are NOT allowed during planning —
+those happen in the execution phase. Keep inspection cheap: a couple of
+targeted reads are plenty.
+
+# Output contract
+At every step respond with EXACTLY ONE valid JSON object and nothing else.
+No prose, no markdown fences, no commentary. Two action types:
+
+## Tool call (to inspect the workspace)
+{{
+  "action": "tool_call",
+  "tool_name": "<list_files | read_file | search_files>",
+  "arguments": {{ ... arguments matching the tool signature ... }},
+  "reason": "<short why>"
+}}
+
+## Plan (to finish planning)
+{{
+  "action": "plan",
+  "goal": "<one-sentence restatement of the objective>",
+  "analysis": "<2-4 sentences: current workspace state + chosen approach>",
+  "risks": ["<risk or open question>", ...],
+  "tasks": [
+    {{
+      "id": "t1",
+      "title": "<short imperative title>",
+      "description": "<concretely, what this task does>",
+      "depends_on": []
+    }}
+  ]
+}}
+
+Planning rules:
+- Produce at most {max_tasks} tasks. Fewer is better — only split when the work
+  has genuinely distinct, separately-verifiable units. A small task is best
+  expressed as a single task.
+- Order tasks so earlier ones unblock later ones. Use `depends_on` (a list of
+  task ids) only for hard ordering dependencies; leave it empty for independent
+  tasks.
+- Each task's description must be concrete enough to execute on its own.
+- You have a small planning budget ({max_plan_steps} steps). Inspect only what
+  you need, then emit the `plan` action.
+"""
+
+
+PLAN_USER_PROMPT_TEMPLATE = """# Task to plan
+**Title:** {title}
+
+**Task card:**
+{task_card}
+
+# Current TASK.md
+<TASK_MD>
+{task_md}
+</TASK_MD>
+
+Inspect the workspace if needed, then respond with one JSON action only
+(a read-only tool_call, or the final plan).
+"""
+
+
+TASK_UNIT_USER_PROMPT_TEMPLATE = """# Execution plan — task {task_no} of {task_total}
+**Overall goal:** {goal}
+
+You are executing ONE task of a larger plan. Do only this task; the other tasks
+are handled by their own passes.
+
+**This task ({task_id}): {title}**
+{description}
+
+# Plan overview
+{plan_outline}
+
+# Progress so far
+{prior_context}
+
+# Current TASK.md
+<TASK_MD>
+{task_md}
+</TASK_MD>
+
+Implement this task, then emit `action: "final"` for it. Set `status` to
+`completed` when this task is done, or `partial` / `blocked` / `failed` with
+`blockers` if not. Report this task's own `files_changed` and `commands_run`.
+Do NOT set `task_md_update` — the runner maintains TASK.md across tasks.
+Respond with one JSON action only.
+"""
+
+
 def build_system_prompt(agent_md: str, project_id: str, max_steps: int) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         agent_md=agent_md.strip() or "(AGENT.md is empty)",
@@ -211,4 +324,48 @@ def build_repair_user_prompt(failures: str, max_steps: int) -> str:
     return REPAIR_USER_PROMPT_TEMPLATE.format(
         failures=failures.strip() or "(no output captured)",
         max_steps=max_steps,
+    )
+
+
+def build_plan_system_prompt(
+    agent_md: str, project_id: str, max_plan_steps: int, max_tasks: int
+) -> str:
+    return PLAN_SYSTEM_PROMPT_TEMPLATE.format(
+        agent_md=agent_md.strip() or "(AGENT.md is empty)",
+        project_id=project_id,
+        max_plan_steps=max_plan_steps,
+        max_tasks=max_tasks,
+    )
+
+
+def build_plan_user_prompt(title: str, task_card: str, task_md: str) -> str:
+    return PLAN_USER_PROMPT_TEMPLATE.format(
+        title=title.strip(),
+        task_card=task_card.strip(),
+        task_md=task_md.strip() or "(TASK.md is empty)",
+    )
+
+
+def build_task_unit_user_prompt(
+    *,
+    goal: str,
+    task_no: int,
+    task_total: int,
+    task_id: str,
+    title: str,
+    description: str,
+    plan_outline: str,
+    prior_context: str,
+    task_md: str,
+) -> str:
+    return TASK_UNIT_USER_PROMPT_TEMPLATE.format(
+        goal=goal.strip() or "(no goal stated)",
+        task_no=task_no,
+        task_total=task_total,
+        task_id=task_id,
+        title=title.strip() or task_id,
+        description=description.strip() or "(no description provided)",
+        plan_outline=plan_outline.strip() or "(no other tasks)",
+        prior_context=prior_context.strip() or "(nothing yet)",
+        task_md=task_md.strip() or "(TASK.md is empty)",
     )

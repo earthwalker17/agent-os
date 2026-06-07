@@ -1089,6 +1089,24 @@ def api_get_run_result(project_id: str, run_id: str):
     return {"run_id": run_id, "content": content}
 
 
+@app.get("/api/projects/{project_id}/execution/runs/{run_id}/plan")
+def api_get_run_plan(project_id: str, run_id: str):
+    """Return the run's execution plan + task graph (Phase 5).
+
+    Reads the standalone ``plan.json`` artifact, falling back to the ``plan``
+    embedded in run.json. 404 when the run predates planning or has no plan.
+    """
+    _require_workspace(project_id)
+    plan = run_store.read_plan_json(project_id, run_id)
+    if plan is None:
+        record = run_store.read_run_json(project_id, run_id)
+        if record is not None and record.get("plan") is not None:
+            plan = record["plan"]
+    if plan is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    return plan
+
+
 @app.get("/api/projects/{project_id}/execution/runs/{run_id}/screenshot")
 def api_get_run_screenshot(project_id: str, run_id: str):
     """Serve the browser verification screenshot for a run (Task 06.2B).

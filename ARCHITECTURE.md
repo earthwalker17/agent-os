@@ -78,8 +78,8 @@ Agent OS/
 │  └─ PROJECT.md / STATUS.md / TASK_QUEUE.md / DECISIONS.md / RESEARCH.md
 ├─ execution_workspaces/{project_id}/
 │  ├─ repo/                     working code tree (Coding Agent's sandbox)
-│  ├─ runs/{run_id}/            task_card.md, events.jsonl, run.json, result.md,
-│  │                            screenshots/browser.png
+│  ├─ runs/{run_id}/            task_card.md, events.jsonl, run.json, plan.json,
+│  │                            result.md, screenshots/browser.png
 │  ├─ logs/  AGENT.md  TASK.md
 │  └─ repo/uploads/             chat files copied in via "add to workspace" (07.0)
 ├─ chat_uploads/{conversation}/ chat-only attachments (07.0, gitignored)
@@ -109,14 +109,15 @@ conversations, messages, and pending executions.
 | File                       | Purpose                                                                |
 |----------------------------|------------------------------------------------------------------------|
 | `manager.py`               | Workspace filesystem layout + idempotent init; `read/update_task_state`. |
-| `models.py`                | Pydantic models: `RunRecord`, `RunStatus`, `TaskSpec`, `ResultSummary`, `VerificationResult` (+ `VerificationCommandResult`), `BrowserVerificationResult`. |
+| `models.py`                | Pydantic models: `RunRecord`, `RunStatus`, `TaskSpec`, `ResultSummary`, `VerificationResult` (+ `VerificationCommandResult`), `BrowserVerificationResult`; **Phase 5** `ExecutionPlan` / `ExecutionTask` / `TaskStatus`. |
 | `templates.py`             | Default `AGENT.md` / `TASK.md` seeds (incl. the verification block docs). |
 | `sandbox.py`               | `ProjectSandbox`: path + command validation. **The boundary.**          |
 | `tool_models.py`           | `ToolResult` + per-tool request models.                                 |
 | `tool_runtime.py`          | `ToolRuntime`: the six sandboxed file/shell tools with output caps.     |
-| `prompts.py`               | Coding Agent system prompt + per-step / correction / **repair** prompts. |
-| `run_store.py`             | Per-run artifact reader/writer; `render_result_md`; `sweep_stuck_runs`. |
-| `runner.py`                | `CodingAgentRunner`: the JSON tool loop, finalize, **verification + repair** orchestration. |
+| `prompts.py`               | Coding Agent system prompt + per-step / correction / **repair** prompts; **Phase 5** planning + per-task-unit prompts. |
+| `planner.py`               | **Phase 5** — pure planning layer: `looks_complex` heuristic gate, tolerant `parse_plan`, `fallback_plan`, task-graph helpers (`topological_order` cycle-safe, `dependency_failed`, `aggregate_run_status`). |
+| `run_store.py`             | Per-run artifact reader/writer; `render_result_md`; `sweep_stuck_runs`; **Phase 5** `write/read_plan_json` + result.md task section. |
+| `runner.py`                | `CodingAgentRunner`: **Phase 5 phased run** — plan phase → per-task execution loops → finalize, **verification + repair** orchestration. |
 | `background.py`            | `BackgroundRunManager`: thread-pool dispatch; crash → `failed`.         |
 | `chat_delegation.py`       | `@code` trigger handling.                                               |
 | `delegation_intent.py`     | Heuristic implicit-delegation detector (fallback only).                 |
@@ -174,20 +175,36 @@ Coding Agent) use the default provider. Availability is key-presence; see
 Inferred intent → pending plan → user clicks **OK** →
 `/execution/pending/{id}/confirm` → same `dispatch()`. **No other path runs.**
 
-### C. Coding Agent run — `CodingAgentRunner.run_task()`
-1. Init run dir + `run.json` (`running`); build system prompt from `AGENT.md`.
-2. **Tool loop** (`MAX_STEPS = 24`): each step = one LLM JSON action
-   (`tool_call` dispatched via `ToolRuntime`, or `final`). One JSON-correction
-   retry. Observed file/command activity tracked as a fallback.
-3. **Finalize**: set status/summary/lists from the `final` action; update
-   `TASK.md` (snapshotting the pre-update copy first).
-4. **Command verification + repair** (see D).
-5. **Browser verification** (opt-in `## Browser Verification` block) — automatic
+### C. Coding Agent run — `CodingAgentRunner.run_task()` (Phase 5: phased)
+1. Init run dir + `run.json` (`running`); load `AGENT.md` / `TASK.md`.
+2. **Plan phase** (`planner.py`): a cheap, pure heuristic (`looks_complex`)
+   gates planning. Simple cards skip the LLM and get a single-task plan; complex
+   cards run a bounded **read-only** inspection loop (`MAX_PLAN_STEPS = 6`,
+   list/read/search only, enforced — not prompt-only) ending in a `plan` action →
+   an `ExecutionPlan` (goal, analysis, risks, ordered `ExecutionTask` units with
+   `depends_on`). Any failure (parse/empty/over-cap/LLM-unavailable) → single-task
+   fallback. Persisted to `plan.json` + `run.json`; the record stays `running`.
+3. **Execution phase**: a single-task plan runs the original bounded loop
+   verbatim (`MAX_STEPS = 24`; `tool_call`/`final`; one JSON-correction retry;
+   observed-activity fallback) and passes the agent's `final` straight through
+   (incl. `task_md_update`). A multi-task plan runs each task in topological
+   order (`MAX_TASK_STEPS = 12` each), skips tasks whose dependency failed
+   (→ `skipped`), mutates per-task status/summary/files/commands/blockers in
+   place (run.json + plan.json rewritten per task for live polling), then
+   aggregates a run status (all completed → `completed`; mixed → `partial`;
+   none → `failed`).
+4. **Finalize**: set status/summary/lists; update `TASK.md` (snapshot pre-update
+   copy first).
+5. **Command verification + repair** (see D).
+6. **Browser verification** (opt-in `## Browser Verification` block) — automatic
    screenshot if configured.
-6. **Memory reconciliation** (06.0) — bounded, best-effort, at most once.
-7. Write `run.json` + `result.md`; return `ResultSummary`.
+7. **Memory reconciliation** (06.0) — bounded, best-effort, at most once.
+8. Write `run.json` + `plan.json` + `result.md`; return `ResultSummary`.
 
-Steps 4–6 are **best-effort: an exception there never fails finalization.**
+Steps 5–7 are **best-effort: an exception there never fails finalization.** The
+plan phase is read-only and never fails the run — it falls back to a single task.
+Events now carry a `phase` tag (`planning`/`execution`/`repair`) plus
+`plan_started`/`plan_ready`/`plan_failed`/`task_started`/`task_status`.
 
 ### D. Command verification + repair — `verification.py` + `runner._verify_with_repair`
 1. `plan_verification()`: manual `## Verification` block wins (multi-line);
@@ -224,8 +241,10 @@ re-hydrate on reload. Images re-serve read-only via
 `run_id`, `project_id`, `task_title`, `status` (`running`/`completed`/
 `partial`/`blocked`/`failed`), `summary`, `files_changed`, `commands_run`,
 `blockers`; verification fields (`verification`, `verification_state`),
-browser fields (`browser_verification`, `browser_verification_state`), and
-memory-reconciliation fields. `VerificationResult` carries `mode`
+browser fields (`browser_verification`, `browser_verification_state`),
+memory-reconciliation fields, and the **Phase 5** `plan` field (an
+`ExecutionPlan` of `ExecutionTask` units, also written standalone as
+`plan.json`). `VerificationResult` carries `mode`
 (`manual`/`inferred`/`skipped`), a `commands[]` breakdown, and `repair_attempts`;
 its legacy top-level `command`/`exit_code`/`output_preview` mirror the aggregate.
 
@@ -274,7 +293,7 @@ when nothing safe can run.
 
 ## 11. Starting a future session
 
-1. Read `CLAUDE.md`, this file, then the latest Phase 3 entries in `ROADMAP.md`.
+1. Read `CLAUDE.md`, this file, then the latest Phase 5 entries in `ROADMAP.md`.
 2. Match the existing per-feature module + per-feature test-file convention.
 3. Keep changes small and bounded to the files the task names; propose refactors
    separately.

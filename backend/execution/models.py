@@ -49,6 +49,72 @@ class TaskSpec(BaseModel):
     created_by: str = "manual"
 
 
+class TaskStatus(str, Enum):
+    """Lifecycle status for a single task unit inside a run's execution plan.
+
+    Distinct from :class:`RunStatus` (which is the run as a whole). A task is
+    ``PENDING`` until the runner picks it up, ``RUNNING`` while its bounded
+    tool loop is in flight, then one of the three terminal values. ``SKIPPED``
+    is used when a task is not attempted because one of its declared
+    dependencies failed.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ExecutionTask(BaseModel):
+    """One unit of work in a run's execution plan (Phase 5).
+
+    The planner breaks a complex task card into an ordered, optionally
+    dependency-linked list of these. The runner executes them one at a time
+    (single-threaded this phase) and mutates each task's ``status`` + result
+    fields in place as it goes, so a poll of run.json shows live progress.
+
+    ``depends_on`` references other tasks by ``id``; it is honored for ordering
+    and skip-on-failure today and leaves room for future parallel execution.
+    """
+
+    id: str
+    title: str
+    description: str = ""
+    status: TaskStatus = TaskStatus.PENDING
+    depends_on: list[str] = Field(default_factory=list)
+    summary: str = ""
+    files_changed: list[str] = Field(default_factory=list)
+    commands_run: list[str] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    steps_used: int = 0
+
+
+class ExecutionPlan(BaseModel):
+    """A run's persisted plan + task graph (Phase 5).
+
+    Produced by the planning phase before implementation begins and persisted
+    both inside :class:`RunRecord` (run.json) and as a standalone ``plan.json``
+    run artifact. ``mode`` records how the plan was formed:
+
+      - ``"planned"`` — an LLM planning loop decomposed the task card.
+      - ``"simple"`` — the task card looked simple; a single task covering the
+        whole card was created without an LLM planning call.
+      - ``"fallback"`` — planning was attempted but could not produce a usable
+        plan (parse failure, LLM unavailable, zero/over-cap/cyclic tasks), so a
+        single-task plan covering the whole card was substituted.
+
+    ``tasks`` carries the live task statuses, mutated in place during execution.
+    """
+
+    goal: str = ""
+    analysis: str = ""
+    risks: list[str] = Field(default_factory=list)
+    tasks: list[ExecutionTask] = Field(default_factory=list)
+    mode: str = "simple"  # "planned" | "simple" | "fallback"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class VerificationCommandResult(BaseModel):
     """Outcome of a single verification command (Task 06.2E).
 
@@ -198,6 +264,12 @@ class RunRecord(BaseModel):
     # verification status (``"passed"`` / ``"failed"``) once it settles. The
     # frontend treats only ``"running"`` as in-progress.
     browser_verification_state: Optional[str] = None
+    # Phase 5 — the run's execution plan + task graph. ``None`` for runs that
+    # finished before planning was introduced. Populated for every new run
+    # (a trivial single-task plan for simple cards, a decomposed multi-task
+    # plan for complex ones); task statuses inside it mutate as execution
+    # proceeds, so a poll of run.json reflects live per-task progress.
+    plan: Optional[ExecutionPlan] = None
 
 
 class ResultSummary(BaseModel):
@@ -212,3 +284,4 @@ class ResultSummary(BaseModel):
     result_path: Optional[str] = None
     verification: Optional[VerificationResult] = None
     browser_verification: Optional[BrowserVerificationResult] = None
+    plan: Optional[ExecutionPlan] = None

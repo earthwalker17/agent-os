@@ -1589,6 +1589,65 @@ html, body, #root {
   color: var(--text-muted);
 }
 
+/* Phase 5 — task status badges (reuse the verify-status badge shape). */
+.run-verify-status.status-completed {
+  background: rgba(46, 160, 67, 0.15);
+  color: #2ea043;
+}
+
+.run-verify-status.status-running {
+  background: rgba(106, 179, 255, 0.15);
+  color: #6ab3ff;
+}
+
+.run-verify-status.status-pending {
+  background: rgba(139, 148, 158, 0.12);
+  color: var(--text-muted);
+}
+
+/* Phase 5 — Plan & Tasks block in the run detail modal. */
+.run-detail-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-detail-task-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-detail-task-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.run-detail-task-title {
+  font-weight: 600;
+}
+
+.run-detail-task-summary {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.run-detail-task-blockers {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: #f85149;
+}
+
 .run-detail-verify-meta {
   font-size: 11px;
   color: var(--text-muted);

@@ -31,13 +31,36 @@ from typing import Any
 import llm
 
 from .manager import get_execution_workspace, read_task_state, update_task_state
-from .models import RunRecord, RunStatus, ResultSummary, TaskSpec, VerificationResult
+from .models import (
+    ExecutionPlan,
+    ExecutionTask,
+    RunRecord,
+    RunStatus,
+    ResultSummary,
+    TaskSpec,
+    TaskStatus,
+    VerificationResult,
+)
 from .memory_reconciliation import reconcile_run_memory
+from .planner import (
+    MAX_TASKS,
+    PlanParseError,
+    aggregate_run_status,
+    dependency_failed,
+    fallback_plan,
+    looks_complex,
+    plan_from_dict,
+    task_status_from_final,
+    topological_order,
+)
 from .prompts import (
     build_correction_prompt,
     build_initial_user_prompt,
+    build_plan_system_prompt,
+    build_plan_user_prompt,
     build_repair_user_prompt,
     build_system_prompt,
+    build_task_unit_user_prompt,
     build_tool_result_prompt,
 )
 from . import run_store
@@ -70,6 +93,23 @@ MAX_STEPS = 24
 # Repairs are targeted fixes informed by the failing command output, so they
 # need far fewer steps than the initial build.
 MAX_REPAIR_STEPS = 10
+
+# Phase 5 — planning + multi-task execution budgets. Kept deliberately small:
+# the point of Phase 5 is better STRUCTURE (plan -> per-task loops), not a
+# bigger flat budget. The single-task (simple) path still uses MAX_STEPS so its
+# behavior — and its tests — are unchanged.
+#
+# - MAX_PLAN_STEPS: read-only inspection steps the planner may take before it
+#   must emit a plan (or we fall back).
+# - MAX_TASK_STEPS: per-task tool-loop budget in the multi-task path. Each task
+#   is a focused unit, so it needs far fewer steps than a whole monolithic run.
+MAX_PLAN_STEPS = 6
+MAX_TASK_STEPS = 12
+
+# Tools the planner is allowed to call — strictly read-only. Writing / shell
+# happen only in the execution phase. Enforced in the plan loop, not just in
+# the prompt.
+_PLAN_READONLY_TOOLS = {"list_files", "read_file", "search_files"}
 
 # The LLM transcript can grow; cap any single tool-result payload that we
 # round-trip back into the LLM. ToolRuntime already caps individual outputs at
@@ -168,31 +208,331 @@ class CodingAgentRunner:
         )
 
         agent_md = Path(ws.agent_md).read_text(encoding="utf-8") if Path(ws.agent_md).exists() else ""
-        # Stashed for the bounded repair pass (Task 06.2E), which builds its
-        # own system prompt after verification fails.
+        # Stashed for the planning + per-task + repair passes, which each build
+        # their own system prompt.
         self._agent_md = agent_md
         task_md = read_task_state(self.project_id) or ""
 
-        system_prompt = build_system_prompt(agent_md, self.project_id, MAX_STEPS)
-        messages: list[dict[str, str]] = [
-            {
-                "role": "user",
-                "content": build_initial_user_prompt(task.title, task.task_card, task_md),
-            }
-        ]
+        # Phase 5: plan -> execute (task-by-task) -> finalize. The run record
+        # stays RUNNING through planning + execution; only _finalize sets a
+        # terminal status, so the background crash handler + startup sweep keep
+        # working. For a simple task card the plan is a single task and the
+        # execution phase runs the original bounded loop verbatim.
+        plan = self._run_plan_phase(run_id, record, task, task_md)
+        final_action, loop_failed_reason = self._run_execution_phase(
+            run_id, record, task, plan, task_md
+        )
 
+        return self._finalize(run_id, record, task, final_action, loop_failed_reason)
+
+    # ---------- planning phase (Phase 5) ----------
+
+    def _run_plan_phase(
+        self, run_id: str, record: RunRecord, task: TaskSpec, task_md: str
+    ) -> ExecutionPlan:
+        """Produce + persist the run's execution plan.
+
+        Simple task cards skip the planner entirely (no LLM call) and get a
+        single-task plan — this is what keeps the legacy behavior + tests
+        intact. Complex cards run a bounded read-only planning loop; any
+        failure falls back to a single-task plan. The record stays RUNNING.
+        """
+        if not looks_complex(task.task_card):
+            plan = fallback_plan(task, mode="simple")
+        else:
+            run_store.append_event(
+                self.project_id,
+                run_id,
+                {"type": "plan_started", "created_by": task.created_by},
+            )
+            try:
+                plan = self._plan_loop(run_id, task, task_md)
+            except Exception as exc:  # noqa: BLE001 — planning never fails a run
+                log.exception("Planning crashed for run %s", run_id)
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {"type": "plan_failed", "error": f"{type(exc).__name__}: {exc}"},
+                )
+                plan = fallback_plan(task, mode="fallback")
+
+        record.plan = plan
+        run_store.write_plan_json(self.project_id, run_id, plan)
+        run_store.write_run_json(self.project_id, run_id, record)
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {
+                "type": "plan_ready",
+                "goal": plan.goal,
+                "mode": plan.mode,
+                "task_count": len(plan.tasks),
+                "tasks": [
+                    {"id": t.id, "title": t.title, "depends_on": t.depends_on}
+                    for t in plan.tasks
+                ],
+                "risks": plan.risks,
+            },
+        )
+        return plan
+
+    def _plan_loop(self, run_id: str, task: TaskSpec, task_md: str) -> ExecutionPlan:
+        """Bounded read-only inspection loop that ends in a ``plan`` action.
+
+        Returns a parsed :class:`ExecutionPlan`, or a fallback plan when the
+        budget is exhausted / the model misbehaves. Restricted to read-only
+        tools (enforced here, not just in the prompt).
+        """
+        system_prompt = build_plan_system_prompt(
+            self._agent_md, self.project_id, MAX_PLAN_STEPS, MAX_TASKS
+        )
+        messages: list[dict[str, str]] = [
+            {"role": "user", "content": build_plan_user_prompt(task.title, task.task_card, task_md)}
+        ]
+        allowed = frozenset({"tool_call", "plan"})
+
+        for step in range(1, MAX_PLAN_STEPS + 1):
+            try:
+                action = self._llm_step(
+                    run_id, step, system_prompt, messages,
+                    allowed_actions=allowed, phase="planning",
+                )
+            except _LLMProtocolError as exc:
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {"type": "plan_failed", "step": step, "error": str(exc)},
+                )
+                return fallback_plan(task, mode="fallback")
+
+            act = action.get("action")
+            if act == "plan":
+                try:
+                    return plan_from_dict(action, task)
+                except PlanParseError as exc:
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {"type": "plan_failed", "step": step, "error": str(exc)},
+                    )
+                    return fallback_plan(task, mode="fallback")
+
+            if act == "tool_call":
+                tool_name = (action.get("tool_name") or "").strip()
+                if tool_name not in _PLAN_READONLY_TOOLS:
+                    # Read-only gate: bounce write/append/run_shell back to the
+                    # model instead of executing them during planning.
+                    msg = (
+                        f"Tool {tool_name!r} is not allowed during planning. Use only "
+                        "list_files / read_file / search_files, or emit the plan."
+                    )
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {
+                            "type": "tool_result",
+                            "step": step,
+                            "phase": "planning",
+                            "tool_name": tool_name or "unknown",
+                            "success": False,
+                            "error": msg,
+                        },
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": build_tool_result_prompt(
+                                tool_name or "unknown", False, msg
+                            ),
+                        }
+                    )
+                    continue
+                tool_result, dispatched = self._dispatch_tool(
+                    run_id, step, action, phase="planning"
+                )
+                # Read-only — nothing to record in the diagnostic activity lists.
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {
+                        "type": "tool_result",
+                        "step": step,
+                        "phase": "planning",
+                        "tool_name": dispatched["tool_name"],
+                        "success": tool_result.success,
+                        "preview": _truncate(tool_result.output, _EVENT_PREVIEW_CHARS),
+                        "error": _truncate(tool_result.error, _EVENT_PREVIEW_CHARS),
+                    },
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": build_tool_result_prompt(
+                            dispatched["tool_name"],
+                            tool_result.success,
+                            _format_tool_result_for_llm(tool_result),
+                        ),
+                    }
+                )
+                continue
+
+            # Shouldn't happen (allowed set enforced) — fall back defensively.
+            return fallback_plan(task, mode="fallback")
+
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {"type": "plan_failed", "step": MAX_PLAN_STEPS, "error": "planning budget exhausted"},
+        )
+        return fallback_plan(task, mode="fallback")
+
+    # ---------- execution phase (Phase 5) ----------
+
+    def _run_execution_phase(
+        self,
+        run_id: str,
+        record: RunRecord,
+        task: TaskSpec,
+        plan: ExecutionPlan,
+        task_md: str,
+    ) -> tuple[dict | None, str | None]:
+        """Execute the plan's tasks and return a (final_action, fail_reason).
+
+        Single-task plans run the original bounded loop verbatim and pass the
+        agent's raw final action (including ``task_md_update``) straight through
+        to ``_finalize`` — so legacy semantics, verification gating, and tests
+        are unchanged. Multi-task plans run each task in topological order
+        (skipping tasks whose dependency failed) and synthesize an aggregate
+        final action.
+        """
+        tasks = plan.tasks
+
+        # --- single-task (simple / fallback) path: identical to the legacy loop
+        if len(tasks) == 1 and tasks[0].status != TaskStatus.SKIPPED:
+            unit = tasks[0]
+            unit.status = TaskStatus.RUNNING
+            system_prompt = build_system_prompt(self._agent_md, self.project_id, MAX_STEPS)
+            initial = build_initial_user_prompt(task.title, task.task_card, task_md)
+            before_f = len(self._observed_files_changed)
+            before_c = len(self._observed_commands_run)
+            final_action, loop_failed_reason = self._run_task_unit(
+                run_id, system_prompt, initial, MAX_STEPS, phase="execution"
+            )
+            self._apply_unit_result(unit, final_action, loop_failed_reason, before_f, before_c)
+            # Pass the raw final action through unchanged (incl. task_md_update).
+            return final_action, loop_failed_reason
+
+        # --- multi-task path
+        by_id = {t.id: t for t in tasks}
+        for idx, unit in enumerate(topological_order(tasks), start=1):
+            if unit.status == TaskStatus.SKIPPED:
+                # Pre-skipped (e.g. MAX_TASKS overflow) — surface, don't run.
+                reason = unit.blockers[0] if unit.blockers else "skipped"
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {"type": "task_status", "task_id": unit.id, "status": "skipped", "reason": reason},
+                )
+                continue
+
+            dep_reason = dependency_failed(unit, by_id)
+            if dep_reason:
+                unit.status = TaskStatus.SKIPPED
+                if dep_reason not in unit.blockers:
+                    unit.blockers.append(dep_reason)
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {"type": "task_status", "task_id": unit.id, "status": "skipped", "reason": dep_reason},
+                )
+                self._persist_progress(run_id, record, plan)
+                continue
+
+            unit.status = TaskStatus.RUNNING
+            run_store.append_event(
+                self.project_id,
+                run_id,
+                {"type": "task_started", "task_id": unit.id, "title": unit.title},
+            )
+            self._persist_progress(run_id, record, plan)
+
+            system_prompt = build_system_prompt(self._agent_md, self.project_id, MAX_TASK_STEPS)
+            initial = build_task_unit_user_prompt(
+                goal=plan.goal,
+                task_no=idx,
+                task_total=len(tasks),
+                task_id=unit.id,
+                title=unit.title,
+                description=unit.description,
+                plan_outline=_render_plan_outline(tasks, current_id=unit.id),
+                prior_context=_render_prior_context(tasks),
+                task_md=task_md,
+            )
+            before_f = len(self._observed_files_changed)
+            before_c = len(self._observed_commands_run)
+            final_action, loop_failed_reason = self._run_task_unit(
+                run_id, system_prompt, initial, MAX_TASK_STEPS, phase="execution"
+            )
+            self._apply_unit_result(unit, final_action, loop_failed_reason, before_f, before_c)
+            run_store.append_event(
+                self.project_id,
+                run_id,
+                {
+                    "type": "task_status",
+                    "task_id": unit.id,
+                    "status": unit.status.value,
+                    "summary": _truncate(unit.summary, 200),
+                    "files_changed": unit.files_changed,
+                    "commands_run": unit.commands_run,
+                    "blockers": unit.blockers,
+                },
+            )
+            self._persist_progress(run_id, record, plan)
+
+        status, summary, blockers = aggregate_run_status(tasks)
+        synthetic = {
+            "action": "final",
+            "status": status,
+            "summary": summary,
+            "files_changed": _dedup([f for t in tasks for f in t.files_changed]),
+            "commands_run": _dedup([c for t in tasks for c in t.commands_run]),
+            "blockers": blockers,
+            # The runner owns TASK.md across a multi-task run (auto-summary);
+            # never honor a per-task TASK.md overwrite.
+            "task_md_update": "",
+        }
+        return synthetic, None
+
+    def _run_task_unit(
+        self,
+        run_id: str,
+        system_prompt: str,
+        initial_user_prompt: str,
+        max_steps: int,
+        *,
+        phase: str = "execution",
+    ) -> tuple[dict | None, str | None]:
+        """One bounded JSON tool loop. Returns (final_action, fail_reason).
+
+        This is the original single-loop body, extracted so the simple path and
+        every multi-task unit run identical machinery. Uses a fresh ``messages``
+        list (per-task isolation). Observed file/command activity accumulates
+        into the run-scoped ``self._observed_*`` lists (the diagnostic fallback
+        + repair-delta in ``_finalize`` depend on run-scope).
+        """
+        messages: list[dict[str, str]] = [{"role": "user", "content": initial_user_prompt}]
         final_action: dict | None = None
         loop_failed_reason: str | None = None
 
-        for step in range(1, MAX_STEPS + 1):
+        for step in range(1, max_steps + 1):
             try:
-                action = self._llm_step(run_id, step, system_prompt, messages)
+                action = self._llm_step(run_id, step, system_prompt, messages, phase=phase)
             except _LLMProtocolError as e:
                 loop_failed_reason = f"LLM protocol error after retry: {e}"
                 run_store.append_event(
                     self.project_id,
                     run_id,
-                    {"type": "run_failed", "step": step, "error": loop_failed_reason},
+                    {"type": "run_failed", "step": step, "phase": phase, "error": loop_failed_reason},
                 )
                 break
 
@@ -204,13 +544,14 @@ class CodingAgentRunner:
                     {
                         "type": "run_completed",
                         "step": step,
+                        "phase": phase,
                         "status": action.get("status"),
                     },
                 )
                 break
 
             if action.get("action") == "tool_call":
-                tool_result, dispatched = self._dispatch_tool(run_id, step, action)
+                tool_result, dispatched = self._dispatch_tool(run_id, step, action, phase=phase)
                 self._observe_tool_result(action, tool_result)
                 run_store.append_event(
                     self.project_id,
@@ -218,6 +559,7 @@ class CodingAgentRunner:
                     {
                         "type": "tool_result",
                         "step": step,
+                        "phase": phase,
                         "tool_name": dispatched["tool_name"],
                         "success": tool_result.success,
                         "preview": _truncate(tool_result.output, _EVENT_PREVIEW_CHARS),
@@ -241,19 +583,64 @@ class CodingAgentRunner:
             run_store.append_event(
                 self.project_id,
                 run_id,
-                {"type": "run_failed", "step": step, "error": loop_failed_reason},
+                {"type": "run_failed", "step": step, "phase": phase, "error": loop_failed_reason},
             )
             break
         else:
             # Loop exhausted without final
-            loop_failed_reason = f"step budget exhausted after {MAX_STEPS} steps"
+            loop_failed_reason = f"step budget exhausted after {max_steps} steps"
             run_store.append_event(
                 self.project_id,
                 run_id,
-                {"type": "run_failed", "step": MAX_STEPS, "error": loop_failed_reason},
+                {"type": "run_failed", "step": max_steps, "phase": phase, "error": loop_failed_reason},
             )
 
-        return self._finalize(run_id, record, task, final_action, loop_failed_reason)
+        return final_action, loop_failed_reason
+
+    def _apply_unit_result(
+        self,
+        unit: "ExecutionTask",
+        final_action: dict | None,
+        loop_failed_reason: str | None,
+        before_f: int,
+        before_c: int,
+    ) -> None:
+        """Record one task unit's outcome onto its :class:`ExecutionTask`.
+
+        Per-task file/command attribution comes from a snapshot delta of the
+        run-scoped observed lists (the lists themselves are NOT reset per task).
+        The agent's explicit final-action lists win when present.
+        """
+        unit_files = self._observed_files_changed[before_f:]
+        unit_cmds = self._observed_commands_run[before_c:]
+        if final_action is not None:
+            raw_status = final_action.get("status", "")
+            if raw_status not in _ALLOWED_STATUS:
+                raw_status = "failed"
+            unit.status = task_status_from_final(raw_status)
+            unit.summary = str(final_action.get("summary", "")).strip()
+            fa_files = _coerce_str_list(final_action.get("files_changed"))
+            fa_cmds = _coerce_str_list(final_action.get("commands_run"))
+            unit.files_changed = fa_files or unit_files
+            unit.commands_run = fa_cmds or unit_cmds
+            blockers = _coerce_str_list(final_action.get("blockers"))
+            if raw_status != "completed" and not blockers:
+                blockers = [f"task ended with status {raw_status}"]
+            unit.blockers = blockers
+        else:
+            unit.status = TaskStatus.FAILED
+            unit.summary = loop_failed_reason or "task did not finalize"
+            unit.files_changed = unit_files
+            unit.commands_run = unit_cmds
+            unit.blockers = [loop_failed_reason] if loop_failed_reason else ["did not finalize"]
+
+    def _persist_progress(
+        self, run_id: str, record: RunRecord, plan: ExecutionPlan
+    ) -> None:
+        """Write run.json + plan.json mid-execution so polls see live progress."""
+        record.plan = plan
+        run_store.write_plan_json(self.project_id, run_id, plan)
+        run_store.write_run_json(self.project_id, run_id, record)
 
     # ---------- internals ----------
 
@@ -263,8 +650,17 @@ class CodingAgentRunner:
         step: int,
         system_prompt: str,
         messages: list[dict[str, str]],
+        *,
+        allowed_actions: frozenset[str] = frozenset({"tool_call", "final"}),
+        phase: str = "execution",
     ) -> dict:
-        """One LLM call with a single correction retry. Mutates `messages` in place."""
+        """One LLM call with a single correction retry. Mutates `messages` in place.
+
+        ``allowed_actions`` constrains which ``action`` values the parser
+        accepts — the execution/repair loops allow ``tool_call`` / ``final``;
+        the planning loop allows ``tool_call`` / ``plan``. This keeps the
+        ``plan`` action from ever being accepted by the execution loop.
+        """
         kwargs: dict[str, Any] = {"system": system_prompt, "messages": messages}
         if self.model:
             kwargs["model"] = self.model
@@ -280,12 +676,13 @@ class CodingAgentRunner:
             {
                 "type": "llm_response",
                 "step": step,
+                "phase": phase,
                 "preview": _truncate(raw, _EVENT_PREVIEW_CHARS),
             },
         )
 
         try:
-            action = _parse_action(raw)
+            action = _parse_action(raw, allowed_actions)
         except _LLMProtocolError as parse_err:
             messages.append({"role": "assistant", "content": raw})
             messages.append(
@@ -301,11 +698,12 @@ class CodingAgentRunner:
                 {
                     "type": "llm_response",
                     "step": step,
+                    "phase": phase,
                     "retry": True,
                     "preview": _truncate(retry_raw, _EVENT_PREVIEW_CHARS),
                 },
             )
-            action = _parse_action(retry_raw)
+            action = _parse_action(retry_raw, allowed_actions)
             messages.append({"role": "assistant", "content": retry_raw})
             return action
 
@@ -332,7 +730,9 @@ class CodingAgentRunner:
             if isinstance(command, str) and command and command not in self._observed_commands_run:
                 self._observed_commands_run.append(command)
 
-    def _dispatch_tool(self, run_id: str, step: int, action: dict) -> tuple[ToolResult, dict]:
+    def _dispatch_tool(
+        self, run_id: str, step: int, action: dict, *, phase: str = "execution"
+    ) -> tuple[ToolResult, dict]:
         tool_name = action.get("tool_name") or ""
         arguments = action.get("arguments") or {}
         run_store.append_event(
@@ -341,6 +741,7 @@ class CodingAgentRunner:
             {
                 "type": "tool_call",
                 "step": step,
+                "phase": phase,
                 "tool_name": tool_name,
                 "arguments": _bound_args(arguments),
                 "reason": _truncate(str(action.get("reason", "")), 200),
@@ -551,6 +952,9 @@ class CodingAgentRunner:
         )
 
         run_store.write_run_json(self.project_id, run_id, record)
+        # Re-write plan.json with the settled per-task statuses (Phase 5).
+        if record.plan is not None:
+            run_store.write_plan_json(self.project_id, run_id, record.plan)
 
         notes = ""
         if loop_failed_reason and final_action is None:
@@ -584,6 +988,7 @@ class CodingAgentRunner:
             result_path=result_path,
             verification=verification,
             browser_verification=browser_verification,
+            plan=record.plan,
         )
 
     # ---------- verification + repair (Task 06.2E) ----------
@@ -680,7 +1085,7 @@ class CodingAgentRunner:
 
             for step in range(1, MAX_REPAIR_STEPS + 1):
                 try:
-                    action = self._llm_step(run_id, step, system_prompt, messages)
+                    action = self._llm_step(run_id, step, system_prompt, messages, phase="repair")
                 except _LLMProtocolError as e:
                     run_store.append_event(
                         self.project_id,
@@ -693,7 +1098,7 @@ class CodingAgentRunner:
                     break
 
                 if action.get("action") == "tool_call":
-                    tool_result, dispatched = self._dispatch_tool(run_id, step, action)
+                    tool_result, dispatched = self._dispatch_tool(run_id, step, action, phase="repair")
                     self._observe_tool_result(action, tool_result)
                     if tool_result.success and dispatched["tool_name"] in {
                         "write_file",
@@ -783,8 +1188,55 @@ def _coerce_str_list(value: Any) -> list[str]:
     return [str(x) for x in value if isinstance(x, (str, int, float))]
 
 
-def _parse_action(raw: str) -> dict:
-    """Tolerant JSON parse: accept fenced or wrapped output, but require an action key."""
+def _dedup(items: list[str]) -> list[str]:
+    """Order-preserving de-duplication."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _render_plan_outline(tasks: list["ExecutionTask"], current_id: str) -> str:
+    """Compact plan overview for a task unit's prompt (marks the current task)."""
+    lines: list[str] = []
+    for t in tasks:
+        marker = "->" if t.id == current_id else "- "
+        dep = f" (after {', '.join(t.depends_on)})" if t.depends_on else ""
+        lines.append(f"{marker} [{t.status.value}] {t.id}: {t.title}{dep}")
+    return "\n".join(lines)
+
+
+def _render_prior_context(tasks: list["ExecutionTask"]) -> str:
+    """Summarize what earlier tasks already wrote, for the next task's prompt."""
+    files = _dedup(
+        [
+            f
+            for t in tasks
+            if t.status == TaskStatus.COMPLETED
+            for f in t.files_changed
+        ]
+    )
+    if not files:
+        return "(nothing written yet)"
+    shown = files[:40]
+    body = "\n".join(f"- {f}" for f in shown)
+    if len(files) > len(shown):
+        body += f"\n- … (+{len(files) - len(shown)} more)"
+    return "Files written by earlier tasks:\n" + body
+
+
+def _parse_action(
+    raw: str, allowed: frozenset[str] = frozenset({"tool_call", "final"})
+) -> dict:
+    """Tolerant JSON parse: accept fenced or wrapped output, but require an action key.
+
+    ``allowed`` restricts which ``action`` values are accepted. Defaults to the
+    execution/repair set (``tool_call`` / ``final``); the planning loop passes
+    ``{"tool_call", "plan"}`` so the ``plan`` action is only ever valid there.
+    """
     if not raw or not raw.strip():
         raise _LLMProtocolError("empty response")
 
@@ -813,7 +1265,7 @@ def _parse_action(raw: str) -> dict:
 
     if not isinstance(parsed, dict):
         raise _LLMProtocolError("response JSON is not an object")
-    if parsed.get("action") not in {"tool_call", "final"}:
+    if parsed.get("action") not in allowed:
         raise _LLMProtocolError(
             f"response missing or unknown 'action' (got {parsed.get('action')!r})"
         )
