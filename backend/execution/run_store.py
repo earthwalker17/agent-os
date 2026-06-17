@@ -52,6 +52,24 @@ def write_task_card(project_id: str, run_id: str, title: str, task_card: str) ->
     (get_run_dir(project_id, run_id) / "task_card.md").write_text(text, encoding="utf-8")
 
 
+def read_task_card(project_id: str, run_id: str) -> tuple[str, str]:
+    """Return ``(title, body)`` parsed from task_card.md.
+
+    Inverse of :func:`write_task_card`, which writes ``# {title}\\n\\n{body}\\n``.
+    Parses by splitting off only the first line (so ``#`` inside the title or
+    blank lines inside the body survive) — used by the retry endpoint to
+    reconstruct the original task card for a fresh run. Returns ``("", "")``
+    when the file is absent.
+    """
+    path = get_run_dir(project_id, run_id) / "task_card.md"
+    if not path.exists():
+        return "", ""
+    text = path.read_text(encoding="utf-8")
+    first, _, rest = text.partition("\n")
+    title = first[2:] if first.startswith("# ") else first
+    return title.strip(), rest.strip("\n")
+
+
 def append_event(project_id: str, run_id: str, event: dict[str, Any]) -> None:
     """Append one JSON event line to events.jsonl.
 
@@ -63,6 +81,33 @@ def append_event(project_id: str, run_id: str, event: dict[str, Any]) -> None:
     line = json.dumps(payload, ensure_ascii=False, default=str)
     with (get_run_dir(project_id, run_id) / "events.jsonl").open("a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def read_events(project_id: str, run_id: str) -> list[dict]:
+    """Return the run's events in file (chronological) order.
+
+    Reads ``events.jsonl`` one line at a time and JSON-parses each; malformed
+    or empty lines are skipped (the log is append-only and a crash could leave
+    a half-written final line). Returns ``[]`` when the file is absent. Each
+    event carries at least ``type`` and ``timestamp`` (stamped by
+    :func:`append_event`).
+    """
+    path = get_run_dir(project_id, run_id) / "events.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+    return events
 
 
 def write_run_json(project_id: str, run_id: str, record: RunRecord) -> None:

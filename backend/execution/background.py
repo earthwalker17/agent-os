@@ -27,7 +27,7 @@ from __future__ import annotations
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from threading import Lock
+from threading import Event, Lock
 
 from . import run_store
 from .manager import get_execution_workspace
@@ -42,8 +42,12 @@ DEFAULT_MAX_WORKERS = 4
 class BackgroundRunManager:
     """Owns a single thread pool for running CodingAgentRunner.run_task off-thread.
 
-    Stateless beyond the executor — the run record itself is persisted to disk
-    by `run_store`, so the manager doesn't need to track in-flight runs.
+    Run records are persisted to disk by `run_store`, so the manager doesn't
+    need to track in-flight runs for status. The one thing it *does* track is a
+    per-run cancellation `Event` (run control): the cancel endpoint sets it and
+    the runner checks it at step boundaries. The registry only holds runs alive
+    in *this* process — after a restart it's empty, and the cancel endpoint
+    falls back to finalizing an orphaned record directly.
     """
 
     def __init__(self, max_workers: int = DEFAULT_MAX_WORKERS):
@@ -51,14 +55,20 @@ class BackgroundRunManager:
             max_workers=max_workers,
             thread_name_prefix="coding-agent-run",
         )
+        # run_id -> cancellation Event for runs in flight in this process.
+        self._cancels: dict[str, Event] = {}
+        self._cancel_lock = Lock()
 
-    def dispatch(self, project_id: str, task: TaskSpec) -> RunRecord:
+    def dispatch(
+        self, project_id: str, task: TaskSpec, *, retry_of: str | None = None
+    ) -> RunRecord:
         """Create the run record + artifacts immediately, then run in the background.
 
         Returns the placeholder RunRecord (status=RUNNING). The caller can hand
         this back to the user (e.g. as an `@code` chat reply) without waiting
         for the LLM loop. Raises FileNotFoundError if the workspace doesn't
-        exist — caller is responsible for ensuring it does.
+        exist — caller is responsible for ensuring it does. ``retry_of`` links
+        this run to the run it was retried from (run control).
         """
         ws = get_execution_workspace(project_id)
         if ws is None:
@@ -75,6 +85,7 @@ class BackgroundRunManager:
             project_id=project_id,
             task_title=task.title,
             status=RunStatus.RUNNING,
+            retry_of=retry_of,
         )
         run_store.write_run_json(project_id, run_id, record)
         run_store.append_event(
@@ -87,8 +98,31 @@ class BackgroundRunManager:
             },
         )
 
-        self._executor.submit(self._execute, project_id, run_id, task)
+        cancel_event = Event()
+        with self._cancel_lock:
+            self._cancels[run_id] = cancel_event
+        self._executor.submit(self._execute, project_id, run_id, task, cancel_event)
         return record
+
+    def request_cancel(self, run_id: str) -> bool:
+        """Signal an in-flight run to cancel at its next step boundary.
+
+        Returns ``True`` iff this process is actually running the given run
+        (a cancellation Event was registered). ``False`` means the run is not
+        in flight here — either it already finished, or the process restarted
+        and lost the registry; the caller (the cancel endpoint) then re-reads
+        run.json and finalizes an orphaned ``running`` record directly.
+        """
+        with self._cancel_lock:
+            event = self._cancels.get(run_id)
+        if event is None:
+            return False
+        event.set()
+        return True
+
+    def _discard_cancel(self, run_id: str) -> None:
+        with self._cancel_lock:
+            self._cancels.pop(run_id, None)
 
     def shutdown(self, wait: bool = False) -> None:
         """Tear down the executor. Safe to call multiple times."""
@@ -96,11 +130,17 @@ class BackgroundRunManager:
 
     # ---------- internals ----------
 
-    def _execute(self, project_id: str, run_id: str, task: TaskSpec) -> None:
+    def _execute(
+        self, project_id: str, run_id: str, task: TaskSpec, cancel_event: Event
+    ) -> None:
         try:
-            CodingAgentRunner(project_id).run_task(task, run_id=run_id)
+            CodingAgentRunner(project_id).run_task(
+                task, run_id=run_id, cancel_event=cancel_event
+            )
         except Exception as exc:
             self._mark_failed(project_id, run_id, task, exc)
+        finally:
+            self._discard_cancel(run_id)
 
     def _mark_failed(
         self,

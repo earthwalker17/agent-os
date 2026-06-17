@@ -29,7 +29,9 @@ running multiple projects. It combines:
   model-proposed plan. Complex tasks are first **planned and broken into a
   tracked task graph**, then executed task-by-task with per-task status.
 - **A verification surface** — a Runs panel and per-run detail modal
-  show status, files changed, commands run, blockers, and `result.md`.
+  show status, files changed, commands run, blockers, `result.md`, and a
+  **live execution timeline**, with **Cancel** and **Retry** controls for
+  long-running or failed runs.
 
 ## Why this exists
 
@@ -78,7 +80,11 @@ broken into an ordered set of task units with dependencies, persisted as a
 `plan.json` artifact; the runner then executes them task-by-task, recording
 per-task status / files / commands / blockers and richer run events. Simple
 tasks still take the original single-loop path, and verification, browser
-verification, preview, and memory reconciliation are unchanged.
+verification, preview, and memory reconciliation are unchanged. That structured
+data is now **visible and controllable**: the chat run card shows a live phase
+badge and task checklist, the detail modal renders a polled event **timeline**,
+and runs can be **cancelled** (cooperatively, ending in a clean `cancelled`
+state) or **retried** as a new linked run.
 
 **Phase 4 — Interface & UX** has begun with **Task 07.0**: a modern
 multi-modal chat composer — auto-growing multiline input (`Enter` for a
@@ -208,6 +214,7 @@ python tests/test_uploads.py
 python tests/test_providers.py
 python tests/test_planner.py
 python tests/test_runner_planning.py
+python tests/test_run_control.py
 ```
 
 All tests stub the LLM caller, so no Anthropic API key is needed to

@@ -17,8 +17,13 @@ from pydantic import BaseModel, Field
 class RunStatus(str, Enum):
     """Lifecycle / final status for a Coding Agent run.
 
-    The four terminal values match the JSON contract the agent emits in its
-    `final` action. RUNNING is used while a run is in flight.
+    The agent's ``final`` action can only declare one of the four "natural"
+    terminal values (``completed`` / ``partial`` / ``blocked`` / ``failed``);
+    RUNNING is used while a run is in flight. ``CANCELLED`` is a fifth terminal
+    value the *runner* sets directly when a user cancels an active run — it is
+    never agent-settable (see ``runner._ALLOWED_STATUS``) and is intentionally
+    excluded from memory reconciliation (an aborted run has no settled outcome
+    worth writing to memory — see ``memory_reconciliation.TERMINAL_STATUSES``).
     """
 
     RUNNING = "running"
@@ -26,6 +31,7 @@ class RunStatus(str, Enum):
     PARTIAL = "partial"
     BLOCKED = "blocked"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ExecutionWorkspace(BaseModel):
@@ -270,6 +276,17 @@ class RunRecord(BaseModel):
     # plan for complex ones); task statuses inside it mutate as execution
     # proceeds, so a poll of run.json reflects live per-task progress.
     plan: Optional[ExecutionPlan] = None
+    # Run control — cooperative cancellation. The cancel endpoint sets this
+    # ``True`` (and leaves status ``running``) so the UI can show a transient
+    # "cancelling" phase while the runner reaches its next step boundary; the
+    # runner then flips status to ``cancelled``. ``False`` for normal runs.
+    cancel_requested: bool = False
+    # Run control — retry linkage. ``retry_of`` is the run_id this run was
+    # spawned from (set on a retry's new record); ``retried_by`` is the run_id
+    # of the retry spawned from this run (set on the original). Both ``None``
+    # for runs never involved in a retry, so old records round-trip unchanged.
+    retry_of: Optional[str] = None
+    retried_by: Optional[str] = None
 
 
 class ResultSummary(BaseModel):

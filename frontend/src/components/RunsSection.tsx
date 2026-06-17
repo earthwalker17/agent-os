@@ -36,12 +36,19 @@ function isActive(run: RunRecord): boolean {
 }
 
 // Compact phase label for the run row: surfaces the in-flight sub-phase
-// (verifying / repairing) over the underlying settled status.
+// (cancelling / planning / executing / verifying / repairing) over the
+// underlying settled status. Null once the run reaches a terminal status, so
+// the row then shows that status (e.g. 'cancelled') directly.
 function phaseLabel(run: RunRecord): string | null {
+  if (run.status !== 'running') return null
+  if (run.cancel_requested) return 'cancelling'
   if (run.verification_state === 'repairing') return 'repairing'
   if (run.verification_state === 'verifying') return 'verifying'
   if (run.browser_verification_state === 'running') return 'verifying'
-  return null
+  const tasks = run.plan?.tasks ?? []
+  if (tasks.some((t) => t.status === 'running')) return 'executing'
+  if (!run.plan) return 'planning'
+  return 'executing'
 }
 
 function RunsSection({ projectId, refreshSignal }: Props) {
@@ -304,6 +311,10 @@ function RunsSection({ projectId, refreshSignal }: Props) {
           projectId={projectId}
           runId={openRunId}
           onClose={() => setOpenRunId(null)}
+          onRunsChanged={() => {
+            loadRuns()
+            loadPreview()
+          }}
         />
       )}
     </details>

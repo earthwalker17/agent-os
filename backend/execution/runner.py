@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -121,11 +122,24 @@ _MAX_TOOL_OUTPUT_FOR_LLM = 4000
 # in the live LLM transcript.
 _EVENT_PREVIEW_CHARS = 500
 
+# Statuses the *agent* may declare in its ``final`` action. Deliberately does
+# NOT include "cancelled": cancellation is a user/runner concern, never
+# something the model can claim about itself (see RunStatus.CANCELLED).
 _ALLOWED_STATUS = {"completed", "partial", "blocked", "failed"}
 
 
 class _LLMProtocolError(Exception):
     """Raised when the LLM returns something we cannot parse into an action."""
+
+
+class _RunCancelled(Exception):
+    """Raised internally at a step boundary when a user has requested cancel.
+
+    Caught in :meth:`CodingAgentRunner.run_task` and routed to
+    :meth:`_finalize_cancelled`. Raised only from loop tops (never inside
+    ``_llm_step`` / ``_dispatch_tool``, whose broad ``except`` clauses would
+    otherwise swallow it).
+    """
 
 
 # ---------- public entry point ----------
@@ -146,8 +160,18 @@ class CodingAgentRunner:
         self._observed_commands_run: list[str] = []
         # AGENT.md text, captured during run_task for the repair pass.
         self._agent_md: str = ""
+        # Run control — cooperative cancellation. ``None`` (the default for the
+        # stand-alone synchronous path + every existing test) means the cancel
+        # checkpoints are inert and the loop is byte-identical to before.
+        self._cancel_event: threading.Event | None = None
 
-    def run_task(self, task: TaskSpec, run_id: str | None = None) -> ResultSummary:
+    def run_task(
+        self,
+        task: TaskSpec,
+        run_id: str | None = None,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> ResultSummary:
         """Execute the Coding Agent loop and finalize artifacts.
 
         If `run_id` is provided, the caller (e.g. BackgroundRunManager) is
@@ -156,6 +180,8 @@ class CodingAgentRunner:
         instead of allocating a new one. Otherwise the runner does the
         allocation itself (stand-alone synchronous path).
         """
+        self._cancel_event = cancel_event
+
         ws = get_execution_workspace(self.project_id)
         if ws is None:
             raise FileNotFoundError(
@@ -218,12 +244,25 @@ class CodingAgentRunner:
         # terminal status, so the background crash handler + startup sweep keep
         # working. For a simple task card the plan is a single task and the
         # execution phase runs the original bounded loop verbatim.
-        plan = self._run_plan_phase(run_id, record, task, task_md)
-        final_action, loop_failed_reason = self._run_execution_phase(
-            run_id, record, task, plan, task_md
-        )
+        #
+        # Run control: a cancel requested mid-planning or mid-execution raises
+        # _RunCancelled at the next step boundary and short-circuits to a
+        # dedicated cancelled-finalize. The wrap deliberately EXCLUDES
+        # _finalize — once a run is producing its terminal result we let
+        # verification/browser/reconcile finish rather than abort half-way.
+        try:
+            plan = self._run_plan_phase(run_id, record, task, task_md)
+            final_action, loop_failed_reason = self._run_execution_phase(
+                run_id, record, task, plan, task_md
+            )
+        except _RunCancelled:
+            return self._finalize_cancelled(run_id, record, task)
 
         return self._finalize(run_id, record, task, final_action, loop_failed_reason)
+
+    def _cancelled(self) -> bool:
+        """True when a user has requested this run be cancelled."""
+        return self._cancel_event is not None and self._cancel_event.is_set()
 
     # ---------- planning phase (Phase 5) ----------
 
@@ -247,6 +286,10 @@ class CodingAgentRunner:
             )
             try:
                 plan = self._plan_loop(run_id, task, task_md)
+            except _RunCancelled:
+                # A cancel during planning must propagate to the cancelled
+                # finalize, never be swallowed into a fallback plan.
+                raise
             except Exception as exc:  # noqa: BLE001 — planning never fails a run
                 log.exception("Planning crashed for run %s", run_id)
                 run_store.append_event(
@@ -292,6 +335,8 @@ class CodingAgentRunner:
         allowed = frozenset({"tool_call", "plan"})
 
         for step in range(1, MAX_PLAN_STEPS + 1):
+            if self._cancelled():
+                raise _RunCancelled()
             try:
                 action = self._llm_step(
                     run_id, step, system_prompt, messages,
@@ -425,6 +470,8 @@ class CodingAgentRunner:
         # --- multi-task path
         by_id = {t.id: t for t in tasks}
         for idx, unit in enumerate(topological_order(tasks), start=1):
+            if self._cancelled():
+                raise _RunCancelled()
             if unit.status == TaskStatus.SKIPPED:
                 # Pre-skipped (e.g. MAX_TASKS overflow) — surface, don't run.
                 reason = unit.blockers[0] if unit.blockers else "skipped"
@@ -525,6 +572,8 @@ class CodingAgentRunner:
         loop_failed_reason: str | None = None
 
         for step in range(1, max_steps + 1):
+            if self._cancelled():
+                raise _RunCancelled()
             try:
                 action = self._llm_step(run_id, step, system_prompt, messages, phase=phase)
             except _LLMProtocolError as e:
@@ -551,6 +600,10 @@ class CodingAgentRunner:
                 break
 
             if action.get("action") == "tool_call":
+                # Cheap extra checkpoint: honor a cancel that arrived during the
+                # (blocking) LLM call before we spend a tool dispatch on it.
+                if self._cancelled():
+                    raise _RunCancelled()
                 tool_result, dispatched = self._dispatch_tool(run_id, step, action, phase=phase)
                 self._observe_tool_result(action, tool_result)
                 run_store.append_event(
@@ -784,6 +837,77 @@ class CodingAgentRunner:
                 error=f"unknown tool: {tool_name!r}",
             ),
             {"tool_name": tool_name or "unknown"},
+        )
+
+    def _finalize_cancelled(
+        self, run_id: str, record: RunRecord, task: TaskSpec
+    ) -> ResultSummary:
+        """Finalize a run a user cancelled mid-flight (run control).
+
+        Sets a clear terminal ``cancelled`` status + artifacts and stops — no
+        command/browser verification and no memory reconciliation, because an
+        aborted run has no settled outcome to verify or record. Re-reads the
+        on-disk status first and only writes when it is still ``running``, so it
+        can never clobber a record another writer (the cancel endpoint's orphan
+        path, or a racing finalize) already settled.
+        """
+        on_disk = run_store.read_run_json(self.project_id, run_id)
+        result_path = str(run_store.get_run_dir(self.project_id, run_id) / "result.md")
+        if on_disk is not None and on_disk.get("status") != RunStatus.RUNNING.value:
+            # Already finalized by someone else — respect it, don't overwrite.
+            return ResultSummary(
+                run_id=run_id,
+                status=str(on_disk.get("status") or RunStatus.CANCELLED.value),
+                summary=str(on_disk.get("summary") or ""),
+                files_changed=_coerce_str_list(on_disk.get("files_changed")),
+                commands_run=_coerce_str_list(on_disk.get("commands_run")),
+                blockers=_coerce_str_list(on_disk.get("blockers")),
+                result_path=result_path,
+            )
+
+        summary = "Run cancelled by user."
+        record.status = RunStatus.CANCELLED
+        record.completed_at = datetime.utcnow()
+        record.summary = summary
+        # Surface whatever the agent managed to do before the cancel landed.
+        if not record.files_changed and self._observed_files_changed:
+            record.files_changed = list(self._observed_files_changed)
+        if not record.commands_run and self._observed_commands_run:
+            record.commands_run = list(self._observed_commands_run)
+        blocker = "run cancelled by user"
+        if blocker not in record.blockers:
+            record.blockers = list(record.blockers) + [blocker]
+        # Settle transient sub-status + the cancel-request flag.
+        record.cancel_requested = False
+        record.verification_state = None
+        # Mark any in-flight task skipped so the task graph reads cleanly.
+        if record.plan is not None:
+            for unit in record.plan.tasks:
+                if unit.status == TaskStatus.RUNNING:
+                    unit.status = TaskStatus.SKIPPED
+                    if "run cancelled" not in unit.blockers:
+                        unit.blockers.append("run cancelled")
+            run_store.write_plan_json(self.project_id, run_id, record.plan)
+
+        run_store.write_run_json(self.project_id, run_id, record)
+        result_md = run_store.render_result_md(
+            record, summary, notes="Run cancelled by user before it finalized."
+        )
+        run_store.write_result_md(self.project_id, run_id, result_md)
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {"type": "run_cancelled", "reason": "user requested cancellation"},
+        )
+        return ResultSummary(
+            run_id=run_id,
+            status=record.status.value,
+            summary=summary,
+            files_changed=record.files_changed,
+            commands_run=record.commands_run,
+            blockers=record.blockers,
+            result_path=result_path,
+            plan=record.plan,
         )
 
     def _finalize(

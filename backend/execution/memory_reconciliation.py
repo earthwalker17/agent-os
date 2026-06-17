@@ -66,6 +66,10 @@ RECONCILIATION_WRITABLE_FILES: set[str] = {
     "RESEARCH.md",
 }
 
+# Statuses worth reconciling memory from. RunStatus.CANCELLED is deliberately
+# EXCLUDED: a user-aborted run has no settled outcome, so it never updates
+# project memory (the runner's cancelled-finalize path also skips reconciliation
+# entirely). Do not "complete the set" by adding CANCELLED here.
 TERMINAL_STATUSES = {
     RunStatus.COMPLETED,
     RunStatus.PARTIAL,

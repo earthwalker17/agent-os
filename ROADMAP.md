@@ -294,6 +294,39 @@ unchanged; the new layer is additive.
 - **Budgets, not bloat.** We added structure (per-task loops + a small planning
   budget), not a bigger flat `MAX_STEPS`.
 
+### Live Execution Timeline + Run Control
+Turned the Phase 5 structured run data into a visible, controllable experience.
+All additive — the run lifecycle, sandbox chokepoint, role separation, and
+explicit-dispatch contract are unchanged.
+- **Live timeline.** New read-only `GET …/runs/{id}/events` returns the parsed
+  `events.jsonl` (tolerant `run_store.read_events`). The run detail modal renders
+  a curated `RunTimeline` (plan / task / command / verification / browser /
+  cancel events → labelled rows) and polls it while the run is active. The chat
+  card gained a live **phase badge** (planning → executing → verifying /
+  repairing → browser verification → cancelling) and a **multi-task checklist**,
+  both derived from `run.json` (no extra fetch).
+- **Cancel.** New terminal `RunStatus.CANCELLED` (runner-set only, never
+  agent-declarable, never reconciled). `BackgroundRunManager` keeps a per-run
+  `threading.Event` registry; `POST …/runs/{id}/cancel` sets `cancel_requested`
+  and signals it. The runner checks the flag at each step boundary
+  (planning / per-task / pre-tool-dispatch) → `_finalize_cancelled` writes a
+  terminal `cancelled` + artifacts and skips verify/browser/reconcile.
+  **Cooperative:** an in-flight LLM call or ≤30 s shell finishes first. An
+  orphaned `running` run (post-restart, no worker) is finalized by the endpoint
+  directly — guarded by a re-read of run.json so it can't clobber a run that
+  just settled.
+- **Retry.** `POST …/runs/{id}/retry` re-reads the original `task_card.md`
+  (`run_store.read_task_card`) and dispatches a fresh **linked** run
+  (`retry_of` on the new record, `retried_by` + a `run_retried` event on the
+  original). Terminal-only (409 while running); explicit user click — no
+  auto-rerun, no hidden dispatch. The chat card surfaces it via a "Retry →
+  view new run" affordance; the Runs panel refreshes to show it.
+- **New events:** `run_cancel_requested`, `run_cancelled`, `run_retried`.
+- **Scope notes:** polling only (no SSE); cancellation does not kill the
+  in-flight subprocess (cooperative at step boundaries — chosen over rewriting
+  the sandbox `run_shell` to `Popen`); retry creates a new run rather than
+  mutating history.
+
 ---
 
 ## Execution-trigger contract (invariant)
@@ -356,7 +389,8 @@ Anthropic key is needed. Each file is runnable standalone.
 | `test_providers.py`               |    19 | 07.1 availability, default order, dispatch/parse, chat routing |
 | `test_planner.py`                 |    26 | Phase 5 heuristic gate, plan parse/fallback, graph + aggregation |
 | `test_runner_planning.py`         |     6 | Phase 5 plan→tasks integration: decompose, skip, fallback, gate |
-| **Total**                         | **264** |                                                            |
+| `test_run_control.py`             |    13 | Run control: events/task-card readers, cooperative cancel, cancel/retry endpoints, orphan + race guard |
+| **Total**                         | **277** |                                                            |
 
 Run all (from `backend/`): `python tests/<file>.py` for each row above.
 
@@ -382,10 +416,12 @@ to surface the verdict in the UI.
 
 ### Longer-term, not committed
 Parallel / subagent task execution (Phase 5 records `depends_on` but runs
-single-threaded); a streaming run-event UI over the richer `events.jsonl`
-(plan/task transitions); run cancellation; run retry ("rerun this task card");
+single-threaded); a *streaming* run-event UI (SSE) over the richer
+`events.jsonl` to replace the 2 s timeline polling; hard cancellation that kills
+the in-flight subprocess (today's cancel is cooperative at step boundaries);
 cross-project memory linking; multi-user / shared deploy (needs auth + per-user
-workspaces + a different DB story).
+workspaces + a different DB story). *(Run cancellation + retry + a polled live
+timeline landed — see "Live Execution Timeline + Run Control".)*
 
 ---
 

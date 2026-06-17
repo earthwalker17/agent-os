@@ -725,6 +725,7 @@ function ChatPanel({
           projectId={runProjectId}
           runId={openRunId}
           onClose={() => setOpenRunId(null)}
+          onRunsChanged={onRunsChanged}
         />
       )}
     </main>

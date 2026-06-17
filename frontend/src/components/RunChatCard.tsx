@@ -12,7 +12,27 @@ interface Props {
 
 const POLL_INTERVAL_MS = 2000
 
-const TERMINAL = new Set(['completed', 'partial', 'blocked', 'failed'])
+const TERMINAL = new Set(['completed', 'partial', 'blocked', 'failed', 'cancelled'])
+
+// Statuses a terminal run can be retried from (everything except a clean pass).
+const RETRYABLE = new Set(['partial', 'blocked', 'failed', 'cancelled'])
+
+/**
+ * Derive the current execution phase from run.json alone (no extra fetch) so
+ * the card can show a live phase badge: planning → executing → verifying /
+ * repairing → browser verification, plus a transient "cancelling".
+ */
+function derivePhase(r: RunRecord): string | null {
+  if (r.status !== 'running') return null
+  if (r.cancel_requested) return 'cancelling'
+  if (r.verification_state === 'repairing') return 'repairing'
+  if (r.verification_state === 'verifying') return 'verifying'
+  if (r.browser_verification_state === 'running') return 'browser verification'
+  const tasks = r.plan?.tasks ?? []
+  if (tasks.some((t) => t.status === 'running')) return 'executing'
+  if (!r.plan) return 'planning'
+  return 'executing'
+}
 
 function fileSummary(files: string[] | undefined): string {
   const list = files ?? []
@@ -38,6 +58,10 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
   const [verifying, setVerifying] = useState(false)
   const [verifyError, setVerifyError] = useState<string | null>(null)
   const [screenshotOpen, setScreenshotOpen] = useState(false)
+  // Run control (cancel / retry).
+  const [controlBusy, setControlBusy] = useState(false)
+  const [controlError, setControlError] = useState<string | null>(null)
+  const [retriedRunId, setRetriedRunId] = useState<string | null>(null)
   const mounted = useRef(true)
 
   useEffect(() => {
@@ -109,9 +133,72 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
     }
   }, [projectId, runId, onRunsChanged])
 
+  const cancelRun = useCallback(async () => {
+    setControlBusy(true)
+    setControlError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/execution/runs/${runId}/cancel`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`
+        try {
+          const b = await res.json()
+          if (b?.detail) detail = b.detail
+        } catch {
+          /* keep status */
+        }
+        throw new Error(detail)
+      }
+      const rec: RunRecord = await res.json()
+      if (mounted.current) setRecord(rec)
+    } catch (err) {
+      console.error('Cancel run failed:', err)
+      if (mounted.current) {
+        setControlError(err instanceof Error ? err.message : 'Cancel failed')
+      }
+    } finally {
+      if (mounted.current) setControlBusy(false)
+      onRunsChanged?.()
+    }
+  }, [projectId, runId, onRunsChanged])
+
+  const retryRun = useCallback(async () => {
+    setControlBusy(true)
+    setControlError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/execution/runs/${runId}/retry`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`
+        try {
+          const b = await res.json()
+          if (b?.detail) detail = b.detail
+        } catch {
+          /* keep status */
+        }
+        throw new Error(detail)
+      }
+      const rec: RunRecord = await res.json()
+      if (mounted.current) setRetriedRunId(rec.run_id)
+    } catch (err) {
+      console.error('Retry run failed:', err)
+      if (mounted.current) {
+        setControlError(err instanceof Error ? err.message : 'Retry failed')
+      }
+    } finally {
+      if (mounted.current) setControlBusy(false)
+      onRunsChanged?.()
+    }
+  }, [projectId, runId, onRunsChanged])
+
   if (!record) return null
 
   const status = record.status
+  const phase = derivePhase(record)
+  const tasks = record.plan?.tasks ?? []
+  const isMultiTask = tasks.length > 1
   const bv = record.browser_verification
   const cv = record.verification
   const verifyingNow = verifying || record.browser_verification_state === 'running'
@@ -134,12 +221,32 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
 
   return (
     <div className="run-chat-card">
+      {/* --- live phase badge (run control / timeline) --- */}
+      {phase && (
+        <div className="run-chat-phase-row">
+          <span className="run-chat-dot" />
+          <span className={`run-chat-phase phase-${phase.replace(/\s+/g, '-')}`}>{phase}</span>
+        </div>
+      )}
+
       {/* --- build-run lifecycle line --- */}
-      {status === 'running' && (
+      {status === 'running' && !phase && (
         <div className="run-chat-status-line">
           <span className="run-chat-dot" />
           Coding Agent is working on the first build pass…
         </div>
+      )}
+
+      {/* --- task checklist for multi-task runs (live, from run.json) --- */}
+      {isMultiTask && (
+        <ul className="run-chat-tasklist">
+          {tasks.map((t) => (
+            <li key={t.id} className="run-chat-task">
+              <span className={`run-verify-status status-${t.status}`}>{t.status}</span>
+              <span className="run-chat-task-title">{t.title}</span>
+            </li>
+          ))}
+        </ul>
       )}
 
       {isTerminal && (
@@ -283,9 +390,49 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
       )}
 
       {verifyError && <div className="run-chat-error">{verifyError}</div>}
+      {controlError && <div className="run-chat-error">{controlError}</div>}
+
+      {/* --- retry follow-up affordance --- */}
+      {retriedRunId && (
+        <div className="run-chat-muted">
+          Retried as a new run.{' '}
+          <button
+            type="button"
+            className="run-chat-link-btn"
+            onClick={() => {
+              onRunsChanged?.()
+              onOpenRun(retriedRunId)
+            }}
+          >
+            View new run
+          </button>
+        </div>
+      )}
 
       {/* --- action row --- */}
       <div className="run-chat-actions">
+        {status === 'running' && (
+          <button
+            type="button"
+            className="run-chat-cancel-btn"
+            onClick={cancelRun}
+            disabled={controlBusy || !!record.cancel_requested}
+            title="Stop this run at its next step boundary"
+          >
+            {record.cancel_requested ? 'Cancelling…' : 'Cancel run'}
+          </button>
+        )}
+        {isTerminal && RETRYABLE.has(status) && !retriedRunId && (
+          <button
+            type="button"
+            className="run-chat-retry-btn"
+            onClick={retryRun}
+            disabled={controlBusy}
+            title="Dispatch a new run from the same task card"
+          >
+            {controlBusy ? 'Retrying…' : 'Retry'}
+          </button>
+        )}
         {canVerify && !verifyingNow && (
           <button
             type="button"

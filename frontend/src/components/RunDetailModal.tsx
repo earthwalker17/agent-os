@@ -2,14 +2,30 @@ import { useCallback, useEffect, useState } from 'react'
 import type {
   BrowserVerificationResult,
   ExecutionPlan,
+  RunEvent,
   RunRecord,
   VerificationResult,
 } from '../types'
+import RunTimeline from './RunTimeline'
 
 interface Props {
   projectId: string
   runId: string
   onClose: () => void
+  /** Run control — let the parent refresh its run list after a cancel/retry. */
+  onRunsChanged?: () => void
+}
+
+const POLL_INTERVAL_MS = 2000
+
+function isActive(r: RunRecord | null): boolean {
+  if (!r) return false
+  return (
+    r.status === 'running' ||
+    r.verification_state === 'verifying' ||
+    r.verification_state === 'repairing' ||
+    r.browser_verification_state === 'running'
+  )
 }
 
 function bullets(items: string[] | undefined | null): JSX.Element {
@@ -216,19 +232,25 @@ function PlanBlock({ plan }: { plan: ExecutionPlan | null | undefined }): JSX.El
   )
 }
 
-function RunDetailModal({ projectId, runId, onClose }: Props) {
+function RunDetailModal({ projectId, runId, onClose, onRunsChanged }: Props) {
   const [record, setRecord] = useState<RunRecord | null>(null)
   const [resultMd, setResultMd] = useState<string>('')
+  const [events, setEvents] = useState<RunEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // Run control (cancel / retry).
+  const [controlBusy, setControlBusy] = useState(false)
+  const [controlError, setControlError] = useState<string | null>(null)
+  const [retriedRunId, setRetriedRunId] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const [recRes, resRes] = await Promise.all([
+      const [recRes, resRes, evRes] = await Promise.all([
         fetch(`/api/projects/${projectId}/execution/runs/${runId}`),
         fetch(`/api/projects/${projectId}/execution/runs/${runId}/result`),
+        fetch(`/api/projects/${projectId}/execution/runs/${runId}/events`),
       ])
       if (!recRes.ok) throw new Error(`run record HTTP ${recRes.status}`)
       const rec: RunRecord = await recRes.json()
@@ -239,6 +261,10 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
       } else {
         setResultMd('')
       }
+      if (evRes.ok) {
+        const data = await evRes.json()
+        setEvents(Array.isArray(data?.events) ? data.events : [])
+      }
     } catch (err) {
       console.error('Failed to load run detail:', err)
       setError(err instanceof Error ? err.message : 'Failed to load run')
@@ -247,9 +273,74 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
     }
   }, [projectId, runId])
 
+  // Silent refresh (no loading flash) for polling an active run.
+  const refresh = useCallback(async () => {
+    try {
+      const [recRes, evRes] = await Promise.all([
+        fetch(`/api/projects/${projectId}/execution/runs/${runId}`),
+        fetch(`/api/projects/${projectId}/execution/runs/${runId}/events`),
+      ])
+      if (recRes.ok) setRecord(await recRes.json())
+      if (evRes.ok) {
+        const data = await evRes.json()
+        setEvents(Array.isArray(data?.events) ? data.events : [])
+      }
+    } catch (err) {
+      console.error('Run detail refresh failed:', err)
+    }
+  }, [projectId, runId])
+
   useEffect(() => {
     load()
   }, [load])
+
+  // Poll while the run is active so the timeline + status update live.
+  useEffect(() => {
+    if (!isActive(record)) return
+    const id = window.setInterval(refresh, POLL_INTERVAL_MS)
+    return () => window.clearInterval(id)
+  }, [record, refresh])
+
+  const cancelRun = useCallback(async () => {
+    setControlBusy(true)
+    setControlError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/execution/runs/${runId}/cancel`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}))
+        throw new Error(b?.detail || `HTTP ${res.status}`)
+      }
+      setRecord(await res.json())
+    } catch (err) {
+      setControlError(err instanceof Error ? err.message : 'Cancel failed')
+    } finally {
+      setControlBusy(false)
+      onRunsChanged?.()
+    }
+  }, [projectId, runId, onRunsChanged])
+
+  const retryRun = useCallback(async () => {
+    setControlBusy(true)
+    setControlError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/execution/runs/${runId}/retry`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}))
+        throw new Error(b?.detail || `HTTP ${res.status}`)
+      }
+      const rec: RunRecord = await res.json()
+      setRetriedRunId(rec.run_id)
+    } catch (err) {
+      setControlError(err instanceof Error ? err.message : 'Retry failed')
+    } finally {
+      setControlBusy(false)
+      onRunsChanged?.()
+    }
+  }, [projectId, runId, onRunsChanged])
 
   // Close on Escape, matching EditModal's pattern
   useEffect(() => {
@@ -296,12 +387,50 @@ function RunDetailModal({ projectId, runId, onClose }: Props) {
                 </div>
               </div>
 
+              {/* --- run control (cancel / retry) --- */}
+              <div className="run-detail-actions">
+                {record.status === 'running' && (
+                  <button
+                    type="button"
+                    className="run-chat-cancel-btn"
+                    onClick={cancelRun}
+                    disabled={controlBusy || !!record.cancel_requested}
+                    title="Stop this run at its next step boundary"
+                  >
+                    {record.cancel_requested ? 'Cancelling…' : 'Cancel run'}
+                  </button>
+                )}
+                {['partial', 'blocked', 'failed', 'cancelled'].includes(record.status) &&
+                  !retriedRunId && (
+                    <button
+                      type="button"
+                      className="run-chat-retry-btn"
+                      onClick={retryRun}
+                      disabled={controlBusy}
+                      title="Dispatch a new run from the same task card"
+                    >
+                      {controlBusy ? 'Retrying…' : 'Retry'}
+                    </button>
+                  )}
+                {retriedRunId && (
+                  <span className="run-chat-muted">
+                    Retried as new run <code>{retriedRunId}</code> — see the Runs list.
+                  </span>
+                )}
+                {controlError && <span className="runs-error">{controlError}</span>}
+              </div>
+
               {record.plan && (record.plan.tasks?.length ?? 0) > 1 && (
                 <section className="run-detail-result">
                   <h4>Plan &amp; Tasks</h4>
                   <PlanBlock plan={record.plan} />
                 </section>
               )}
+
+              <section className="run-detail-result">
+                <h4>Timeline</h4>
+                <RunTimeline events={events} />
+              </section>
 
               <div className="run-detail-grid">
                 <section>

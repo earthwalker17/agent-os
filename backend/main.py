@@ -1107,6 +1107,21 @@ def api_get_run_plan(project_id: str, run_id: str):
     return plan
 
 
+@app.get("/api/projects/{project_id}/execution/runs/{run_id}/events")
+def api_get_run_events(project_id: str, run_id: str):
+    """Return the run's event timeline (run control / live timeline).
+
+    Reads the append-only ``events.jsonl`` and returns the parsed events in
+    chronological order. 404 only when the run dir itself is missing; a run
+    with no events yet returns an empty list. Drives the Run Detail timeline
+    and (while a run is active) is polled alongside run.json.
+    """
+    _require_workspace(project_id)
+    if run_store.read_run_json(project_id, run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return {"run_id": run_id, "events": run_store.read_events(project_id, run_id)}
+
+
 @app.get("/api/projects/{project_id}/execution/runs/{run_id}/screenshot")
 def api_get_run_screenshot(project_id: str, run_id: str):
     """Serve the browser verification screenshot for a run (Task 06.2B).
@@ -1121,6 +1136,122 @@ def api_get_run_screenshot(project_id: str, run_id: str):
     if not screenshot.exists() or not screenshot.is_file():
         raise HTTPException(status_code=404, detail="screenshot not found")
     return FileResponse(str(screenshot), media_type="image/png")
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/cancel")
+def api_cancel_run(project_id: str, run_id: str):
+    """Request cooperative cancellation of an active run (run control).
+
+    Only a ``running`` run can be cancelled (409 otherwise). Sets
+    ``cancel_requested`` so the UI can show a transient "cancelling" phase, then
+    signals the in-flight runner, which stops at its next step boundary and
+    writes a terminal ``cancelled`` status + artifacts. If no runner is in
+    flight in this process (e.g. after a server restart the registry is empty),
+    the orphaned record is finalized to ``cancelled`` here so it never stays
+    stuck — but only after re-reading run.json to confirm it is still
+    ``running`` (guards against clobbering a run that just finished).
+    """
+    _require_workspace(project_id)
+    raw = run_store.read_run_json(project_id, run_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        record = RunRecord(**raw)
+    except Exception:
+        raise HTTPException(status_code=500, detail="run record is corrupt")
+    if record.status != RunStatus.RUNNING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"only a running run can be cancelled (status={record.status.value})",
+        )
+
+    record.cancel_requested = True
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.append_event(project_id, run_id, {"type": "run_cancel_requested"})
+
+    in_flight = get_default_manager().request_cancel(run_id)
+    if not in_flight:
+        # No runner in this process owns the run. Re-read to make sure it didn't
+        # just finalize, then finalize the orphan directly so it doesn't hang.
+        fresh = run_store.read_run_json(project_id, run_id)
+        if fresh is not None and fresh.get("status") == RunStatus.RUNNING.value:
+            try:
+                orphan = RunRecord(**fresh)
+            except Exception:
+                orphan = record
+            orphan.status = RunStatus.CANCELLED
+            orphan.completed_at = datetime.utcnow()
+            orphan.cancel_requested = False
+            orphan.summary = "Run cancelled by user."
+            blocker = "run cancelled by user (no active worker)"
+            if blocker not in orphan.blockers:
+                orphan.blockers = list(orphan.blockers) + [blocker]
+            run_store.write_run_json(project_id, run_id, orphan)
+            run_store.write_result_md(
+                project_id,
+                run_id,
+                run_store.render_result_md(
+                    orphan,
+                    orphan.summary,
+                    notes="Run cancelled by user; no active worker to stop.",
+                ),
+            )
+            run_store.append_event(
+                project_id, run_id, {"type": "run_cancelled", "reason": "orphan"}
+            )
+            return orphan.model_dump()
+
+    # Worker is in flight (or the run already settled) — return the latest record.
+    latest = run_store.read_run_json(project_id, run_id)
+    return latest if latest is not None else record.model_dump()
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/retry")
+def api_retry_run(project_id: str, run_id: str):
+    """Retry a terminal run as a new, linked run (run control).
+
+    Reads the original task card and dispatches a fresh run with the same task
+    (explicit user action — no auto-rerun). The new run records ``retry_of`` and
+    the original records ``retried_by`` so the two are linked; history is never
+    mutated beyond that pointer. 409 if the original is still running.
+    """
+    _require_workspace(project_id)
+    raw = run_store.read_run_json(project_id, run_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        original = RunRecord(**raw)
+    except Exception:
+        raise HTTPException(status_code=500, detail="run record is corrupt")
+    if original.status == RunStatus.RUNNING:
+        raise HTTPException(
+            status_code=409, detail="cannot retry a run that is still running"
+        )
+
+    title, body = run_store.read_task_card(project_id, run_id)
+    title = title or original.task_title or "Retry"
+    if not body.strip():
+        raise HTTPException(
+            status_code=409, detail="original task card is empty; nothing to retry"
+        )
+
+    task = TaskSpec(title=title, task_card=body, created_by="retry")
+    new_record = get_default_manager().dispatch(project_id, task, retry_of=run_id)
+
+    # Link the original back to the retry. Re-read to avoid clobbering any
+    # concurrent write to the original record.
+    fresh = run_store.read_run_json(project_id, run_id)
+    if fresh is not None:
+        try:
+            original = RunRecord(**fresh)
+        except Exception:
+            pass
+    original.retried_by = new_record.run_id
+    run_store.write_run_json(project_id, run_id, original)
+    run_store.append_event(
+        project_id, run_id, {"type": "run_retried", "new_run_id": new_record.run_id}
+    )
+    return new_record.model_dump()
 
 
 @app.post("/api/projects/{project_id}/execution/runs/{run_id}/browser-verify")

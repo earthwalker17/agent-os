@@ -98,7 +98,7 @@ conversations, messages, and pending executions.
 ### Top level (`backend/`)
 | File              | Purpose                                                                 |
 |-------------------|-------------------------------------------------------------------------|
-| `main.py`         | FastAPI app + all HTTP endpoints (projects, conversations, chat, memory, execution, inspection, verification, preview). Wires everything together. |
+| `main.py`         | FastAPI app + all HTTP endpoints (projects, conversations, chat, memory, execution, inspection, verification, preview, **run control** — events / cancel / retry). Wires everything together. |
 | `orchestrator.py` | The chat brain. Loads SOUL + memory, assembles context, produces the reply, runs the bounded inspection loop, then the memory-writeback judge. |
 | `llm.py`          | Thin LLM entry point: `chat(system, messages, model?, provider?) -> str`. Delegates to `providers.py` (07.1); no context assembly — callers own that. |
 | `providers.py`    | Task 07.1 — pluggable model providers (Claude / GPT / Gemini / DeepSeek). Key-presence availability, default-provider preference (Claude first), per-provider default model (env-overridable), and a `complete()` dispatcher. Anthropic via SDK; the rest via `urllib` HTTPS (no new deps). |
@@ -116,9 +116,9 @@ conversations, messages, and pending executions.
 | `tool_runtime.py`          | `ToolRuntime`: the six sandboxed file/shell tools with output caps.     |
 | `prompts.py`               | Coding Agent system prompt + per-step / correction / **repair** prompts; **Phase 5** planning + per-task-unit prompts. |
 | `planner.py`               | **Phase 5** — pure planning layer: `looks_complex` heuristic gate, tolerant `parse_plan`, `fallback_plan`, task-graph helpers (`topological_order` cycle-safe, `dependency_failed`, `aggregate_run_status`). |
-| `run_store.py`             | Per-run artifact reader/writer; `render_result_md`; `sweep_stuck_runs`; **Phase 5** `write/read_plan_json` + result.md task section. |
-| `runner.py`                | `CodingAgentRunner`: **Phase 5 phased run** — plan phase → per-task execution loops → finalize, **verification + repair** orchestration. |
-| `background.py`            | `BackgroundRunManager`: thread-pool dispatch; crash → `failed`.         |
+| `run_store.py`             | Per-run artifact reader/writer; `render_result_md`; `sweep_stuck_runs`; **Phase 5** `write/read_plan_json` + result.md task section; **run control** `read_events` (timeline) + `read_task_card` (retry source). |
+| `runner.py`                | `CodingAgentRunner`: **Phase 5 phased run** — plan phase → per-task execution loops → finalize, **verification + repair** orchestration. **Run control:** cooperative `cancel_event` checked at step boundaries → `_finalize_cancelled` (terminal `cancelled`, no verify/reconcile). |
+| `background.py`            | `BackgroundRunManager`: thread-pool dispatch; crash → `failed`; **run control** per-run cancel-`Event` registry (`request_cancel`) + `dispatch(..., retry_of=)`. |
 | `chat_delegation.py`       | `@code` trigger handling.                                               |
 | `delegation_intent.py`     | Heuristic implicit-delegation detector (fallback only).                 |
 | `delegation_judge.py`      | LLM semantic delegation judge (the primary classifier).                 |
@@ -143,8 +143,9 @@ conversations, messages, and pending executions.
 | `components/ChatPanel.tsx`   | Center column: header (provider selector top-left 07.1, theme selector top-right 07.2) + message thread + the **multi-modal composer** (07.0 — auto-growing textarea, `Ctrl/Cmd+Enter` send, `+` file upload with chips + "add to workspace too", Web Speech voice button); renders `RunChatCard` on messages carrying a `run_id` and attachment chips on messages carrying `metadata.attachments`. |
 | `components/ContextPanel.tsx`| Right column: project memory files (editable) + `RunsSection`.       |
 | `components/RunsSection.tsx` | Runs list (auto-polls while active) + Start/Stop **preview** control. |
-| `components/RunChatCard.tsx` | The in-chat run lifecycle: build progress → verification phases → completion summary → **Run browser verification** → live preview URL + screenshot. |
-| `components/RunDetailModal.tsx` | Detailed run inspection: per-command verification, browser status, `result.md`. |
+| `components/RunChatCard.tsx` | The in-chat run lifecycle: **live phase badge + multi-task checklist** → build progress → verification phases → completion summary → **Run browser verification** → live preview URL + screenshot; **Cancel** (active) / **Retry** (terminal) controls. |
+| `components/RunDetailModal.tsx` | Detailed run inspection: per-command verification, browser status, **Plan & Tasks**, **event Timeline** (polls while active), `result.md`; **Cancel / Retry** controls. |
+| `components/RunTimeline.tsx` | Read-only presentational timeline: maps a curated subset of `events.jsonl` (plan / task / command / verification / cancel) to labelled rows. |
 | `components/EditModal.tsx` / `ConfirmDialog.tsx` / `GlobalMemoryModal.tsx` | Memory editing, confirmations, global-memory viewer. |
 
 ---
@@ -234,17 +235,39 @@ is echoed back on the `/api/chat` body and stored on the user message, so chips
 re-hydrate on reload. Images re-serve read-only via
 `GET /api/conversations/{id}/attachments/{name}`.
 
+### G. Run control — live timeline + cancel + retry
+Surfaces the structured run data and adds bounded control over active/terminal
+runs. **Read-only timeline:** `GET …/runs/{id}/events` returns the parsed
+`events.jsonl`; the run detail modal renders a curated `RunTimeline` and polls
+it (with run.json) while the run is active. The chat card derives a live **phase
+badge** + **multi-task checklist** straight from `run.json` (no extra fetch).
+**Cancel** (`POST …/runs/{id}/cancel`, only when `running`): sets
+`cancel_requested`, signals the in-flight runner via a per-run `threading.Event`
+in `BackgroundRunManager`; the runner checks it at each step boundary and routes
+to `_finalize_cancelled` (terminal `cancelled` + artifacts, no
+verify/browser/reconcile). If no worker owns the run (post-restart), the
+endpoint finalizes the orphan directly — after re-reading run.json to confirm
+it's still `running`, so it never clobbers a run that just settled. Cancellation
+is **cooperative**: an in-flight LLM call or shell command finishes first.
+**Retry** (`POST …/runs/{id}/retry`, only when terminal): re-reads the original
+`task_card.md` and dispatches a fresh linked run (`retry_of` on the new record,
+`retried_by` on the original) — explicit user action, no auto-rerun.
+
 ---
 
 ## 8. Core data model — `RunRecord` (serialized as `run.json`)
 
 `run_id`, `project_id`, `task_title`, `status` (`running`/`completed`/
-`partial`/`blocked`/`failed`), `summary`, `files_changed`, `commands_run`,
-`blockers`; verification fields (`verification`, `verification_state`),
-browser fields (`browser_verification`, `browser_verification_state`),
-memory-reconciliation fields, and the **Phase 5** `plan` field (an
-`ExecutionPlan` of `ExecutionTask` units, also written standalone as
-`plan.json`). `VerificationResult` carries `mode`
+`partial`/`blocked`/`failed`/**`cancelled`**), `summary`, `files_changed`,
+`commands_run`, `blockers`; verification fields (`verification`,
+`verification_state`), browser fields (`browser_verification`,
+`browser_verification_state`), memory-reconciliation fields, the **Phase 5**
+`plan` field (an `ExecutionPlan` of `ExecutionTask` units, also written
+standalone as `plan.json`), and **run-control** fields `cancel_requested`
+(transient — set while a cancel is pending, status still `running`) +
+`retry_of` / `retried_by` (links a retry to its origin). `cancelled` is a
+terminal status the runner sets directly on user cancel — never agent-settable,
+and excluded from memory reconciliation. `VerificationResult` carries `mode`
 (`manual`/`inferred`/`skipped`), a `commands[]` breakdown, and `repair_attempts`;
 its legacy top-level `command`/`exit_code`/`output_preview` mirror the aggregate.
 
@@ -263,7 +286,8 @@ when nothing safe can run.
   never edits memory (`projects/{id}/*.md`, `memory/*.md`) or other workspaces.
 - **`SOUL.md`** is read-only + hidden — never shown, never auto-written, never
   in any write path.
-- **Explicit dispatch only.** No inferred-intent auto-run, ever.
+- **Explicit dispatch only.** No inferred-intent auto-run, ever. **Retry** is
+  an explicit user click that creates a new linked run — never an auto-rerun.
 - **Best-effort post-run steps.** Verification / browser / reconciliation never
   crash finalization and never get a run stuck in `running`.
 - **No auto-injection of repo contents** into the main agent's context.

@@ -66,7 +66,23 @@ export interface MemoryUpdate {
   action: 'append' | 'replace'
 }
 
-export type RunStatus = 'running' | 'completed' | 'partial' | 'blocked' | 'failed' | 'unknown'
+export type RunStatus =
+  | 'running'
+  | 'completed'
+  | 'partial'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled'
+  | 'unknown'
+
+/** Run control — one parsed line from a run's events.jsonl timeline. */
+export interface RunEvent {
+  type: string
+  timestamp?: string
+  // Events carry varied fields by type (task_id, status, tool_name, command…);
+  // the timeline reads them defensively.
+  [key: string]: unknown
+}
 
 export type VerificationStatus = 'passed' | 'failed' | 'skipped'
 
@@ -165,6 +181,11 @@ export interface RunRecord {
   browser_verification_state?: 'running' | 'passed' | 'failed' | null
   /** Phase 5 — the run's execution plan + task graph (null for older runs). */
   plan?: ExecutionPlan | null
+  /** Run control — set true while a cancel is pending (status still 'running'). */
+  cancel_requested?: boolean
+  /** Run control — retry linkage: the run this one was retried from / into. */
+  retry_of?: string | null
+  retried_by?: string | null
 }
 
 /** Task 06.2D — managed preview dev-server status. */
