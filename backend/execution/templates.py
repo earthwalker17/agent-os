@@ -111,9 +111,10 @@ should accomplish)
 # Fill this in only to OVERRIDE the inference. Lines starting with `#` are
 # ignored; every uncommented line becomes a verification command, run in order.
 #
-# Examples:
+# Examples (a manual block runs verbatim — include install if deps may be
+# missing, since the auto-install heuristic only applies to inferred commands):
 #   python -m pytest tests/
-#   npm run build
+#   npm install && npm run build
 #   tsc --noEmit
 ```
 

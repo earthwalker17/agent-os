@@ -189,7 +189,7 @@ Inferred intent → pending plan → user clicks **OK** →
    verbatim (`MAX_STEPS = 24`; `tool_call`/`final`; one JSON-correction retry;
    observed-activity fallback) and passes the agent's `final` straight through
    (incl. `task_md_update`). A multi-task plan runs each task in topological
-   order (`MAX_TASK_STEPS = 12` each), skips tasks whose dependency failed
+   order (`MAX_TASK_STEPS = 16` each), skips tasks whose dependency failed
    (→ `skipped`), mutates per-task status/summary/files/commands/blockers in
    place (run.json + plan.json rewritten per task for live polling), then
    aggregates a run status (all completed → `completed`; mixed → `partial`;
@@ -312,6 +312,28 @@ when nothing safe can run.
   with the process; `sweep_stuck_runs()` at startup rescues them to `failed`.
 - **Snapshot `TASK.md` before applying the agent's update** so a `task_md_update`
   can't clobber the verification config.
+- **`subprocess(text=True)` decodes with the machine codec, not UTF-8.** On a
+  non-UTF-8 Windows box (e.g. cp936/GBK, cp1252) capturing npm/Vite's UTF-8
+  output (box-drawing, ✓, ➜, emoji) raises `UnicodeDecodeError` — silently losing
+  captured output, or killing a `_StreamDrainer` reader thread and re-introducing
+  the pipe-deadlock. Always pass `encoding="utf-8", errors="replace"` to every
+  `subprocess.run`/`Popen` that captures child output.
+- **A timeout/teardown kills only the direct child.** With `shell=True` the
+  child is `cmd.exe`; `npm`/`node` grandchildren survive and orphan, holding ports
+  (5173/5174) and file locks. Reap the whole tree: `taskkill /F /T /PID` on
+  Windows (`run_shell`, dev-server teardown, installer), `killpg` on POSIX.
+- **Non-atomic JSON writes tear under polling.** The runner rewrites
+  `run.json`/`plan.json` many times per run while the UI polls every 2 s;
+  truncate-then-write leaves a window where a reader sees an empty/partial file
+  (transient 404/flicker). Write to a `.tmp` sibling then `os.replace` (atomic on
+  the same NTFS volume) — see `run_store._atomic_write_text`.
+- **The agent writes whole files inline as JSON, so cap output high.** A
+  `write_file` of a real component overflows a 2048-token default and truncates
+  the JSON mid-string → the action won't parse → the task fails. The Coding Agent
+  loop uses `CODING_AGENT_MAX_TOKENS = 8192`.
+- **Pinned model ids go stale.** `claude-sonnet-4-20250514` now 404s; a dead
+  default model breaks every LLM call. The default is a current alias
+  (`claude-sonnet-4-5`), overridable via `AGENT_OS_CLAUDE_MODEL`.
 
 ---
 

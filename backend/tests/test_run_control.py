@@ -41,7 +41,14 @@ import execution.memory_reconciliation as mr  # noqa: E402
 import execution.preview as preview  # noqa: E402
 import execution.run_store as run_store  # noqa: E402
 from execution.background import BackgroundRunManager  # noqa: E402
-from execution.models import RunRecord, RunStatus, TaskSpec, TaskStatus  # noqa: E402
+from execution.models import (  # noqa: E402
+    ExecutionPlan,
+    ExecutionTask,
+    RunRecord,
+    RunStatus,
+    TaskSpec,
+    TaskStatus,
+)
 from execution.runner import CodingAgentRunner  # noqa: E402
 
 
@@ -387,6 +394,44 @@ def test_cancel_endpoint_orphan_finalizes():
     _run(body)
 
 
+def test_cancel_endpoint_orphan_settles_plan_tasks():
+    """Orphan-cancel (no worker) must settle an in-flight plan task + write plan.json."""
+
+    def body(env: _Env):
+        env.setup("p")
+        plan = ExecutionPlan(
+            goal="g",
+            mode="planned",
+            tasks=[
+                ExecutionTask(id="t1", title="one", status=TaskStatus.COMPLETED),
+                ExecutionTask(id="t2", title="two", status=TaskStatus.RUNNING),
+            ],
+        )
+        env.seed_run("p", "r1", RunStatus.RUNNING, plan=plan)
+        fake = _FakeManager(cancel_in_flight=False)  # no worker -> orphan branch
+        prev = main.get_default_manager
+        main.get_default_manager = lambda: fake
+        try:
+            res = env.client.post("/api/projects/p/execution/runs/r1/cancel")
+            assert res.status_code == 200
+            assert res.json()["status"] == "cancelled"
+        finally:
+            main.get_default_manager = prev
+
+        # plan.json now exists and the in-flight task is settled to skipped.
+        plan_raw = run_store.read_plan_json("p", "r1")
+        assert plan_raw is not None
+        by_id = {t["id"]: t["status"] for t in plan_raw["tasks"]}
+        assert by_id["t1"] == "completed"  # untouched
+        assert by_id["t2"] == "skipped"  # was running -> skipped
+        # run.json's embedded plan agrees (no torn cross-artifact state).
+        run_raw = run_store.read_run_json("p", "r1")
+        emb = {t["id"]: t["status"] for t in run_raw["plan"]["tasks"]}
+        assert emb["t2"] == "skipped"
+
+    _run(body)
+
+
 def test_cancel_endpoint_does_not_clobber_finished_run():
     """Race guard: request_cancel False + a re-read showing terminal => no orphan write."""
 
@@ -458,6 +503,33 @@ def test_retry_dispatches_new_linked_run():
         assert original["retried_by"] == new["run_id"]
         types = [e["type"] for e in run_store.read_events("p", "20260101-000000-aaaaaaaa")]
         assert "run_retried" in types
+
+    _run(body)
+
+
+def test_retry_of_cancelled_run_is_allowed():
+    """A cancelled run is terminal, so retry must dispatch a new linked run."""
+
+    def body(env: _Env):
+        env.setup("p")
+        env.seed_run("p", "20260101-000000-bbbbbbbb", RunStatus.CANCELLED, task_title="Build it")
+        run_store.write_task_card(
+            "p", "20260101-000000-bbbbbbbb", "Build it", "the original task body"
+        )
+        fake = _FakeManager()
+        prev = main.get_default_manager
+        main.get_default_manager = lambda: fake
+        try:
+            res = env.client.post(
+                "/api/projects/p/execution/runs/20260101-000000-bbbbbbbb/retry"
+            )
+        finally:
+            main.get_default_manager = prev
+
+        assert res.status_code == 200, res.text
+        new = res.json()
+        assert new["retry_of"] == "20260101-000000-bbbbbbbb"
+        assert fake.calls and fake.calls[0][1].task_card == "the original task body"
 
     _run(body)
 

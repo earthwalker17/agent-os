@@ -77,6 +77,27 @@ def test_looks_complex_multi_line_card():
     assert looks_complex("alpha\nbeta\ngamma\ndelta") is True
 
 
+def test_looks_complex_terse_clause_enumerated_card():
+    # A realistic one-line full-stack dispatch: single sentence, no terminal '.',
+    # under 240 chars, but enumerates several deliverables via commas/conjunctions.
+    # Must classify complex so Phase 5 planning engages (regression guard for the
+    # 'terse LaunchBoard card silently skips decomposition' thin-spot).
+    card = (
+        "Build a LaunchBoard planning dashboard with multiple views, local CRUD, "
+        "filtering and grouping, and a responsive frontend"
+    )
+    assert len(card) < 240  # not caught by the char-length rule
+    assert "\n" not in card  # not caught by the multi-line rule
+    assert looks_complex(card) is True
+
+
+def test_looks_complex_short_two_part_card_stays_simple():
+    # One comma / one conjunction is not enough to trip the clause heuristic, so a
+    # genuinely small two-part card still runs the legacy single loop.
+    assert looks_complex("add a login form and a logout button") is False
+    assert looks_complex("rename the helper, then export it") is False
+
+
 # ---------- fallback_plan ----------
 
 

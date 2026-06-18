@@ -75,6 +75,8 @@ function describe(e: RunEvent): Row | null {
     }
     case 'verification_repair_started':
       return { label: 'Repair pass started', detail: str(e.command), kind: 'running' }
+    case 'verification_repair_failed':
+      return { label: 'Repair pass failed', detail: str(e.error), kind: 'failed' }
     case 'verification_reverified':
       return { label: `Re-verified: ${str(e.status)}`, detail: str(e.command), kind: kindFor(str(e.status)) }
     case 'verification': {
@@ -100,6 +102,8 @@ function describe(e: RunEvent): Row | null {
       return { label: 'Cancellation requested', detail: '', kind: 'skipped' }
     case 'run_cancelled':
       return { label: 'Run cancelled', detail: str(e.reason), kind: 'skipped' }
+    case 'run_retried':
+      return { label: 'Run retried', detail: str(e.new_run_id), kind: 'skipped' }
     case 'run_interrupted':
       return { label: 'Run interrupted', detail: str(e.reason), kind: 'failed' }
     default:

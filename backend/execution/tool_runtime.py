@@ -11,6 +11,7 @@ context window or the response payload.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -25,7 +26,42 @@ _MAX_LIST_ENTRIES = 500
 _MAX_SEARCH_HITS = 200
 _MAX_SNIPPET_CHARS = 200
 
+# Upper bound on a single run_shell call. The agent (or a malformed argument)
+# can request an arbitrarily large timeout; without a ceiling a hung command
+# would pin a worker thread well past any per-step expectation (cancellation is
+# cooperative and only observed at step boundaries). 600 s comfortably covers a
+# cold ``npm install`` while still bounding worst-case latency.
+_MAX_SHELL_TIMEOUT_SECONDS = 600
+
 _SKIP_DIR_NAMES = {".git", "node_modules", ".venv", "__pycache__"}
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort kill of a child process AND its descendants. Never raises.
+
+    With ``shell=True`` on Windows, ``proc`` is the cmd.exe shell; ``npm``/
+    ``node`` grandchildren survive a plain ``proc.kill()`` (which only
+    TerminateProcess()es cmd.exe) and orphan — holding dev-server ports
+    (5173/5174) and file locks that break a subsequent verify/preview. ``taskkill
+    /T`` reaps the whole tree by pid. On POSIX we fall back to ``proc.kill()``
+    (the child is not in its own session here, so killpg would be unsafe).
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _truncate(text: str, limit: int) -> tuple[str, bool]:
@@ -287,32 +323,56 @@ class ToolRuntime:
                 error=f"repo dir does not exist: {repo}",
             )
 
+        # Clamp the timeout into a sane band: the lower bound keeps a 0/negative
+        # value from meaning "wait forever"; the upper bound stops a model-supplied
+        # huge value from pinning a worker thread.
+        effective_timeout = max(1, min(int(timeout_seconds), _MAX_SHELL_TIMEOUT_SECONDS))
+
+        # Popen + communicate (not subprocess.run) so a timeout can reap the whole
+        # child tree (see _kill_process_tree). encoding/errors are explicit because
+        # the machine's default codec (cp936/cp1252) raises UnicodeDecodeError on
+        # the UTF-8 box-drawing / emoji output npm + Vite emit — which would
+        # otherwise drop captured output (or, in a Popen drainer, kill the reader
+        # thread). errors="replace" keeps logs readable instead.
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(repo),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=max(1, int(timeout_seconds)),
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                success=False,
-                tool_name="run_shell",
-                error=f"command timed out after {timeout_seconds}s",
-                metadata={
-                    "command": command,
-                    "cwd": str(repo),
-                    "timeout": True,
-                    "timeout_seconds": timeout_seconds,
-                },
+                encoding="utf-8",
+                errors="replace",
             )
         except Exception as e:
             return _err("run_shell", e)
 
-        stdout, stdout_truncated = _truncate(proc.stdout or "", _MAX_SHELL_OUTPUT_CHARS)
-        stderr, stderr_truncated = _truncate(proc.stderr or "", _MAX_SHELL_OUTPUT_CHARS)
+        try:
+            out, err = proc.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            return ToolResult(
+                success=False,
+                tool_name="run_shell",
+                error=f"command timed out after {effective_timeout}s",
+                metadata={
+                    "command": command,
+                    "cwd": str(repo),
+                    "timeout": True,
+                    "timeout_seconds": effective_timeout,
+                },
+            )
+        except Exception as e:
+            _kill_process_tree(proc)
+            return _err("run_shell", e)
+
+        stdout, stdout_truncated = _truncate(out or "", _MAX_SHELL_OUTPUT_CHARS)
+        stderr, stderr_truncated = _truncate(err or "", _MAX_SHELL_OUTPUT_CHARS)
         return ToolResult(
             success=proc.returncode == 0,
             tool_name="run_shell",

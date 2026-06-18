@@ -208,6 +208,58 @@ def test_complex_card_decomposes_into_tasks():
     _run(body)
 
 
+def test_multitask_artifacts_are_consistent():
+    """run.json, plan.json, and events.jsonl agree for a multi-task run.
+
+    Guards the per-task UI/timeline contract: the chat checklist + run-detail
+    plan block read run.json's embedded plan, the /plan endpoint reads the
+    standalone plan.json, and the timeline reads events.jsonl — a divergence
+    between them would show contradictory per-task state.
+    """
+
+    def body(layout: _TempLayout):
+        layout.make_project("p")
+        layout.init_workspace("p")
+        responses = [
+            _plan([_ptask("t1", "Create config"), _ptask("t2", "Wire it")]),
+            _final("completed", summary="config done", files_changed=["config.txt"]),
+            _final("completed", summary="wired", files_changed=["main.txt"]),
+        ]
+        monkey: dict[str, Any] = {}
+        _patch_llm(monkey, _stub_llm_caller(responses))
+        try:
+            summary = CodingAgentRunner("p").run_task(
+                TaskSpec(title="t", task_card=_COMPLEX_CARD, created_by="test")
+            )
+        finally:
+            _unpatch_llm(monkey)
+
+        run_id = summary.run_id
+        run_raw = run_store.read_run_json("p", run_id)
+        plan_raw = run_store.read_plan_json("p", run_id)
+        assert run_raw is not None and plan_raw is not None
+        # run.json's embedded plan == standalone plan.json (ids + statuses).
+        embedded = [(t["id"], t["status"]) for t in run_raw["plan"]["tasks"]]
+        standalone = [(t["id"], t["status"]) for t in plan_raw["tasks"]]
+        assert embedded == standalone
+        assert standalone == [("t1", "completed"), ("t2", "completed")]
+        # events.jsonl carries a task_started + a completed task_status per task.
+        events = run_store.read_events("p", run_id)
+        started = {e.get("task_id") for e in events if e.get("type") == "task_started"}
+        assert started == {"t1", "t2"}
+        for tid in ("t1", "t2"):
+            statuses = [
+                e.get("status")
+                for e in events
+                if e.get("type") == "task_status" and e.get("task_id") == tid
+            ]
+            assert "completed" in statuses, (tid, statuses)
+        # files_changed in run.json aggregates per-task attribution.
+        assert set(run_raw["files_changed"]) == {"config.txt", "main.txt"}
+
+    _run(body)
+
+
 def test_planner_failure_falls_back_to_single_task():
     def body(layout: _TempLayout):
         layout.make_project("p")

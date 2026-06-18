@@ -160,6 +160,8 @@ Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 ```bash
 cd backend
 pip install -r requirements.txt
+# Browser verification drives a headless Chromium; install it once:
+python -m playwright install chromium
 cp .env.example .env
 # Edit .env and add at least one provider key:
 #   ANTHROPIC_API_KEY (Claude), OPENAI_API_KEY (GPT),

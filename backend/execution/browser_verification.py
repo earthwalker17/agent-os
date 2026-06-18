@@ -60,7 +60,12 @@ _BROWSER_OUTPUT_PREVIEW_CHARS = 4000
 
 # Default lifecycle timeouts. The whole pipeline is meant to be a
 # lightweight smoke check, not a full browser test suite.
-DEFAULT_READINESS_TIMEOUT_SECONDS = 30
+# Bumped 30 -> 60: a moderately complex app's FIRST `npm run dev` does esbuild
+# dep pre-bundling, and on Windows real-time AV scanning of node_modules can push
+# the first HTTP bind past 30 s on a cold boot. The early-exit-on-process-death
+# guard in _wait_for_url_or_exit still fails fast if the server actually dies, so
+# a larger ceiling only costs wall-clock on a genuinely slow-but-alive boot.
+DEFAULT_READINESS_TIMEOUT_SECONDS = 60
 DEFAULT_SCREENSHOT_TIMEOUT_SECONDS = 20
 DEFAULT_TERMINATE_GRACE_SECONDS = 5
 READINESS_POLL_INTERVAL_SECONDS = 0.5
@@ -72,7 +77,12 @@ READINESS_POLL_INTERVAL_SECONDS = 0.5
 # still override via that block — see ``run_ui_browser_verification``).
 DEFAULT_DEV_HOST = "127.0.0.1"
 DEFAULT_DEV_PORT = 5174
-DEFAULT_DEV_COMMAND = f"npm run dev -- --host {DEFAULT_DEV_HOST} --port {DEFAULT_DEV_PORT}"
+# --strictPort makes Vite fail loudly if 5174 is taken instead of silently
+# bumping to 5175 — which would desync from the hardwired DEFAULT_DEV_URL and
+# either screenshot a stale/foreign server or hang the readiness gate.
+DEFAULT_DEV_COMMAND = (
+    f"npm run dev -- --host {DEFAULT_DEV_HOST} --port {DEFAULT_DEV_PORT} --strictPort"
+)
 DEFAULT_DEV_URL = f"http://{DEFAULT_DEV_HOST}:{DEFAULT_DEV_PORT}"
 # Frontend dependency install runs before the dev server starts. npm install
 # on a cold cache can take a while, so the cap is generous compared to the
@@ -323,6 +333,13 @@ def _start_dev_server(command: str, cwd: Path) -> subprocess.Popen:
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        # Explicit UTF-8 so the _StreamDrainer's readline() can't raise
+        # UnicodeDecodeError on Vite's box-drawing/emoji output under a non-UTF-8
+        # machine codec (cp936/cp1252). A drainer crash would silently stop
+        # draining the pipe and re-introduce the Windows startup deadlock this
+        # whole mechanism exists to prevent.
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if os.name == "nt":
         # New process group on Windows so children can be terminated as a
@@ -332,6 +349,27 @@ def _start_dev_server(command: str, cwd: Path) -> subprocess.Popen:
     # POSIX: detach into its own process group via setsid.
     kwargs["preexec_fn"] = os.setsid  # type: ignore[assignment]
     return subprocess.Popen(command, shell=True, **kwargs)
+
+
+def _taskkill_tree(proc: subprocess.Popen) -> None:
+    """Windows-only: reap a process AND its descendants via ``taskkill /T``.
+
+    With ``shell=True`` the Popen handle is cmd.exe; ``proc.kill()`` terminates
+    only that shell, orphaning the ``npm.cmd`` -> node/Vite children that keep
+    the dev port (5174) bound. ``taskkill /F /T`` walks the whole tree by pid.
+    Falls back to ``proc.kill()`` if taskkill is unavailable. Never raises.
+    """
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _terminate_dev_server(proc: subprocess.Popen, grace_seconds: int) -> None:
@@ -354,12 +392,14 @@ def _terminate_dev_server(proc: subprocess.Popen, grace_seconds: int) -> None:
             return
         except subprocess.TimeoutExpired:
             pass
-        # Escalate.
+        # Escalate. On Windows a plain proc.kill() only terminates the cmd.exe
+        # shell and orphans the node/Vite child (leaking port 5174); taskkill /T
+        # reaps the whole tree.
         try:
             if os.name != "nt":
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             else:
-                proc.kill()
+                _taskkill_tree(proc)
         except Exception:  # noqa: BLE001
             try:
                 proc.kill()
@@ -498,6 +538,8 @@ def _default_playwright_screenshot(url: str, output_path: Path, timeout_seconds:
             [sys.executable, "-c", _PLAYWRIGHT_SCREENSHOT_SCRIPT, payload],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=outer_timeout,
             check=False,
         )
@@ -837,22 +879,41 @@ def _default_dependency_installer(
     non-zero exit with an explanatory line so the caller treats it as a
     failed install (and skips the screenshot) rather than crashing.
     """
+    # Popen (not subprocess.run) + explicit UTF-8 so a timeout can reap the whole
+    # npm/node tree on Windows (a half-finished install left writing into
+    # node_modules corrupts the next install) and Vite/npm UTF-8 output decodes
+    # cleanly under a non-UTF-8 machine codec.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=str(cwd),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=max(1, int(timeout_seconds)),
+            encoding="utf-8",
+            errors="replace",
         )
-    except subprocess.TimeoutExpired:
-        return 1, f"dependency install timed out after {timeout_seconds}s"
     except Exception as exc:  # noqa: BLE001
         return 1, f"dependency install could not start: {_format_exception(exc)}"
-    return proc.returncode, _build_output_preview(
-        proc.stdout or "", proc.stderr or ""
-    )
+    try:
+        out, err = proc.communicate(timeout=max(1, int(timeout_seconds)))
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            _taskkill_tree(proc)
+        else:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        return 1, f"dependency install timed out after {timeout_seconds}s"
+    except Exception as exc:  # noqa: BLE001
+        return 1, f"dependency install crashed: {_format_exception(exc)}"
+    return proc.returncode, _build_output_preview(out or "", err or "")
 
 
 def run_ui_browser_verification(

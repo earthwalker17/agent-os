@@ -62,8 +62,11 @@ _MODEL_ENV = {
 }
 
 _MODEL_DEFAULTS = {
-    # Matches the pre-07.1 hard-coded default, so Claude behavior is unchanged.
-    PROVIDER_CLAUDE: "claude-sonnet-4-20250514",
+    # Current stable Sonnet. The previous pinned id (claude-sonnet-4-20250514)
+    # now returns 404 not_found from the API, which broke every Coding Agent /
+    # orchestrator call on a fresh install. Override per-deployment with
+    # AGENT_OS_CLAUDE_MODEL.
+    PROVIDER_CLAUDE: "claude-sonnet-4-5",
     PROVIDER_GPT: "gpt-4o",
     PROVIDER_GEMINI: "gemini-1.5-flash",
     PROVIDER_DEEPSEEK: "deepseek-chat",

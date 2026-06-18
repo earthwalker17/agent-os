@@ -40,11 +40,16 @@ function isActive(run: RunRecord): boolean {
 // underlying settled status. Null once the run reaches a terminal status, so
 // the row then shows that status (e.g. 'cancelled') directly.
 function phaseLabel(run: RunRecord): string | null {
+  // A completed/partial run that's actively being browser-verified is still
+  // busy (isActive polls it); surface 'verifying' so the row badge doesn't read
+  // a stale terminal status while the "N running" indicator says it's active.
+  if (run.browser_verification_state === 'running') return 'verifying'
   if (run.status !== 'running') return null
   if (run.cancel_requested) return 'cancelling'
   if (run.verification_state === 'repairing') return 'repairing'
   if (run.verification_state === 'verifying') return 'verifying'
-  if (run.browser_verification_state === 'running') return 'verifying'
+  // (browser_verification_state === 'running' is handled above the status guard,
+  // since it occurs on a terminal run where run.status !== 'running'.)
   const tasks = run.plan?.tasks ?? []
   if (tasks.some((t) => t.status === 'running')) return 'executing'
   if (!run.plan) return 'planning'

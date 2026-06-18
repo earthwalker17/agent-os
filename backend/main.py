@@ -58,7 +58,7 @@ from execution.tool_models import (
     SearchFilesRequest,
     RunShellRequest,
 )
-from execution.models import TaskSpec, RunRecord, RunStatus
+from execution.models import TaskSpec, RunRecord, RunStatus, TaskStatus
 from execution import run_store
 from execution.browser_verification import (
     run_ui_browser_verification,
@@ -1186,6 +1186,18 @@ def api_cancel_run(project_id: str, run_id: str):
             blocker = "run cancelled by user (no active worker)"
             if blocker not in orphan.blockers:
                 orphan.blockers = list(orphan.blockers) + [blocker]
+            # Settle any in-flight plan task to SKIPPED and rewrite plan.json,
+            # mirroring runner._finalize_cancelled. This branch runs in the
+            # endpoint after a restart (no worker owns the run), so without it a
+            # multi-task run would end `cancelled` while plan.json still shows a
+            # task perpetually `running`.
+            if orphan.plan is not None:
+                for unit in orphan.plan.tasks:
+                    if unit.status == TaskStatus.RUNNING:
+                        unit.status = TaskStatus.SKIPPED
+                        if "run cancelled" not in unit.blockers:
+                            unit.blockers.append("run cancelled")
+                run_store.write_plan_json(project_id, run_id, orphan.plan)
             run_store.write_run_json(project_id, run_id, orphan)
             run_store.write_result_md(
                 project_id,
@@ -1450,6 +1462,13 @@ def api_confirm_pending_execution(project_id: str, pending_id: str):
             status_code=400,
             detail="Pending execution plans are not available in the GENERAL workspace.",
         )
+    # Lazily initialize the execution workspace (idempotent) so the
+    # natural-language confirm path works on a brand-new project — exactly like
+    # the `@code` path (chat_delegation.handle_code_delegation). Without this,
+    # BackgroundRunManager.dispatch() 404s because the workspace was never
+    # created, so the pending plan's "OK, run this" button would dead-end.
+    _require_project(project_id)
+    init_execution_workspace(project_id, _project_display_name(project_id))
     _require_workspace(project_id)
 
     row = get_pending_execution(pending_id)

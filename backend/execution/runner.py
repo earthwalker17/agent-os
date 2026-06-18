@@ -105,7 +105,20 @@ MAX_REPAIR_STEPS = 10
 # - MAX_TASK_STEPS: per-task tool-loop budget in the multi-task path. Each task
 #   is a focused unit, so it needs far fewer steps than a whole monolithic run.
 MAX_PLAN_STEPS = 6
-MAX_TASK_STEPS = 12
+# Bumped 12 -> 16: a frontend-heavy task unit (several view components + a state
+# store + filter/group utils + styles) can need a dozen-plus write_file steps
+# plus a little exploration and the final action. At 12, exhaustion marked the
+# unit FAILED, which cascaded its dependents to SKIPPED and collapsed the whole
+# run to `partial` with most files already written. 16 gives realistic headroom
+# while keeping the aggregate budget bounded (<= MAX_TASKS units).
+MAX_TASK_STEPS = 16
+
+# Output-token budget for every Coding Agent LLM call. The agent emits whole
+# files inline as JSON (the write_file ``content`` argument), so llm.chat's
+# default of 2048 truncates a moderately large component mid-string — the JSON
+# action then fails to parse and the task fails. 8192 leaves ample room for a
+# full file plus the JSON envelope; Sonnet supports far more.
+CODING_AGENT_MAX_TOKENS = 8192
 
 # Tools the planner is allowed to call — strictly read-only. Writing / shell
 # happen only in the execution phase. Enforced in the plan loop, not just in
@@ -714,7 +727,11 @@ class CodingAgentRunner:
         the planning loop allows ``tool_call`` / ``plan``. This keeps the
         ``plan`` action from ever being accepted by the execution loop.
         """
-        kwargs: dict[str, Any] = {"system": system_prompt, "messages": messages}
+        kwargs: dict[str, Any] = {
+            "system": system_prompt,
+            "messages": messages,
+            "max_tokens": CODING_AGENT_MAX_TOKENS,
+        }
         if self.model:
             kwargs["model"] = self.model
 
@@ -1076,8 +1093,19 @@ class CodingAgentRunner:
         )
 
         run_store.write_run_json(self.project_id, run_id, record)
-        # Re-write plan.json with the settled per-task statuses (Phase 5).
+        # Re-write plan.json with the settled per-task statuses (Phase 5). For a
+        # single-task plan, sync the lone task's status to the run's terminal
+        # status so run.json's embedded plan + plan.json never contradict the
+        # top-level status — the per-task `task_status_from_final` mapping
+        # collapses partial/blocked to FAILED, and a verification downgrade can
+        # move the run to PARTIAL after the task was marked COMPLETED.
         if record.plan is not None:
+            if len(record.plan.tasks) == 1:
+                record.plan.tasks[0].status = (
+                    TaskStatus.COMPLETED
+                    if record.status == RunStatus.COMPLETED
+                    else TaskStatus.FAILED
+                )
             run_store.write_plan_json(self.project_id, run_id, record.plan)
 
         notes = ""

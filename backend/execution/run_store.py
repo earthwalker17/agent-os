@@ -14,6 +14,7 @@ owns the loop logic; the API endpoints query through this store.
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from datetime import datetime
@@ -29,6 +30,22 @@ from .browser_verification import render_browser_verification_section
 def new_run_id() -> str:
     """Sortable timestamped run id with a short random suffix."""
     return datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically (temp sibling + ``os.replace``).
+
+    The runner rewrites run.json / plan.json many times during a multi-task run
+    (once per task boundary + each verification phase) while the UI polls every
+    2 s. A plain truncate-then-write leaves a window where a reader sees an
+    empty / half-written file — on Windows this surfaces as a transient 404 /
+    'unknown' status. ``os.replace`` is atomic on the same volume (NTFS
+    included), so a concurrent reader always sees either the old or the new
+    complete file, never a torn one.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def get_runs_dir(project_id: str) -> Path:
@@ -112,7 +129,7 @@ def read_events(project_id: str, run_id: str) -> list[dict]:
 
 def write_run_json(project_id: str, run_id: str, record: RunRecord) -> None:
     path = get_run_dir(project_id, run_id) / "run.json"
-    path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+    _atomic_write_text(path, record.model_dump_json(indent=2))
 
 
 def read_run_json(project_id: str, run_id: str) -> dict | None:
@@ -133,7 +150,7 @@ def write_plan_json(project_id: str, run_id: str, plan: ExecutionPlan) -> None:
     re-writes as task statuses settle (Phase 5).
     """
     path = get_run_dir(project_id, run_id) / "plan.json"
-    path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+    _atomic_write_text(path, plan.model_dump_json(indent=2))
 
 
 def read_plan_json(project_id: str, run_id: str) -> dict | None:
@@ -147,7 +164,7 @@ def read_plan_json(project_id: str, run_id: str) -> dict | None:
 
 
 def write_result_md(project_id: str, run_id: str, content: str) -> None:
-    (get_run_dir(project_id, run_id) / "result.md").write_text(content, encoding="utf-8")
+    _atomic_write_text(get_run_dir(project_id, run_id) / "result.md", content)
 
 
 def read_result_md(project_id: str, run_id: str) -> str | None:

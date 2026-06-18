@@ -40,9 +40,14 @@ _COMPLEX_CHAR_THRESHOLD = 240
 _COMPLEX_LINE_THRESHOLD = 4
 _COMPLEX_LIST_ITEM_THRESHOLD = 2
 _COMPLEX_SENTENCE_THRESHOLD = 3
+# A single sentence can still enumerate many deliverables via commas /
+# conjunctions; >= this many such clauses (each with real content) reads as
+# multi-part work worth planning.
+_COMPLEX_CLAUSE_THRESHOLD = 3
 
 _LIST_ITEM_REGEX = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", re.MULTILINE)
 _SENTENCE_SPLIT_REGEX = re.compile(r"[.!?]+")
+_CLAUSE_SPLIT_REGEX = re.compile(r",|\band\b|&|;", re.IGNORECASE)
 
 
 class PlanParseError(Exception):
@@ -85,6 +90,17 @@ def looks_complex(task_card: str) -> bool:
 
     sentences = [s for s in _SENTENCE_SPLIT_REGEX.split(text) if s.strip()]
     if len(sentences) >= _COMPLEX_SENTENCE_THRESHOLD:
+        return True
+
+    # A single comma/conjunction-enumerated sentence (no terminal '.') like
+    # "build a dashboard with multiple views, local CRUD, filtering and grouping,
+    # and a responsive frontend" describes multi-part work but slips past every
+    # check above. Count clauses with real content (>= 2 words each) so a terse
+    # one-line full-stack card still trips planning. A false positive only costs
+    # one cheap planning call (which can still fall back to a single task); the
+    # ">= 2 words" filter keeps trivial cards ("do it") simple.
+    clauses = [c for c in _CLAUSE_SPLIT_REGEX.split(text) if len(c.split()) >= 2]
+    if len(clauses) >= _COMPLEX_CLAUSE_THRESHOLD:
         return True
 
     return False

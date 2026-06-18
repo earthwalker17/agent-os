@@ -322,10 +322,56 @@ explicit-dispatch contract are unchanged.
   auto-rerun, no hidden dispatch. The chat card surfaces it via a "Retry →
   view new run" affordance; the Runs panel refreshes to show it.
 - **New events:** `run_cancel_requested`, `run_cancelled`, `run_retried`.
-- **Scope notes:** polling only (no SSE); cancellation does not kill the
-  in-flight subprocess (cooperative at step boundaries — chosen over rewriting
-  the sandbox `run_shell` to `Popen`); retry creates a new run rather than
-  mutating history.
+- **Scope notes:** polling only (no SSE); cancellation is cooperative at step
+  boundaries and does not kill the in-flight subprocess (the later readiness pass
+  moved `run_shell` to `Popen` for *timeout* tree-kill, but cancel still doesn't
+  reach a running command); retry creates a new run rather than mutating history.
+
+### Real-World Readiness Hardening (Windows smoke-test pass)
+A readiness review (adversarially verified) + a real Windows full-stack smoke
+test — building a "LaunchBoard" planning dashboard end-to-end through the normal
+UI/API path — hardened the execution layer. All changes are targeted and
+stability-focused; sandbox chokepoint, role separation, explicit-dispatch, and
+verification semantics are unchanged.
+- **Confirm-path blocker fixed.** `/execution/pending/{id}/confirm` (the
+  natural-language **OK, run this** button) now lazily inits the workspace like
+  `@code` does — it previously 404'd on a brand-new project, dead-ending the
+  pending plan with no run dispatched.
+- **Windows subprocess robustness.** Every execution-layer `subprocess` that
+  captures output now decodes `encoding="utf-8", errors="replace"` (the default
+  machine codec — cp936/GBK on the test box — raised `UnicodeDecodeError` on
+  npm/Vite's UTF-8 output, dropping logs or killing a `_StreamDrainer`). `run_shell`,
+  the dev-server teardown, and the dependency installer reap the **whole process
+  tree** on timeout/teardown (`taskkill /F /T`) so node can't orphan and hold port
+  5174; `run_shell` clamps its timeout to `[1, 600] s`.
+- **Atomic artifacts.** `run.json` / `plan.json` / `result.md` write via temp
+  file + `os.replace` (`run_store._atomic_write_text`), eliminating torn-read
+  404/flicker under 2 s UI polling.
+- **Coding-agent token budget.** The agent loop uses `max_tokens = 8192` (was the
+  `llm.chat` default 2048) so a full file written inline as JSON can't truncate
+  mid-string → parse-fail → task-fail.
+- **Planning fidelity.** `looks_complex` now also counts comma/conjunction
+  clauses, so a terse one-line full-stack card reliably triggers Phase 5
+  decomposition instead of one monolithic loop. `MAX_TASK_STEPS` 12 → 16 so a
+  frontend-heavy unit doesn't exhaust and cascade dependents to `skipped`.
+- **Artifact consistency.** Single-task plans sync `plan.tasks[0].status` to the
+  run's terminal status; the orphan-cancel endpoint settles in-flight plan tasks
+  to `skipped` and rewrites `plan.json`.
+- **Browser/preview.** Readiness timeout 30 → 60 s (cold Vite + Windows AV
+  scanning); default dev command gains `--strictPort` (fail loud instead of
+  silently moving to 5175 and desyncing the hardwired URL).
+- **UI.** The Runs-panel row shows `verifying` during a UI-triggered browser
+  verification; the timeline renders `verification_repair_failed` + `run_retried`.
+- **Model + deps.** Default Claude model is a current alias (`claude-sonnet-4-5`);
+  the previous pinned id `claude-sonnet-4-20250514` now returns 404, which broke
+  every LLM call. `playwright` is added to `requirements.txt` (one-time
+  `python -m playwright install chromium`).
+- **Deferred (documented, low-risk):** events.jsonl append lock, cosmetic
+  cancel-vs-runner `run.json` race, cancel-during-finalize no-op, multi-node
+  dependency-cycle detection, partial-`node_modules` reinstall heuristic,
+  reverify skip-already-passed, the `format`/`ssh` block-list substring
+  false-positives (left untouched to avoid weakening the sandbox), and the unused
+  `steps_used` field.
 
 ---
 
@@ -387,10 +433,10 @@ Anthropic key is needed. Each file is runnable standalone.
 | `test_chat_first_endpoints.py`    |     3 | 06.2D HTTP: browser-verify sub-status, preview start/stop    |
 | `test_uploads.py`                 |    14 | 07.0 sanitize/dedup/storage, workspace copy, upload HTTP      |
 | `test_providers.py`               |    19 | 07.1 availability, default order, dispatch/parse, chat routing |
-| `test_planner.py`                 |    26 | Phase 5 heuristic gate, plan parse/fallback, graph + aggregation |
-| `test_runner_planning.py`         |     6 | Phase 5 plan→tasks integration: decompose, skip, fallback, gate |
-| `test_run_control.py`             |    13 | Run control: events/task-card readers, cooperative cancel, cancel/retry endpoints, orphan + race guard |
-| **Total**                         | **277** |                                                            |
+| `test_planner.py`                 |    28 | Phase 5 heuristic gate (+ clause heuristic), plan parse/fallback, graph + aggregation |
+| `test_runner_planning.py`         |     7 | Phase 5 plan→tasks integration: decompose, skip, fallback, gate, artifact consistency |
+| `test_run_control.py`             |    15 | Run control: events/task-card readers, cooperative cancel, cancel/retry endpoints, orphan + race guard, orphan plan-settle, retry-of-cancelled |
+| **Total**                         | **282** |                                                            |
 
 Run all (from `backend/`): `python tests/<file>.py` for each row above.
 
