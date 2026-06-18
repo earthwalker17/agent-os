@@ -73,6 +73,13 @@ Status values:
 - blocked   — sandbox or external constraint prevented progress
 - failed    — internal error or the task is not actionable
 
+# Truthful reporting (important)
+Only declare `completed` after you have ACTUALLY written every file the task
+needs via `write_file` — not when you merely intend to. List a path in
+`files_changed` ONLY if you called `write_file`/`append_file` for it in THIS
+run. Never claim files you planned but didn't write: a later automatic build
+will fail on the missing files, and your summary must match what is on disk.
+
 # Loop budget
 You have a limited number of steps (typically {max_steps}). Spend them on
 work, not exploration. Concretely:
@@ -108,6 +115,55 @@ Quick `run_shell` calls for things like inspecting a file's structure,
 checking a tool's `--version`, or running a fast targeted command are
 fine. The rule of thumb: **if the command would normally not exit on its
 own, do not run it.**
+
+# Previewable apps must render with the frontend dev server ALONE
+Browser verification / preview starts ONLY the frontend dev server (e.g.
+`npm run dev`) on its own port and screenshots the page — it does NOT launch any
+separate backend process. So the initial view must render meaningful content
+WITHOUT a separately-started API:
+
+- Prefer bundling seed/mock data IN the frontend — a static module the app
+  imports directly (e.g. `src/data/seedData.ts`) — so a fresh `npm run dev`
+  shows a populated UI.
+- If you also build a separate backend (an Express/Node server, etc.), the
+  frontend MUST fall back to the bundled/mock data when the API is unreachable
+  (wrap the fetch in try/catch with a static default). Never leave the UI stuck
+  on a "Loading…" state when the API isn't running — that screenshots as a blank
+  dashboard and fails the demo.
+
+# Scaffolding & multi-file generation
+When you must create a project from scratch (e.g. a Vite + React + TypeScript
+app):
+
+- Do NOT run interactive scaffolders — `npm create vite`, `npx create-react-app`,
+  `npm init` without `-y`, `yarn create`, etc. They pause for an interactive
+  prompt; with no terminal input they fail or hang and waste a step.
+- Instead write each project file YOURSELF, one `write_file` call per file:
+  `package.json` (include a `build` script), `tsconfig.json`,
+  `tsconfig.node.json`, `vite.config.ts`, `index.html`, `src/main.tsx`,
+  `src/App.tsx`, and any styles/entry files. The automatic verification step
+  runs `npm install` for you afterwards.
+- Actually issue every `write_file` BEFORE you finalize. A scaffold missing its
+  entry/config files (`index.html`, `tsconfig.json`, `vite.config.ts`,
+  `src/main.tsx`) will not build, so do not declare `completed` until they are
+  all written. Writing `package.json` alone is NOT a complete scaffold.
+- One step = one tool call, so don't waste them: skip `list_files` / `read_file`
+  of a path you're about to overwrite, and DON'T `mkdir` — `write_file` creates
+  parent directories automatically, so just write to the nested path
+  (`src/components/Foo.tsx`).
+- For a VERY large file (e.g. an extensive seed-data module), do NOT try to emit
+  it all in one giant `write_file` — an oversized response can be truncated and
+  fail to parse, losing the whole file. Write the first portion with
+  `write_file`, then add the rest with one or two `append_file` calls. Keep any
+  single tool call's `content` to a few hundred lines at most.
+
+# TypeScript: avoid duplicate exports (error TS2484)
+If you BOTH declare a type with an inline `export` (`export interface Foo {{}}` or
+`export type Bar = …`) AND list the same name again in a trailing
+`export {{ Foo }}` / `export type {{ Bar }}` block, `tsc` fails the build with
+"Export declaration conflicts with exported declaration of 'Foo'". Pick ONE
+style — prefer an inline `export` on each declaration and do NOT add a trailing
+re-export block for names already exported inline.
 
 # Style
 - Edit existing files in preference to creating new ones (unless the task
@@ -156,16 +212,42 @@ The failing verification command(s) and their output:
 <VERIFICATION_FAILURE>
 {failures}
 </VERIFICATION_FAILURE>
-
+{files_context}
 Rules for this repair pass:
 - Edit only the files needed to make the failing command(s) pass.
-- Do NOT re-run the verification command yourself, do NOT start a dev server,
-  and do NOT run the full test suite — Agent OS reruns verification
-  automatically after you finalize.
+- Each error names a file and line, e.g. `src/pages/Dashboard.tsx(181,11)`. Read
+  THAT file (plus, if needed, the one type/component it references) and rewrite
+  it to fix the specific errors. Do not hunt with repeated `search_files` — go
+  straight to the named file. Investigate minimally; spend most of your budget
+  WRITING fixes, and make sure you've written them before you run out of steps.
+- Fix the SPECIFIC errors reported above (don't refactor unrelated code).
+- For a TypeScript "Export declaration conflicts with exported declaration"
+  error (TS2484): the file both exports a name inline (`export interface X`)
+  and re-exports it in a trailing `export {{ … }}` / `export type {{ … }}` block.
+  Remove the redundant trailing re-export block; keep the inline `export`s.
+- `run_shell` is DISABLED in this pass — you may only use `read_file`,
+  `write_file`, `search_files`. Do not try to run `tsc`, `npm run build`, a
+  dev server, or the test suite to "check" your work: Agent OS reruns
+  verification automatically after you finalize. Spend every step reading the
+  failing file(s) and writing corrected versions.
 - If the failure is not something you can fix from the repo (missing external
   service, ambiguous requirement), finalize with status `partial` and explain
   the blocker. Otherwise finalize with status `completed` once you've applied
   the fix.
+
+Respond with one JSON action only.
+"""
+
+
+CONTINUATION_USER_PROMPT_TEMPLATE = """# Step budget nearly spent — finishing pass
+
+You have used the initial step budget for THIS task but you're still making
+progress (you've been writing files). You have roughly {remaining} more steps.
+
+Finish only the ESSENTIAL remaining work for this task, then emit
+`action: "final"`. Do NOT start new sub-features, do NOT re-read or re-verify
+files you've already written, and do NOT begin work that belongs to a later
+task. If the core deliverable is already on disk, finalize now.
 
 Respond with one JSON action only.
 """
@@ -278,7 +360,7 @@ are handled by their own passes.
 
 # Progress so far
 {prior_context}
-
+{degraded_note}
 # Current TASK.md
 <TASK_MD>
 {task_md}
@@ -320,11 +402,36 @@ def build_correction_prompt(error: str) -> str:
     return CORRECTION_USER_PROMPT_TEMPLATE.format(error=error)
 
 
-def build_repair_user_prompt(failures: str, max_steps: int) -> str:
+def build_repair_user_prompt(
+    failures: str, max_steps: int, files_context: str = ""
+) -> str:
+    """Build the repair-pass prompt.
+
+    ``files_context`` (optional) is a pre-rendered block of the CURRENT contents
+    of the files named in the errors, injected verbatim so the agent can rewrite
+    them immediately without spending steps reading/searching. Code braces in
+    the content are safe — they are a substituted value, not part of the
+    template, so ``str.format`` does not re-interpret them.
+    """
+    block = ""
+    if files_context.strip():
+        block = (
+            "\nThe CURRENT contents of the file(s) named in the errors are below. "
+            "You already have what you need — rewrite the necessary one(s) with "
+            "write_file to fix the errors; do NOT read or search for them again:\n\n"
+            "<CURRENT_FILES>\n"
+            f"{files_context.strip()}\n"
+            "</CURRENT_FILES>\n"
+        )
     return REPAIR_USER_PROMPT_TEMPLATE.format(
         failures=failures.strip() or "(no output captured)",
         max_steps=max_steps,
+        files_context=block,
     )
+
+
+def build_continuation_prompt(remaining: int) -> str:
+    return CONTINUATION_USER_PROMPT_TEMPLATE.format(remaining=remaining)
 
 
 def build_plan_system_prompt(
@@ -357,7 +464,22 @@ def build_task_unit_user_prompt(
     plan_outline: str,
     prior_context: str,
     task_md: str,
+    degraded_dependencies: list[str] | None = None,
 ) -> str:
+    deps = [d for d in (degraded_dependencies or []) if d and d.strip()]
+    if deps:
+        listed = "\n".join(f"- {d}" for d in deps)
+        degraded_note = (
+            "\n# Heads-up: incomplete dependencies\n"
+            "One or more tasks this task depends on did NOT fully complete. Any "
+            "files they wrote are on disk, but output may be missing or partial. "
+            "Compensate so this task still produces a working result — e.g. create "
+            "minimal inline/seed data or stub a missing module rather than "
+            "importing something that may not exist:\n"
+            f"{listed}\n"
+        )
+    else:
+        degraded_note = ""
     return TASK_UNIT_USER_PROMPT_TEMPLATE.format(
         goal=goal.strip() or "(no goal stated)",
         task_no=task_no,
@@ -368,4 +490,5 @@ def build_task_unit_user_prompt(
         plan_outline=plan_outline.strip() or "(no other tasks)",
         prior_context=prior_context.strip() or "(nothing yet)",
         task_md=task_md.strip() or "(TASK.md is empty)",
+        degraded_note=degraded_note,
     )

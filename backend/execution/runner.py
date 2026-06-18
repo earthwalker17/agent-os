@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ from .planner import (
     MAX_TASKS,
     PlanParseError,
     aggregate_run_status,
+    degraded_dependencies,
     dependency_failed,
     fallback_plan,
     looks_complex,
@@ -55,6 +57,7 @@ from .planner import (
     topological_order,
 )
 from .prompts import (
+    build_continuation_prompt,
     build_correction_prompt,
     build_initial_user_prompt,
     build_plan_system_prompt,
@@ -90,10 +93,26 @@ log = logging.getLogger(__name__)
 # running dev servers or test suites — see prompts.py.
 MAX_STEPS = 24
 
-# Bounded budget for the single post-verification repair pass (Task 06.2E).
-# Repairs are targeted fixes informed by the failing command output, so they
-# need far fewer steps than the initial build.
-MAX_REPAIR_STEPS = 10
+# Bounded budget for ONE post-verification repair pass (Task 06.2E). Repairs
+# are targeted fixes informed by the failing command output. Bumped 10 -> 18:
+# a pass against subtle cross-file type errors spends several steps reading the
+# erroring file + the component/type interfaces it references BEFORE it can
+# write; at 12 an investigation-heavy pass exhausted its budget on reads/searches
+# without ever writing a fix (mutations=0), which the iterative loop reads as
+# "no progress" and stops. 18 leaves comfortable room to read AND write.
+MAX_REPAIR_STEPS = 18
+
+# Maximum number of repair→re-verify cycles (autonomy hardening). A single pass
+# is rarely enough for a real multi-file build: cross-file type/import errors
+# surface in waves, so the first pass fixes most and a re-verify reveals
+# stragglers (or a fix exposes a downstream error). Bumped 3 -> 5: a freshly
+# generated multi-section app can start with errors spread across ~15-20 files
+# (cross-file type drift + strict-tsconfig unused-var/import noise); repair
+# converges monotonically (~6-9 files fixed per pass) but at 3 attempts it ran
+# one straggler short of green. Each pass is bounded by MAX_REPAIR_STEPS, and the
+# loop stops early as soon as the build passes or a pass changes nothing, so the
+# extra ceiling only costs time on builds that are actually still converging.
+MAX_REPAIR_ATTEMPTS = 5
 
 # Phase 5 — planning + multi-task execution budgets. Kept deliberately small:
 # the point of Phase 5 is better STRUCTURE (plan -> per-task loops), not a
@@ -105,20 +124,37 @@ MAX_REPAIR_STEPS = 10
 # - MAX_TASK_STEPS: per-task tool-loop budget in the multi-task path. Each task
 #   is a focused unit, so it needs far fewer steps than a whole monolithic run.
 MAX_PLAN_STEPS = 6
-# Bumped 12 -> 16: a frontend-heavy task unit (several view components + a state
-# store + filter/group utils + styles) can need a dozen-plus write_file steps
-# plus a little exploration and the final action. At 12, exhaustion marked the
-# unit FAILED, which cascaded its dependents to SKIPPED and collapsed the whole
-# run to `partial` with most files already written. 16 gives realistic headroom
-# while keeping the aggregate budget bounded (<= MAX_TASKS units).
-MAX_TASK_STEPS = 16
+# Bumped 12 -> 16 -> 20: a frontend-heavy task unit (several view components + a
+# state store + filter/group utils + styles) or a from-scratch scaffold writes
+# a dozen-plus files at one write_file per step, plus a little exploration and
+# the final action. At 16 the Aegis scaffold task burned all its steps writing
+# config files and never reached `final`, so it was marked FAILED. 20 gives
+# realistic headroom; the productive-continuation safety net below covers the
+# rare unit that still needs more while it is actively writing files.
+MAX_TASK_STEPS = 20
+
+# Productive-continuation safety net for a per-task unit (multi-task path only).
+# When a task exhausts its step budget WITHOUT finalizing but is still making
+# progress (it wrote at least one new file since the last checkpoint), grant it
+# one more bounded budget so a genuinely heavy unit can finish instead of dying
+# one step short and cascading its dependents. This is "budget extends only for
+# productive work", not a bigger flat loop: a unit that stops writing files gets
+# no extension. The single-task (simple/fallback) path passes
+# max_continuations=0, preserving its legacy exhaustion behavior + tests.
+MAX_TASK_CONTINUATIONS = 1
+TASK_CONTINUATION_STEPS = MAX_TASK_STEPS
 
 # Output-token budget for every Coding Agent LLM call. The agent emits whole
-# files inline as JSON (the write_file ``content`` argument), so llm.chat's
-# default of 2048 truncates a moderately large component mid-string — the JSON
-# action then fails to parse and the task fails. 8192 leaves ample room for a
-# full file plus the JSON envelope; Sonnet supports far more.
-CODING_AGENT_MAX_TOKENS = 8192
+# files inline as JSON (the write_file ``content`` argument), so a too-small
+# budget truncates the file mid-string — the JSON action then fails to parse and
+# the task fails (the default 2048 truncated even a moderate component; the
+# original fix raised it to 8192). A rich seed-data module is much bigger than a
+# component, and at 8192 the Aegis "create seed data" task overflowed and failed
+# with "response is not valid JSON" on EVERY attempt. 16384 (~60 KB of file
+# content) comfortably covers a large data module plus the JSON envelope; the
+# prompt also tells the agent to split a truly huge file across write_file +
+# append_file. Sonnet supports far more, so this stays well within model limits.
+CODING_AGENT_MAX_TOKENS = 16384
 
 # Tools the planner is allowed to call — strictly read-only. Writing / shell
 # happen only in the execution phase. Enforced in the plan loop, not just in
@@ -171,6 +207,12 @@ class CodingAgentRunner:
         # are absent or empty.
         self._observed_files_changed: list[str] = []
         self._observed_commands_run: list[str] = []
+        # Total successful write/append operations (NOT deduplicated). The
+        # productive-continuation check keys off this, not the deduplicated path
+        # list above: a polish/refactor task that OVERWRITES existing files makes
+        # real progress without adding new unique paths, so a unique-path delta
+        # would wrongly read as "no progress" and deny it a continuation.
+        self._observed_write_ops: int = 0
         # AGENT.md text, captured during run_task for the repair pass.
         self._agent_md: str = ""
         # Run control — cooperative cancellation. ``None`` (the default for the
@@ -516,6 +558,9 @@ class CodingAgentRunner:
             )
             self._persist_progress(run_id, record, plan)
 
+            # Surface any dependency that didn't cleanly complete but didn't
+            # block this task (progress-aware skip) so the agent can compensate.
+            degraded = degraded_dependencies(unit, by_id)
             system_prompt = build_system_prompt(self._agent_md, self.project_id, MAX_TASK_STEPS)
             initial = build_task_unit_user_prompt(
                 goal=plan.goal,
@@ -527,11 +572,18 @@ class CodingAgentRunner:
                 plan_outline=_render_plan_outline(tasks, current_id=unit.id),
                 prior_context=_render_prior_context(tasks),
                 task_md=task_md,
+                degraded_dependencies=degraded,
             )
             before_f = len(self._observed_files_changed)
             before_c = len(self._observed_commands_run)
             final_action, loop_failed_reason = self._run_task_unit(
-                run_id, system_prompt, initial, MAX_TASK_STEPS, phase="execution"
+                run_id,
+                system_prompt,
+                initial,
+                MAX_TASK_STEPS,
+                phase="execution",
+                max_continuations=MAX_TASK_CONTINUATIONS,
+                continuation_steps=TASK_CONTINUATION_STEPS,
             )
             self._apply_unit_result(unit, final_action, loop_failed_reason, before_f, before_c)
             run_store.append_event(
@@ -571,6 +623,8 @@ class CodingAgentRunner:
         max_steps: int,
         *,
         phase: str = "execution",
+        max_continuations: int = 0,
+        continuation_steps: int | None = None,
     ) -> tuple[dict | None, str | None]:
         """One bounded JSON tool loop. Returns (final_action, fail_reason).
 
@@ -579,12 +633,64 @@ class CodingAgentRunner:
         list (per-task isolation). Observed file/command activity accumulates
         into the run-scoped ``self._observed_*`` lists (the diagnostic fallback
         + repair-delta in ``_finalize`` depend on run-scope).
+
+        Productive continuation (hardening): if the step budget is exhausted
+        WITHOUT a ``final`` action but the agent wrote at least one new file
+        since the last checkpoint, the budget is extended by
+        ``continuation_steps`` (up to ``max_continuations`` times) with a short
+        "finish up" nudge — so a heavy-but-progressing unit (e.g. a from-scratch
+        scaffold) can finish instead of dying one step short and cascading its
+        dependents. A unit that has stopped producing files gets no extension.
+        ``max_continuations=0`` (the default, used by the single-task path)
+        preserves the legacy exhaustion behavior + its regression tests.
         """
         messages: list[dict[str, str]] = [{"role": "user", "content": initial_user_prompt}]
         final_action: dict | None = None
         loop_failed_reason: str | None = None
 
-        for step in range(1, max_steps + 1):
+        cont_steps = continuation_steps if continuation_steps is not None else max_steps
+        budget = max_steps
+        continuations_used = 0
+        # Progress is measured in successful WRITE OPERATIONS (incl. overwrites),
+        # not unique file paths — a polish/refactor unit that rewrites existing
+        # files is making progress even though it adds no new paths.
+        writes_at_checkpoint = self._observed_write_ops
+        step = 0
+
+        while True:
+            step += 1
+            if step > budget:
+                # Budget exhausted without a final action. Grant a bounded
+                # continuation only while the unit is still productive.
+                progressed = self._observed_write_ops > writes_at_checkpoint
+                if continuations_used < max_continuations and progressed:
+                    continuations_used += 1
+                    writes_at_checkpoint = self._observed_write_ops
+                    budget += cont_steps
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {
+                            "type": "task_continued",
+                            "step": step - 1,
+                            "phase": phase,
+                            "granted_steps": cont_steps,
+                            "continuation": continuations_used,
+                        },
+                    )
+                    messages.append(
+                        {"role": "user", "content": build_continuation_prompt(cont_steps)}
+                    )
+                    # fall through and run another step under the extended budget
+                else:
+                    loop_failed_reason = f"step budget exhausted after {budget} steps"
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {"type": "run_failed", "step": budget, "phase": phase, "error": loop_failed_reason},
+                    )
+                    break
+
             if self._cancelled():
                 raise _RunCancelled()
             try:
@@ -652,14 +758,6 @@ class CodingAgentRunner:
                 {"type": "run_failed", "step": step, "phase": phase, "error": loop_failed_reason},
             )
             break
-        else:
-            # Loop exhausted without final
-            loop_failed_reason = f"step budget exhausted after {max_steps} steps"
-            run_store.append_event(
-                self.project_id,
-                run_id,
-                {"type": "run_failed", "step": max_steps, "phase": phase, "error": loop_failed_reason},
-            )
 
         return final_action, loop_failed_reason
 
@@ -792,6 +890,9 @@ class CodingAgentRunner:
         tool_name = (action.get("tool_name") or "").strip()
         arguments = action.get("arguments") or {}
         if tool_name in {"write_file", "append_file"}:
+            # Count every successful write (incl. overwrites) for the
+            # continuation progress signal.
+            self._observed_write_ops += 1
             path = arguments.get("path") if isinstance(arguments, dict) else None
             if isinstance(path, str) and path and path not in self._observed_files_changed:
                 self._observed_files_changed.append(path)
@@ -1009,15 +1110,17 @@ class CodingAgentRunner:
         for path in self._observed_files_changed:
             if path not in observed_before_verify and path not in record.files_changed:
                 record.files_changed.append(path)
-        if (
-            verification.enabled
-            and verification.status == "failed"
-            and record.status == RunStatus.COMPLETED
-        ):
-            record.status = RunStatus.PARTIAL
-            blocker_msg = f"verification failed: {verification.command or '(unknown command)'}"
-            if blocker_msg not in record.blockers:
-                record.blockers.append(blocker_msg)
+        if verification.enabled and verification.status == "failed":
+            # A `completed` run that fails verification is downgraded to
+            # `partial`; a run that was already `partial` stays `partial`. Either
+            # way, record the failing command as a blocker so the run report is
+            # honest about why the build/check didn't pass.
+            if record.status == RunStatus.COMPLETED:
+                record.status = RunStatus.PARTIAL
+            if record.status == RunStatus.PARTIAL:
+                blocker_msg = f"verification failed: {verification.command or '(unknown command)'}"
+                if blocker_msg not in record.blockers:
+                    record.blockers.append(blocker_msg)
         # Settle the transient verification sub-status now that the phase is done.
         record.verification_state = None
         run_store.append_event(
@@ -1152,11 +1255,13 @@ class CodingAgentRunner:
         task: TaskSpec,
         pre_update_task_md: str,
     ) -> VerificationResult:
-        """Run command verification, with one bounded repair pass on failure.
+        """Run command verification, with bounded iterative repair on failure.
 
-        Returns the final :class:`VerificationResult`. Never raises — any
-        unexpected error is folded into a ``failed`` aggregate so background
-        finalization is never interrupted.
+        Up to ``MAX_REPAIR_ATTEMPTS`` repair→re-verify cycles run while the build
+        still fails and the run produced output worth fixing. Returns the final
+        :class:`VerificationResult`. Never raises — any unexpected error is folded
+        into a ``failed`` aggregate so background finalization is never
+        interrupted.
         """
         try:
             mode, specs = plan_verification(
@@ -1182,40 +1287,100 @@ class CodingAgentRunner:
             self.project_id, specs, mode=mode, runtime=self.runtime
         )
 
-        # Only attempt a repair when the run would otherwise be `completed` and
-        # verification actually failed. Other terminal statuses are left alone.
-        if not (verification.status == "failed" and record.status == RunStatus.COMPLETED):
+        # Attempt a bounded repair when verification failed AND the run produced
+        # real output worth fixing. Originally this fired only for `completed`
+        # runs; extended to `partial` runs too (hardening): a multi-task run can
+        # land `partial` because one task didn't finish, yet still carry a fixable
+        # build error (e.g. a TypeScript export conflict — TS2484) that blocks the
+        # whole app from building. Repairing it makes the build green so browser
+        # verification / preview can proceed. `blocked` / `failed` runs and runs
+        # with no files changed (nothing usable to repair) are left alone.
+        repairable = record.status in (RunStatus.COMPLETED, RunStatus.PARTIAL) and bool(
+            record.files_changed
+        )
+        if not (verification.status == "failed" and repairable):
             return verification
 
-        record.verification_state = "repairing"
-        run_store.write_run_json(self.project_id, run_id, record)
-        run_store.append_event(
-            self.project_id,
-            run_id,
-            {"type": "verification_repair_started", "command": verification.command},
-        )
+        # Iterative repair (hardening): a single repair pass is rarely enough for
+        # a real multi-file build, where type/import errors surface in waves — the
+        # first pass fixes most, a re-verify reveals a few stragglers (or a fix
+        # exposes a downstream error). Loop up to MAX_REPAIR_ATTEMPTS times:
+        # repair against the LATEST failing output, re-verify, repeat until it
+        # passes, a pass changes nothing / the LLM is unavailable, or the budget
+        # is spent. Each pass is itself bounded (MAX_REPAIR_STEPS), so total work
+        # stays tightly capped. ``repair_attempts`` records the count for the UI.
+        attempts = 0
+        while (
+            verification.status == "failed"
+            and repairable
+            and attempts < MAX_REPAIR_ATTEMPTS
+        ):
+            record.verification_state = "repairing"
+            run_store.write_run_json(self.project_id, run_id, record)
+            run_store.append_event(
+                self.project_id,
+                run_id,
+                {
+                    "type": "verification_repair_started",
+                    "attempt": attempts + 1,
+                    "command": verification.command,
+                },
+            )
 
-        repaired = self._run_repair_pass(run_id, verification)
-        if not repaired:
-            # Repair could not run (e.g. LLM unavailable) or changed nothing —
-            # keep the original failed verification, just record the attempt.
-            verification.repair_attempts = 1
-            return verification
+            repaired = self._run_repair_pass(run_id, verification)
+            if not repaired:
+                # Repair could not run (LLM unavailable) or changed nothing —
+                # further passes would be identical, so stop. Record at least one
+                # attempt so the UI/report shows repair was tried.
+                verification.repair_attempts = max(attempts, 1)
+                break
 
-        # Re-run the same specs after the repair pass.
-        reverified = run_verification_specs(
-            self.project_id, specs, mode=mode, runtime=self.runtime, repair_attempts=1
-        )
-        run_store.append_event(
-            self.project_id,
-            run_id,
-            {
-                "type": "verification_reverified",
-                "status": reverified.status,
-                "command": reverified.command,
-            },
-        )
-        return reverified
+            attempts += 1
+            verification = run_verification_specs(
+                self.project_id, specs, mode=mode, runtime=self.runtime, repair_attempts=attempts
+            )
+            run_store.append_event(
+                self.project_id,
+                run_id,
+                {
+                    "type": "verification_reverified",
+                    "attempt": attempts,
+                    "status": verification.status,
+                    "command": verification.command,
+                },
+            )
+
+        return verification
+
+    def _collect_repair_file_context(self, verification: VerificationResult) -> str:
+        """Pre-read the files named in the failing output for the repair prompt.
+
+        Inlining the current contents lets the repair agent rewrite them
+        immediately rather than burning its bounded step budget on reads/searches
+        (an unguarded repair agent spent all its steps investigating and wrote
+        zero fixes). Only fully-readable (non-truncated) files are inlined — a
+        truncated file is skipped so the agent never rewrites a partial file and
+        drops content. Bounded in file count + total size.
+        """
+        paths = _extract_error_file_paths(verification)
+        blocks: list[str] = []
+        total = 0
+        for path in paths[:_MAX_REPAIR_CONTEXT_FILES]:
+            try:
+                res = self.runtime.read_file(path)
+            except Exception:  # noqa: BLE001
+                continue
+            if not res.success or not res.output:
+                continue
+            meta = res.metadata or {}
+            if meta.get("truncated"):
+                continue
+            content = res.output
+            if total + len(content) > _MAX_REPAIR_CONTEXT_CHARS:
+                break
+            total += len(content)
+            blocks.append(f"### {path}\n```\n{content}\n```")
+        return "\n\n".join(blocks)
 
     def _run_repair_pass(self, run_id: str, verification: VerificationResult) -> bool:
         """Give the Coding Agent one bounded pass to fix a failed verification.
@@ -1227,11 +1392,17 @@ class CodingAgentRunner:
         """
         try:
             failures = _format_verification_failures(verification)
+            files_context = self._collect_repair_file_context(verification)
             system_prompt = build_system_prompt(
                 self._agent_md, self.project_id, MAX_REPAIR_STEPS
             )
             messages: list[dict[str, str]] = [
-                {"role": "user", "content": build_repair_user_prompt(failures, MAX_REPAIR_STEPS)}
+                {
+                    "role": "user",
+                    "content": build_repair_user_prompt(
+                        failures, MAX_REPAIR_STEPS, files_context
+                    ),
+                }
             ]
             mutations = 0
 
@@ -1250,6 +1421,40 @@ class CodingAgentRunner:
                     break
 
                 if action.get("action") == "tool_call":
+                    tool_name = (action.get("tool_name") or "").strip()
+                    if tool_name == "run_shell":
+                        # Hard-block run_shell during repair (enforced, not just
+                        # prompted): verification reruns automatically after this
+                        # pass, so a repair must spend its bounded budget EDITING
+                        # files. In practice an unguarded repair agent burns all
+                        # its steps re-running `tsc` / `npm run build` to "check"
+                        # and writes zero fixes — the pass then looks like it made
+                        # no progress and the iterative loop gives up early.
+                        msg = (
+                            "run_shell is disabled during the repair pass — Agent OS "
+                            "reruns verification automatically after you finalize. Do "
+                            "not run build/test commands. Read the file(s) named in the "
+                            "errors and write the corrected versions, then emit final."
+                        )
+                        run_store.append_event(
+                            self.project_id,
+                            run_id,
+                            {
+                                "type": "tool_result",
+                                "step": step,
+                                "phase": "repair",
+                                "tool_name": "run_shell",
+                                "success": False,
+                                "error": msg,
+                            },
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": build_tool_result_prompt("run_shell", False, msg),
+                            }
+                        )
+                        continue
                     tool_result, dispatched = self._dispatch_tool(run_id, step, action, phase="repair")
                     self._observe_tool_result(action, tool_result)
                     if tool_result.success and dispatched["tool_name"] in {
@@ -1278,6 +1483,33 @@ class CodingAgentRunner:
 
 
 # ---------- helpers ----------
+
+
+# Matches a repo-relative file path with an extension followed by a line marker
+# in compiler/test output: ``src/pages/Dashboard.tsx(181,11)`` (TS) or
+# ``backend/app.py:12`` (Python/most tools). Captures the path.
+_ERROR_FILE_PATH_REGEX = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_./\-]*\.[A-Za-z0-9]+)[(:]\d+")
+# Bound how much pre-read file context we inject into a repair prompt. 10 files
+# (was 6): a multi-file build error often names a dozen+ files, and pre-reading
+# more of them lets a single repair pass rewrite more in one go — fewer passes to
+# converge.
+_MAX_REPAIR_CONTEXT_FILES = 10
+_MAX_REPAIR_CONTEXT_CHARS = 16_000
+
+
+def _extract_error_file_paths(verification: VerificationResult) -> list[str]:
+    """Pull repo-relative file paths out of the failing verification output.
+
+    Ordered + de-duplicated. Used to pre-read the offending files into the
+    repair prompt so the agent can rewrite them without hunting.
+    """
+    text = _format_verification_failures(verification)
+    paths: list[str] = []
+    for m in _ERROR_FILE_PATH_REGEX.finditer(text):
+        p = m.group(1).replace("\\", "/").lstrip("./")
+        if p and p not in paths:
+            paths.append(p)
+    return paths
 
 
 def _format_verification_failures(verification: VerificationResult) -> str:

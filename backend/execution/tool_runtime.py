@@ -334,11 +334,19 @@ class ToolRuntime:
         # the UTF-8 box-drawing / emoji output npm + Vite emit — which would
         # otherwise drop captured output (or, in a Popen drainer, kill the reader
         # thread). errors="replace" keeps logs readable instead.
+        # stdin is closed (DEVNULL) so an interactive command can never hang the
+        # loop waiting for input it will never get. Scaffolders like
+        # ``npm create vite@latest`` / ``create-react-app`` / a bare ``npm init``
+        # prompt for confirmation; inheriting a non-TTY stdin they would block
+        # until the timeout (a wasted step + minutes of latency), as happened on
+        # the first Aegis build. With stdin at EOF they fail fast instead, and
+        # the agent falls back to writing config files directly.
         try:
             proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(repo),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

@@ -213,11 +213,14 @@ Events now carry a `phase` tag (`planning`/`execution`/`repair`) plus
    else `compileall` syntax check; else `skipped`.
 2. Write `verification_state = "verifying"`; run specs in order, **stop at first
    failure**.
-3. If a `completed` run failed verification → `verification_state =
-   "repairing"`, run **one** bounded repair pass (agent re-edits with the
-   failing output), then **re-verify**.
-4. Pass → stay `completed`; still failing → `partial` + a `verification failed:`
-   blocker. Clear `verification_state`.
+3. If a `completed` **or `partial`** run that produced files failed verification
+   → `verification_state = "repairing"`, run a **bounded iterative repair loop**
+   (`MAX_REPAIR_ATTEMPTS`): each pass pre-reads the files named in the errors into
+   the prompt, re-edits them (`run_shell` is blocked during repair), then
+   **re-verifies**; repeat until green, a pass changes nothing, or the cap is hit.
+4. Pass → keep status; still failing → a `completed` run downgrades to `partial`,
+   and either way a `verification failed:` blocker is recorded. Clear
+   `verification_state`.
 
 ### E. Browser preview — `browser_verification.py` + `preview.py`
 User clicks **Run browser verification** → `POST …/browser-verify`:
@@ -329,11 +332,33 @@ when nothing safe can run.
   the same NTFS volume) — see `run_store._atomic_write_text`.
 - **The agent writes whole files inline as JSON, so cap output high.** A
   `write_file` of a real component overflows a 2048-token default and truncates
-  the JSON mid-string → the action won't parse → the task fails. The Coding Agent
-  loop uses `CODING_AGENT_MAX_TOKENS = 8192`.
+  the JSON mid-string → the action won't parse → the task fails. A rich seed-data
+  module is bigger still and failed every time at 8192, so the Coding Agent loop
+  uses `CODING_AGENT_MAX_TOKENS = 16384` and the prompt tells the agent to split a
+  very large file across `write_file` + `append_file`.
 - **Pinned model ids go stale.** `claude-sonnet-4-20250514` now 404s; a dead
   default model breaks every LLM call. The default is a current alias
   (`claude-sonnet-4-5`), overridable via `AGENT_OS_CLAUDE_MODEL`.
+- **A transient LLM blip must not kill a task.** One mid-run "Connection error"
+  used to fail a task and cascade its dependents to `skipped`. `llm.chat` retries
+  transient errors (connection/timeout/429/5xx) with backoff; deterministic ones
+  (auth/4xx) are not retried.
+- **The agent can hallucinate completion.** It once finalized a scaffold task as
+  `completed` after writing only `package.json`, fabricating the rest in
+  `files_changed`. Command verification (the real `npm run build`) is the ground
+  truth that catches this; the prompt also forbids claiming unwritten files.
+- **One repair pass isn't enough for a real build.** Multi-file builds shed
+  type/import errors in waves; repair is now an iterative loop that pre-reads the
+  erroring files and blocks `run_shell` (an unguarded repair agent spent every
+  step re-running `tsc` and wrote no fix). It recovered even a hallucinated,
+  scaffold-missing repo to a green build.
+- **Preview starts only the frontend.** Browser verification runs `npm run dev`
+  alone — an app fetching from a separately-launched backend screenshots as a
+  stuck "Loading…". The agent is told to bundle seed data in the frontend so the
+  preview renders populated.
+- **"Progress" for a continuation = write ops, not unique paths.** A polish pass
+  that overwrites existing files makes progress without adding new paths; the
+  budget-extension check counts successful writes, not deduplicated path count.
 
 ---
 

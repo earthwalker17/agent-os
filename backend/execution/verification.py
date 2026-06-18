@@ -52,8 +52,16 @@ DEFAULT_VERIFY_TIMEOUT_SECONDS = 120
 # Per-kind timeouts for inferred commands. ``npm install`` on a cold cache
 # is slow, so it gets a generous budget; a build sits between that and a
 # focused test run; a syntax check is fast.
-_INSTALL_TIMEOUT_SECONDS = 300
-_BUILD_TIMEOUT_SECONDS = 240
+#
+# Install gets the full sandbox ceiling (``ToolRuntime`` clamps run_shell to
+# 600 s): a cold ``npm install`` for a real Vite + React + TypeScript +
+# Tailwind app on Windows (with Defender scanning every extracted file) can
+# run well past 300 s — the Aegis Launch Control build timed out at 300 s on
+# the first attempt, marking the whole run failed and leaving node_modules
+# half-populated. 600 s gives that install room to finish on a cold machine
+# while still bounding worst-case latency.
+_INSTALL_TIMEOUT_SECONDS = 600
+_BUILD_TIMEOUT_SECONDS = 300
 _TEST_TIMEOUT_SECONDS = 180
 _SYNTAX_TIMEOUT_SECONDS = 60
 

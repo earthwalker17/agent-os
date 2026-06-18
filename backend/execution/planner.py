@@ -282,17 +282,82 @@ def topological_order(tasks: list[ExecutionTask]) -> list[ExecutionTask]:
     return [by_id[tid] for tid in ordered_ids]
 
 
+def _dependency_provides_output(dep: ExecutionTask) -> bool:
+    """True if a dependency produced something a dependent can build on.
+
+    A COMPLETED dependency obviously qualifies. A FAILED dependency that still
+    wrote files (e.g. a scaffold task that laid down package.json + config but
+    exhausted its step budget before emitting ``final``) also qualifies — its
+    output is on disk and a dependent can use it, possibly after the post-run
+    repair pass. A SKIPPED dependency never ran, so it provides nothing.
+    """
+    if dep.status == TaskStatus.COMPLETED:
+        return True
+    if dep.status == TaskStatus.FAILED and dep.files_changed:
+        return True
+    return False
+
+
 def dependency_failed(
     task: ExecutionTask, by_id: dict[str, ExecutionTask]
 ) -> Optional[str]:
-    """Return a reason string if any dependency failed/was skipped, else None."""
-    for dep_id in task.depends_on:
-        dep = by_id.get(dep_id)
-        if dep is None:
+    """Return a skip reason when a task cannot proceed, else None.
+
+    Progress-aware (hardening): a dependent is skipped only when NONE of its
+    dependencies produced usable output. If at least one dependency completed —
+    or failed but left files on disk — the task RUNS even though other
+    dependencies failed/were skipped; the runner hands the incomplete ones to
+    the task as a degraded-dependency note (see :func:`degraded_dependencies`)
+    so it can compensate (e.g. inline minimal data). This stops one brittle
+    task from collapsing an entire multi-task run through the skip cascade — the
+    failure mode that skipped six/seven downstream tasks in the Aegis build
+    after a single upstream task failed.
+
+    Returns ``None`` when there are no dependencies or at least one provides
+    output; otherwise a reason naming the unsatisfied dependencies.
+    """
+    deps = [by_id[d] for d in task.depends_on if d in by_id]
+    if not deps:
+        return None
+    # Only resolved (terminal) dependencies can block. A dependency still
+    # PENDING/RUNNING is not-yet-decided and must not block — this matches the
+    # pre-hardening behavior and preserves topological_order's cycle-remainder
+    # guarantee (a task left in a dependency cycle is still run, not silently
+    # skipped). On the normal forward path deps are always terminal here.
+    terminal = [
+        d
+        for d in deps
+        if d.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED)
+    ]
+    if not terminal:
+        return None
+    if any(_dependency_provides_output(d) for d in terminal):
+        return None
+    return "; ".join(
+        f"dependency {d.id!r} did not complete ({d.status.value})" for d in terminal
+    )
+
+
+def degraded_dependencies(
+    task: ExecutionTask, by_id: dict[str, ExecutionTask]
+) -> list[str]:
+    """Short notes for dependencies that didn't cleanly complete but didn't block.
+
+    Only meaningful for a task that IS going to run (``dependency_failed``
+    returned ``None``). Each entry is a human-readable description the runner
+    folds into the task-unit prompt so the agent knows which upstream outputs
+    may be missing or incomplete and can work around them.
+    """
+    notes: list[str] = []
+    for dep in (by_id[d] for d in task.depends_on if d in by_id):
+        if dep.status == TaskStatus.COMPLETED:
             continue
-        if dep.status in (TaskStatus.FAILED, TaskStatus.SKIPPED):
-            return f"dependency {dep_id!r} did not complete ({dep.status.value})"
-    return None
+        if dep.status == TaskStatus.FAILED and dep.files_changed:
+            state = "incomplete (wrote some files but did not finish)"
+        else:
+            state = dep.status.value
+        notes.append(f"{dep.id} ({dep.title}): {state}")
+    return notes
 
 
 def task_status_from_final(final_status: str) -> TaskStatus:

@@ -373,6 +373,74 @@ verification semantics are unchanged.
   false-positives (left untouched to avoid weakening the sandbox), and the unused
   `steps_used` field.
 
+### Autonomous complex-build hardening ("Aegis Launch Control" pass)
+A cinematic full-stack React+Vite+TS demo ("Aegis Launch Control" — a polished
+mission-control dashboard with 6 sections, seeded data, filtering, and a scenario
+simulator) repeatedly failed to build autonomously. Two failed runs were studied
+as evidence, the root causes were traced **into Agent OS** (not the generated
+app), then fixed and re-validated by dispatching fresh builds through the normal
+runner path until one completed clean with a populated browser preview. Sandbox
+chokepoint, role separation, explicit dispatch, and verification semantics are
+unchanged. The fixes, each tied to an observed failure mode:
+- **LLM transient-error resilience** (`llm.py`). A single mid-run "Connection
+  error" used to kill a task (run 2 lost `t2` this way) and cascade its
+  dependents to `skipped`. `chat()` now retries *transient* failures
+  (connection/timeout/429/5xx/overloaded) with bounded exponential backoff;
+  deterministic failures (bad key, 400/401/404, unknown provider) are never
+  retried. Env-tunable (`AGENT_OS_LLM_MAX_RETRIES` / `_RETRY_BASE_DELAY`).
+- **Progress-aware dependency skip** (`planner.py`). A dependent is now skipped
+  only when NO dependency produced usable output — a dep that FAILED but left
+  files on disk (e.g. a scaffold that ran out of steps) no longer cascades the
+  whole run to `skipped`. `degraded_dependencies()` feeds the incomplete ones to
+  the dependent as a "compensate / inline minimal data" note. Only *terminal*
+  deps can block, so `topological_order`'s cycle-remainder guarantee is preserved.
+- **Productive continuation** (`runner._run_task_unit`). A task that exhausts its
+  step budget WITHOUT finalizing but is still writing files gets one bounded
+  budget extension (multi-task path; `MAX_TASK_CONTINUATIONS`), so a heavy
+  scaffold/polish unit finishes instead of dying one step short. Progress is
+  measured in **write operations, not unique paths** — a polish pass that
+  overwrites existing files counts as progress. `MAX_TASK_STEPS` 16 → 20.
+- **Iterative repair** (`runner._verify_with_repair`). The single post-verify
+  repair pass became a bounded loop (`MAX_REPAIR_ATTEMPTS = 5`): a real
+  multi-file build sheds type/import errors in waves, so repair runs
+  repair→re-verify until green, a pass changes nothing, or the cap is hit.
+  Repair now also fires on `partial` runs that produced files (was `completed`
+  only), so a build error on an otherwise-incomplete run still gets fixed. Each
+  pass **pre-reads the files named in the errors** into the prompt (so the agent
+  rewrites them immediately instead of burning its budget hunting), `run_shell`
+  is **hard-blocked** during repair (an unguarded agent wasted every step
+  re-running `tsc`), and `MAX_REPAIR_STEPS` 10 → 18. This recovered even a
+  doubly-broken run (hallucinated scaffold + failed seed data) to a green build.
+- **Truthful completion + scaffold/TS prompt rules** (`prompts.py`). The Coding
+  Agent once finalized `t1` as `completed` after writing only `package.json`,
+  hallucinating the rest of the scaffold. The prompt now forbids claiming
+  unwritten files, says "write every required file before finalizing — a
+  package.json alone is not a scaffold", forbids interactive scaffolders
+  (`npm create vite` hangs/blanks), and warns against the duplicate-export
+  TS2484 pattern (inline `export` + a trailing re-export block) that broke the
+  original build.
+- **Big-file write budget** (`runner`). The seed-data task overflowed the 8192
+  output-token budget and failed every time with "response is not valid JSON".
+  `CODING_AGENT_MAX_TOKENS` 8192 → 16384, plus a prompt rule to split a very
+  large file across `write_file` + `append_file`.
+- **Previewable-architecture guidance** (`prompts.py`). Browser verification /
+  preview starts only the frontend dev server; an app that fetched from a
+  separately-launched backend screenshotted as a stuck "Loading…". The prompt now
+  tells the agent to bundle seed/mock data in the frontend (a static import) so
+  `npm run dev` renders populated, and to fall back to bundled data if a separate
+  API is unreachable.
+- **Non-interactive shell + install timeout** (`tool_runtime.py`,
+  `verification.py`). `run_shell` runs with `stdin=DEVNULL` so an interactive
+  scaffolder fails fast instead of hanging to timeout. The inferred `npm install`
+  timeout 300 → 600 s (the sandbox ceiling) — a cold Vite+React+Tailwind install
+  on Windows exceeded 300 s and timed out, failing the whole run.
+- **Re-test outcome.** Fresh builds dispatched through the normal runner path now
+  complete autonomously: a run reached `completed` with `npm install` +
+  `npm run build` both green, and a frontend-bundled run rendered a fully
+  populated, demo-grade dashboard under headless browser verification (dev server
+  on 5174 → Playwright screenshot). 15 new backend tests guard the fixes
+  (`test_llm_retry.py`, `test_autonomy_hardening.py`); full suite green.
+
 ---
 
 ## Execution-trigger contract (invariant)
@@ -436,7 +504,9 @@ Anthropic key is needed. Each file is runnable standalone.
 | `test_planner.py`                 |    28 | Phase 5 heuristic gate (+ clause heuristic), plan parse/fallback, graph + aggregation |
 | `test_runner_planning.py`         |     7 | Phase 5 plan→tasks integration: decompose, skip, fallback, gate, artifact consistency |
 | `test_run_control.py`             |    15 | Run control: events/task-card readers, cooperative cancel, cancel/retry endpoints, orphan + race guard, orphan plan-settle, retry-of-cancelled |
-| **Total**                         | **282** |                                                            |
+| `test_llm_retry.py`               |     4 | Autonomy hardening: transient-vs-permanent LLM error classification, retry-then-succeed, no-retry-on-deterministic, exhaust-then-raise |
+| `test_autonomy_hardening.py`      |    11 | Autonomy hardening: progress-aware dependency skip (+cycle remainder), productive continuation (incl. overwrite), failed-with-files dependent runs, repair on partial, iterative-repair convergence |
+| **Total**                         | **297** |                                                            |
 
 Run all (from `backend/`): `python tests/<file>.py` for each row above.
 
