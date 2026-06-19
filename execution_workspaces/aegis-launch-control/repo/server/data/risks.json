@@ -1,0 +1,98 @@
+[
+  {
+    "id": "risk-1",
+    "title": "Weather Window Constraints",
+    "description": "Limited launch windows due to seasonal weather patterns",
+    "category": "environmental",
+    "probability": "high",
+    "impact": "high",
+    "severity": "critical",
+    "mitigation": "Extended weather monitoring, backup launch dates identified",
+    "owner": "James O'Connor",
+    "status": "active"
+  },
+  {
+    "id": "risk-2",
+    "title": "Regulatory Approval Delays",
+    "description": "FAA license approval timeline uncertainty",
+    "category": "regulatory",
+    "probability": "medium",
+    "impact": "high",
+    "severity": "high",
+    "mitigation": "Early engagement with regulators, parallel workstreams",
+    "owner": "Lisa Kim",
+    "status": "active"
+  },
+  {
+    "id": "risk-3",
+    "title": "Propulsion System Integration",
+    "description": "Complex integration points between stages",
+    "category": "technical",
+    "probability": "medium",
+    "impact": "critical",
+    "severity": "high",
+    "mitigation": "Additional integration testing, design reviews completed",
+    "owner": "Marcus Rodriguez",
+    "status": "mitigated"
+  },
+  {
+    "id": "risk-4",
+    "title": "Supply Chain Disruptions",
+    "description": "Critical component delivery dependencies",
+    "category": "supply-chain",
+    "probability": "medium",
+    "impact": "medium",
+    "severity": "medium",
+    "mitigation": "Dual sourcing strategy, buffer inventory maintained",
+    "owner": "Sarah Chen",
+    "status": "active"
+  },
+  {
+    "id": "risk-5",
+    "title": "Range Safety Certification",
+    "description": "Flight termination system validation requirements",
+    "category": "safety",
+    "probability": "low",
+    "impact": "critical",
+    "severity": "high",
+    "mitigation": "Comprehensive testing program, third-party validation",
+    "owner": "David Zhang",
+    "status": "monitoring"
+  },
+  {
+    "id": "risk-6",
+    "title": "Payload Integration Schedule",
+    "description": "Customer payload delivery timing",
+    "category": "schedule",
+    "probability": "medium",
+    "impact": "medium",
+    "severity": "medium",
+    "mitigation": "Regular customer coordination, contingency timeline",
+    "owner": "Dr. Aisha Patel",
+    "status": "active"
+  },
+  {
+    "id": "risk-7",
+    "title": "Avionics Software Validation",
+    "description": "Flight software testing and certification",
+    "category": "technical",
+    "probability": "low",
+    "impact": "high",
+    "severity": "medium",
+    "mitigation": "Rigorous test coverage, independent verification",
+    "owner": "Dr. Aisha Patel",
+    "status": "monitoring"
+  },
+  {
+    "id": "risk-8",
+    "title": "Budget Overrun Potential",
+    "description": "Cost pressures from scope changes",
+    "category": "financial",
+    "probability": "medium",
+    "impact": "medium",
+    "severity": "medium",
+    "mitigation": "Strict change control process, contingency reserves",
+    "owner": "Sarah Chen",
+    "status": "active"
+  }
+]

@@ -1,0 +1,61 @@
+[
+  {
+    "id": "scenario-1",
+    "name": "Nominal Timeline",
+    "description": "All systems green, nominal weather, on-schedule execution",
+    "probability": 0.65,
+    "impacts": [
+      { "area": "Launch Date", "change": "No change", "severity": "positive" },
+      { "area": "Budget", "change": "Within 2% variance", "severity": "positive" },
+      { "area": "Risk Level", "change": "Low", "severity": "positive" }
+    ]
+  },
+  {
+    "id": "scenario-2",
+    "name": "Weather Delay (7 days)",
+    "description": "Unfavorable weather pushes launch window by one week",
+    "probability": 0.25,
+    "impacts": [
+      { "area": "Launch Date", "change": "+7 days", "severity": "warning" },
+      { "area": "Budget", "change": "+$1.2M (extended ops)", "severity": "warning" },
+      { "area": "Risk Level", "change": "Medium", "severity": "warning" },
+      { "area": "Team Morale", "change": "Minor impact", "severity": "neutral" }
+    ]
+  },
+  {
+    "id": "scenario-3",
+    "name": "Regulatory Hold",
+    "description": "FAA requires additional documentation, 14-21 day delay",
+    "probability": 0.15,
+    "impacts": [
+      { "area": "Launch Date", "change": "+14-21 days", "severity": "critical" },
+      { "area": "Budget", "change": "+$2.8M (compliance & ops)", "severity": "critical" },
+      { "area": "Risk Level", "change": "High", "severity": "critical" },
+      { "area": "Regulatory", "change": "Additional audits required", "severity": "critical" }
+    ]
+  },
+  {
+    "id": "scenario-4",
+    "name": "Technical Anomaly",
+    "description": "Minor technical issue identified during final checks",
+    "probability": 0.18,
+    "impacts": [
+      { "area": "Launch Date", "change": "+3-5 days", "severity": "warning" },
+      { "area": "Budget", "change": "+$800K (troubleshooting)", "severity": "warning" },
+      { "area": "Engineering", "change": "Additional testing cycle", "severity": "warning" },
+      { "area": "Risk Level", "change": "Medium-High", "severity": "warning" }
+    ]
+  },
+  {
+    "id": "scenario-5",
+    "name": "Accelerated Timeline",
+    "description": "All workstreams complete early, advance launch by 3 days",
+    "probability": 0.08,
+    "impacts": [
+      { "area": "Launch Date", "change": "-3 days", "severity": "positive" },
+      { "area": "Budget", "change": "-$600K (reduced ops time)", "severity": "positive" },
+      { "area": "Risk Level", "change": "Low", "severity": "positive" },
+      { "area": "Team Morale", "change": "Strong positive impact", "severity": "positive" }
+    ]
+  }
+]

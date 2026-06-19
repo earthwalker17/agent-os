@@ -1,0 +1,62 @@
+[
+  {
+    "id": "engineering",
+    "name": "Engineering & Design",
+    "description": "Vehicle systems, propulsion, and structural engineering",
+    "lead": "Marcus Rodriguez",
+    "color": "#8B5CF6",
+    "progress": 82,
+    "taskCount": 8,
+    "completedTaskCount": 6
+  },
+  {
+    "id": "systems",
+    "name": "Systems Integration",
+    "description": "Payload integration, avionics, and software systems",
+    "lead": "Dr. Aisha Patel",
+    "color": "#EC4899",
+    "progress": 71,
+    "taskCount": 7,
+    "completedTaskCount": 5
+  },
+  {
+    "id": "operations",
+    "name": "Launch Operations",
+    "description": "Range operations, ground systems, and mission control",
+    "lead": "James O'Connor",
+    "color": "#10B981",
+    "progress": 58,
+    "taskCount": 9,
+    "completedTaskCount": 4
+  },
+  {
+    "id": "regulatory",
+    "name": "Regulatory & Compliance",
+    "description": "FAA licensing, environmental compliance, safety approvals",
+    "lead": "Lisa Kim",
+    "color": "#F59E0B",
+    "progress": 45,
+    "taskCount": 6,
+    "completedTaskCount": 2
+  },
+  {
+    "id": "safety",
+    "name": "Safety & Risk",
+    "description": "Flight safety, range safety, and hazard analysis",
+    "lead": "David Zhang",
+    "color": "#EF4444",
+    "progress": 63,
+    "taskCount": 5,
+    "completedTaskCount": 3
+  },
+  {
+    "id": "mission-command",
+    "name": "Mission Command",
+    "description": "Mission planning, timeline coordination, stakeholder management",
+    "lead": "Sarah Chen",
+    "color": "#3B82F6",
+    "progress": 75,
+    "taskCount": 6,
+    "completedTaskCount": 4
+  }
+]
