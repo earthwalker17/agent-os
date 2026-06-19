@@ -46,6 +46,12 @@ build. Agent OS planned the work into an **8-task dependency graph**, executed i
 task-by-task, and verified the result with a real `npm install` + `npm run build`
 (passed). All 8 tasks completed with zero blockers.
 
+[![Aegis Launch Control dashboard](./execution_workspaces/aegis-launch-control/preview.png)](./execution_workspaces/aegis-launch-control/SHOWCASE.md)
+
+Notably, this run was driven by **Claude Sonnet 4.5** — a mid-tier model, not
+the strongest available — so it's a useful *lower bound* on what the system can
+produce.
+
 The full generated source plus the complete run evidence — the task card, the
 plan, a chronological log of every tool call, the build log, and the
 browser-verification capture — are committed under

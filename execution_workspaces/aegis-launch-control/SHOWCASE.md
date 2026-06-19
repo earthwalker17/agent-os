@@ -7,6 +7,18 @@ natural-language task card. No human wrote any of the application code, fixed
 its build, or edited its files. It is committed here as a concrete example of
 what Agent OS can do today.
 
+![Aegis Launch Control — the Overview tab, running locally with the bundled API online](./preview.png)
+
+*The running app: the Overview tab with the Express API online — countdown,
+readiness gauge, budget/tasks/risk metrics, and the six workstreams. Captured
+by starting the app locally (`npm run dev:all`).*
+
+> **Built by Claude Sonnet 4.5.** The Coding Agent for this run was driven by
+> **Claude Sonnet 4.5** — deliberately *not* the strongest model available.
+> That a mid-tier model produced a complete, building full-stack app end to end
+> makes this a useful *lower bound* on what Agent OS can do; stronger models
+> only raise the ceiling.
+
 > Every *other* project and workspace stays private (gitignored). Only this one
 > demo is published, and only its source + run evidence — the regenerable
 > `node_modules/`, `dist/`, and `logs/` are excluded.
@@ -62,21 +74,23 @@ Everything the agent did is replayable from the run artifacts in
 | `run.json` | The full structured run record |
 | `screenshots/browser.png` | The automated browser-verification capture |
 
-## About the screenshot
+## Two screenshots — what's what
 
-[`screenshots/browser.png`](./runs/20260619-044436-e65d2e61/screenshots/browser.png)
-is the **automated** headless capture from browser verification, and it shows
-the app's **loading state**, not the populated dashboard. That's a known,
-documented limitation of single-server preview — not a build failure:
+- **[`preview.png`](./preview.png)** (shown above) is the **real, populated
+  app**, captured by running it locally with both servers up (`npm run dev:all`,
+  "API Online"). This is what the dashboard actually looks like.
+- **[`runs/.../screenshots/browser.png`](./runs/20260619-044436-e65d2e61/screenshots/browser.png)**
+  is the **automated** capture taken by Agent OS during the autonomous run, and
+  it shows the app's **loading state**, not the populated dashboard. That's a
+  known, documented limitation of single-server preview — not a build failure:
+  - Browser verification starts only the **frontend** dev server (`npm run dev`).
+  - This build wired the UI to fetch from the **separate Express API**, which
+    that single-server preview doesn't start, so the capture landed during load.
+  - The app ships a static-data fallback for frontend-only use; the **production
+    build itself passes** (see the build log in `result.md`).
 
-- Browser verification starts only the **frontend** dev server (`npm run dev`).
-- This particular build wired the UI to fetch from the **separate Express API**,
-  which that single-server preview doesn't start, so the capture landed during
-  load.
-- The app ships a static-data fallback for frontend-only use; the **production
-  build itself passes** (see the build log in `result.md`).
-
-To see it fully populated, run it yourself (below).
+  (Teaching Agent OS's browser verification to bring up a bundled API for this
+  case is a known follow-up.)
 
 ## Run it yourself
 
