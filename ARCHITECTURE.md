@@ -117,7 +117,7 @@ conversations, messages, and pending executions.
 | `prompts.py`               | Coding Agent system prompt + per-step / correction / **repair** prompts; **Phase 5** planning + per-task-unit prompts. |
 | `planner.py`               | **Phase 5** — pure planning layer: `looks_complex` heuristic gate, tolerant `parse_plan`, `fallback_plan`, task-graph helpers (`topological_order` cycle-safe, `dependency_failed`, `aggregate_run_status`). |
 | `run_store.py`             | Per-run artifact reader/writer; `render_result_md`; `sweep_stuck_runs`; **Phase 5** `write/read_plan_json` + result.md task section; **run control** `read_events` (timeline) + `read_task_card` (retry source). |
-| `runner.py`                | `CodingAgentRunner`: **Phase 5 phased run** — plan phase → per-task execution loops → finalize, **verification + repair** orchestration. **Run control:** cooperative `cancel_event` checked at step boundaries → `_finalize_cancelled` (terminal `cancelled`, no verify/reconcile). |
+| `runner.py`                | `CodingAgentRunner`: **Phase 5 phased run** — plan phase → per-task execution loops → finalize, **verification + repair** orchestration. **Run control:** cooperative `cancel_event` checked at step boundaries → `_finalize_cancelled` (terminal `cancelled`, no verify/reconcile). **Live metrics:** `_persist_live_metrics` flushes observed files/commands (+ the active task's delta) to run.json/plan.json after each side-effecting tool result, so counts climb during a run; finalize still owns the authoritative lists. |
 | `background.py`            | `BackgroundRunManager`: thread-pool dispatch; crash → `failed`; **run control** per-run cancel-`Event` registry (`request_cancel`) + `dispatch(..., retry_of=)`. |
 | `chat_delegation.py`       | `@code` trigger handling.                                               |
 | `delegation_intent.py`     | Heuristic implicit-delegation detector (fallback only).                 |
@@ -142,10 +142,12 @@ conversations, messages, and pending executions.
 | `components/ProjectList.tsx` | Left column: projects + conversations + create/rename/delete.       |
 | `components/ChatPanel.tsx`   | Center column: header (provider selector top-left 07.1, theme selector top-right 07.2) + message thread + the **multi-modal composer** (07.0 — auto-growing textarea, `Ctrl/Cmd+Enter` send, `+` file upload with chips + "add to workspace too", Web Speech voice button); renders `RunChatCard` on messages carrying a `run_id` and attachment chips on messages carrying `metadata.attachments`. |
 | `components/ContextPanel.tsx`| Right column: project memory files (editable) + `RunsSection`.       |
-| `components/RunsSection.tsx` | Runs list (auto-polls while active) + Start/Stop **preview** control. |
-| `components/RunChatCard.tsx` | The in-chat run lifecycle: **live phase badge + multi-task checklist** → build progress → verification phases → completion summary → **Run browser verification** → live preview URL + screenshot; **Cancel** (active) / **Retry** (terminal) controls. |
-| `components/RunDetailModal.tsx` | Detailed run inspection: per-command verification, browser status, **Plan & Tasks**, **event Timeline** (polls while active), `result.md`; **Cancel / Retry** controls. |
-| `components/RunTimeline.tsx` | Read-only presentational timeline: maps a curated subset of `events.jsonl` (plan / task / command / verification / cancel) to labelled rows. |
+| `components/RunsSection.tsx` | Runs list (auto-polls while active; **live files/cmds counts**) + Start/Stop **preview** control + per-row **Trace** button. |
+| `components/RunChatCard.tsx` | The in-chat run lifecycle: **live phase badge + multi-task checklist** → build progress → verification phases → completion summary → **Run browser verification** → live preview URL + screenshot; **Cancel** (active) / **Retry** (terminal) / **Live trace** controls. |
+| `components/RunDetailModal.tsx` | Detailed run inspection: per-command verification, browser status, **Plan & Tasks**, **event Timeline** (settled milestones, polls while active), `result.md`; **Cancel / Retry / Open live trace** controls. |
+| `components/RunTimeline.tsx` | Read-only **settled milestone** timeline: collapses each logical step's start/settle event pair (plan / each task / verification / each repair attempt / browser) into one row showing its terminal status; a `runActive` prop settles any dangling "running" once the run is terminal. |
+| `components/RunTrace.tsx` | **Live Trace modal** — a lightweight vertical chronological thread of all run activity (planning, every file read/write/append/search, shell command, task start/finish, verification, repair, browser, cancel/retry). Pairs `tool_call`+`tool_result` into one row; drops raw `llm_response` (no chain-of-thought). Polls `…/events?since=` + run.json while active, auto-scrolls; replayable after the run. |
+| `components/runEventUtils.ts` | Shared event-rendering helpers (`kindFor` status→palette, `str`, `clockTime`) used by `RunTimeline` + `RunTrace`. |
 | `components/EditModal.tsx` / `ConfirmDialog.tsx` / `GlobalMemoryModal.tsx` | Memory editing, confirmations, global-memory viewer. |
 
 ---
@@ -241,9 +243,17 @@ re-hydrate on reload. Images re-serve read-only via
 ### G. Run control — live timeline + cancel + retry
 Surfaces the structured run data and adds bounded control over active/terminal
 runs. **Read-only timeline:** `GET …/runs/{id}/events` returns the parsed
-`events.jsonl`; the run detail modal renders a curated `RunTimeline` and polls
-it (with run.json) while the run is active. The chat card derives a live **phase
-badge** + **multi-task checklist** straight from `run.json` (no extra fetch).
+`events.jsonl` (optional `since=<index>` cursor → `{events: tail, total}` for
+cheap incremental polling; no `since` returns all, the legacy shape). The run
+detail modal renders a **settled** `RunTimeline` (start/settle pairs collapsed to
+one row per logical step) and polls it (with run.json) while the run is active;
+a dedicated **Live Trace modal** (`RunTrace`) renders the granular chronological
+thread (every file op + command, with `tool_call`+`tool_result` paired and raw
+`llm_response` dropped — no chain-of-thought) and polls with the `since` cursor.
+The chat card derives a live **phase badge** + **multi-task checklist** straight
+from `run.json` (no extra fetch). **Progressive metrics:** the runner rewrites
+run.json after each side-effecting tool result, so the Runs panel + chat card
+files/cmds counts climb live instead of only at finalize.
 **Cancel** (`POST …/runs/{id}/cancel`, only when `running`): sets
 `cancel_requested`, signals the in-flight runner via a per-run `threading.Event`
 in `BackgroundRunManager`; the runner checks it at each step boundary and routes
@@ -276,7 +286,11 @@ its legacy top-level `command`/`exit_code`/`output_preview` mirror the aggregate
 
 Status semantics: **`completed` only after verification passes (or safe skip);**
 files-written-but-verification-failed is `partial`; `skipped` is acceptable only
-when nothing safe can run.
+when nothing safe can run. `files_changed` / `commands_run` update
+**progressively** during a run (the runner rewrites run.json — atomically — as
+new files/commands are observed) and are overwritten with the authoritative
+lists at finalize, so a poll mid-run sees live counts without changing the final
+values.
 
 ---
 

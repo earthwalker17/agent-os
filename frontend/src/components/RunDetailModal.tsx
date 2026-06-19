@@ -14,6 +14,8 @@ interface Props {
   onClose: () => void
   /** Run control — let the parent refresh its run list after a cancel/retry. */
   onRunsChanged?: () => void
+  /** Open the lightweight Live Trace modal for this run. */
+  onOpenTrace?: (runId: string) => void
 }
 
 const POLL_INTERVAL_MS = 2000
@@ -232,7 +234,7 @@ function PlanBlock({ plan }: { plan: ExecutionPlan | null | undefined }): JSX.El
   )
 }
 
-function RunDetailModal({ projectId, runId, onClose, onRunsChanged }: Props) {
+function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace }: Props) {
   const [record, setRecord] = useState<RunRecord | null>(null)
   const [resultMd, setResultMd] = useState<string>('')
   const [events, setEvents] = useState<RunEvent[]>([])
@@ -389,6 +391,16 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged }: Props) {
 
               {/* --- run control (cancel / retry) --- */}
               <div className="run-detail-actions">
+                {onOpenTrace && (
+                  <button
+                    type="button"
+                    className="run-chat-trace-btn"
+                    onClick={() => onOpenTrace(runId)}
+                    title="Open the live execution trace — a faster, chronological activity thread"
+                  >
+                    Open live trace
+                  </button>
+                )}
                 {record.status === 'running' && (
                   <button
                     type="button"
@@ -429,7 +441,7 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged }: Props) {
 
               <section className="run-detail-result">
                 <h4>Timeline</h4>
-                <RunTimeline events={events} />
+                <RunTimeline events={events} runActive={isActive(record)} />
               </section>
 
               <div className="run-detail-grid">

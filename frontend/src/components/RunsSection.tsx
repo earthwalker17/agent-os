@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { PreviewStatus, RunRecord } from '../types'
 import RunDetailModal from './RunDetailModal'
+import RunTrace from './RunTrace'
 
 interface Props {
   projectId: string
@@ -61,6 +62,7 @@ function RunsSection({ projectId, refreshSignal }: Props) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [openRunId, setOpenRunId] = useState<string | null>(null)
+  const [openTraceId, setOpenTraceId] = useState<string | null>(null)
   const [preview, setPreview] = useState<PreviewStatus | null>(null)
   const [previewBusy, setPreviewBusy] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
@@ -286,7 +288,7 @@ function RunsSection({ projectId, refreshSignal }: Props) {
             const time = formatTime(run.completed_at) || formatTime(run.created_at)
             const phase = phaseLabel(run)
             return (
-              <li key={run.run_id}>
+              <li key={run.run_id} className="run-row-item">
                 <button
                   type="button"
                   className="run-row"
@@ -305,6 +307,14 @@ function RunsSection({ projectId, refreshSignal }: Props) {
                     <span>cmds: {cmdsCount}</span>
                   </div>
                 </button>
+                <button
+                  type="button"
+                  className="run-row-trace-btn"
+                  onClick={() => setOpenTraceId(run.run_id)}
+                  title="Open the live execution trace"
+                >
+                  Trace
+                </button>
               </li>
             )
           })}
@@ -316,10 +326,22 @@ function RunsSection({ projectId, refreshSignal }: Props) {
           projectId={projectId}
           runId={openRunId}
           onClose={() => setOpenRunId(null)}
+          onOpenTrace={(rid) => {
+            setOpenRunId(null)
+            setOpenTraceId(rid)
+          }}
           onRunsChanged={() => {
             loadRuns()
             loadPreview()
           }}
+        />
+      )}
+
+      {openTraceId && (
+        <RunTrace
+          projectId={projectId}
+          runId={openTraceId}
+          onClose={() => setOpenTraceId(null)}
         />
       )}
     </details>

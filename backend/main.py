@@ -1108,18 +1108,30 @@ def api_get_run_plan(project_id: str, run_id: str):
 
 
 @app.get("/api/projects/{project_id}/execution/runs/{run_id}/events")
-def api_get_run_events(project_id: str, run_id: str):
-    """Return the run's event timeline (run control / live timeline).
+def api_get_run_events(project_id: str, run_id: str, since: int = 0):
+    """Return the run's event timeline (run control / live timeline / trace).
 
     Reads the append-only ``events.jsonl`` and returns the parsed events in
     chronological order. 404 only when the run dir itself is missing; a run
     with no events yet returns an empty list. Drives the Run Detail timeline
-    and (while a run is active) is polled alongside run.json.
+    and the Live Trace, both polled alongside run.json while a run is active.
+
+    ``since`` is an optional cursor: an index into the full event list. The
+    response returns ``events[since:]`` plus ``total`` (the full count) so a
+    live poller can append only new events instead of re-rendering the whole
+    log. Omitting ``since`` (or ``since=0``) returns every event — the legacy
+    behavior the Run Detail modal relies on.
     """
     _require_workspace(project_id)
     if run_store.read_run_json(project_id, run_id) is None:
         raise HTTPException(status_code=404, detail="run not found")
-    return {"run_id": run_id, "events": run_store.read_events(project_id, run_id)}
+    all_events = run_store.read_events(project_id, run_id)
+    start = since if since > 0 else 0
+    return {
+        "run_id": run_id,
+        "events": all_events[start:],
+        "total": len(all_events),
+    }
 
 
 @app.get("/api/projects/{project_id}/execution/runs/{run_id}/screenshot")

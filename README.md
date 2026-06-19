@@ -30,8 +30,30 @@ running multiple projects. It combines:
   tracked task graph**, then executed task-by-task with per-task status.
 - **A verification surface** — a Runs panel and per-run detail modal
   show status, files changed, commands run, blockers, `result.md`, and a
-  **live execution timeline**, with **Cancel** and **Retry** controls for
-  long-running or failed runs.
+  settled execution timeline, with **Cancel** and **Retry** controls for
+  long-running or failed runs. Metrics update **live** as the agent works,
+  and a dedicated **Live Trace** shows a real-time chronological thread of
+  every file edit, command, and verification step.
+
+## Showcase: a full-stack app Agent OS built by itself
+
+[**Aegis Launch Control**](./execution_workspaces/aegis-launch-control/SHOWCASE.md)
+is a mission-control planning dashboard (**React + TypeScript + Vite + Tailwind**
+front end + a lightweight **Express** API) that the Agent OS Coding Agent built
+**autonomously, from an empty repository**, in response to a single
+natural-language task card. No human wrote any of the app code or fixed its
+build. Agent OS planned the work into an **8-task dependency graph**, executed it
+task-by-task, and verified the result with a real `npm install` + `npm run build`
+(passed). All 8 tasks completed with zero blockers.
+
+The full generated source plus the complete run evidence — the task card, the
+plan, a chronological log of every tool call, the build log, and the
+browser-verification capture — are committed under
+[`execution_workspaces/aegis-launch-control/`](./execution_workspaces/aegis-launch-control/)
+as a public, replayable example. See its
+[SHOWCASE.md](./execution_workspaces/aegis-launch-control/SHOWCASE.md) for the
+details (including an honest note on the verification screenshot). Every other
+project and workspace stays private.
 
 ## Why this exists
 
@@ -82,9 +104,12 @@ per-task status / files / commands / blockers and richer run events. Simple
 tasks still take the original single-loop path, and verification, browser
 verification, preview, and memory reconciliation are unchanged. That structured
 data is now **visible and controllable**: the chat run card shows a live phase
-badge and task checklist, the detail modal renders a polled event **timeline**,
-and runs can be **cancelled** (cooperatively, ending in a clean `cancelled`
-state) or **retried** as a new linked run.
+badge and task checklist, files/commands counts climb **live** during a run, a
+dedicated **Live Trace** modal streams the full chronological activity thread
+(opened from the chat card, the Runs panel, or the detail modal), the detail
+modal renders a polled timeline that **settles** completed steps (no stale
+"running" rows), and runs can be **cancelled** (cooperatively, ending in a clean
+`cancelled` state) or **retried** as a new linked run.
 
 **Phase 4 — Interface & UX** has begun with **Task 07.0**: a modern
 multi-modal chat composer — auto-growing multiline input (`Enter` for a

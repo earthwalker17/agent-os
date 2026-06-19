@@ -558,8 +558,44 @@ def test_events_endpoint_returns_timeline():
         payload = res.json()
         assert payload["run_id"] == "r1"
         assert [e["type"] for e in payload["events"]] == ["run_started", "task_started"]
+        # Backward-compatible: a total count rides alongside the events.
+        assert payload["total"] == 2
         # Unknown run -> 404.
         assert env.client.get("/api/projects/p/execution/runs/nope/events").status_code == 404
+
+    _run(body)
+
+
+def test_events_endpoint_since_cursor():
+    """The Live Trace polls with ?since=<index> to fetch only new events."""
+
+    def body(env: _Env):
+        env.setup("p")
+        env.seed_run("p", "r1", RunStatus.RUNNING)
+        for i in range(5):
+            run_store.append_event("p", "r1", {"type": f"e{i}"})
+
+        # since past the first two -> only the tail, but total is the full count.
+        res = env.client.get("/api/projects/p/execution/runs/r1/events?since=2")
+        assert res.status_code == 200
+        payload = res.json()
+        assert [e["type"] for e in payload["events"]] == ["e2", "e3", "e4"]
+        assert payload["total"] == 5
+
+        # since at the end -> empty tail, total still reported (poll-and-append).
+        res = env.client.get("/api/projects/p/execution/runs/r1/events?since=5")
+        payload = res.json()
+        assert payload["events"] == []
+        assert payload["total"] == 5
+
+        # since beyond the end (race / stale cursor) -> empty, never raises.
+        res = env.client.get("/api/projects/p/execution/runs/r1/events?since=99")
+        assert res.status_code == 200
+        assert res.json()["events"] == []
+
+        # No since -> every event (legacy behavior preserved).
+        res = env.client.get("/api/projects/p/execution/runs/r1/events")
+        assert [e["type"] for e in res.json()["events"]] == ["e0", "e1", "e2", "e3", "e4"]
 
     _run(body)
 

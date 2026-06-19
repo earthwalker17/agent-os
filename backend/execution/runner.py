@@ -219,6 +219,17 @@ class CodingAgentRunner:
         # stand-alone synchronous path + every existing test) means the cancel
         # checkpoints are inert and the loop is byte-identical to before.
         self._cancel_event: threading.Event | None = None
+        # Live observability — progressive run metrics. The active run's record +
+        # id, captured in ``run_task`` so ``_persist_live_metrics`` can rewrite
+        # run.json (and plan.json for the active task) as files/commands
+        # accumulate, instead of only at finalize. ``_active_unit`` + its base
+        # offsets attribute the live delta to the task currently executing.
+        # All default to inert so the synchronous path + tests are unchanged.
+        self._live_run_id: str | None = None
+        self._live_record: RunRecord | None = None
+        self._active_unit: ExecutionTask | None = None
+        self._active_unit_base_f: int = 0
+        self._active_unit_base_c: int = 0
 
     def run_task(
         self,
@@ -277,6 +288,13 @@ class CodingAgentRunner:
                 run_store.init_run_dir(self.project_id, run_id)
                 run_store.write_task_card(self.project_id, run_id, task.title, task.task_card)
                 run_store.write_run_json(self.project_id, run_id, record)
+
+        # Capture the active record + id so live tool activity can be flushed to
+        # run.json progressively (see _persist_live_metrics). Finalize still owns
+        # the authoritative file/command lists; these writes only make the
+        # in-progress counts climb for pollers.
+        self._live_run_id = run_id
+        self._live_record = record
 
         run_store.append_event(
             self.project_id,
@@ -515,9 +533,13 @@ class CodingAgentRunner:
             initial = build_initial_user_prompt(task.title, task.task_card, task_md)
             before_f = len(self._observed_files_changed)
             before_c = len(self._observed_commands_run)
-            final_action, loop_failed_reason = self._run_task_unit(
-                run_id, system_prompt, initial, MAX_STEPS, phase="execution"
-            )
+            self._begin_unit(unit, before_f, before_c)
+            try:
+                final_action, loop_failed_reason = self._run_task_unit(
+                    run_id, system_prompt, initial, MAX_STEPS, phase="execution"
+                )
+            finally:
+                self._active_unit = None
             self._apply_unit_result(unit, final_action, loop_failed_reason, before_f, before_c)
             # Pass the raw final action through unchanged (incl. task_md_update).
             return final_action, loop_failed_reason
@@ -576,15 +598,19 @@ class CodingAgentRunner:
             )
             before_f = len(self._observed_files_changed)
             before_c = len(self._observed_commands_run)
-            final_action, loop_failed_reason = self._run_task_unit(
-                run_id,
-                system_prompt,
-                initial,
-                MAX_TASK_STEPS,
-                phase="execution",
-                max_continuations=MAX_TASK_CONTINUATIONS,
-                continuation_steps=TASK_CONTINUATION_STEPS,
-            )
+            self._begin_unit(unit, before_f, before_c)
+            try:
+                final_action, loop_failed_reason = self._run_task_unit(
+                    run_id,
+                    system_prompt,
+                    initial,
+                    MAX_TASK_STEPS,
+                    phase="execution",
+                    max_continuations=MAX_TASK_CONTINUATIONS,
+                    continuation_steps=TASK_CONTINUATION_STEPS,
+                )
+            finally:
+                self._active_unit = None
             self._apply_unit_result(unit, final_action, loop_failed_reason, before_f, before_c)
             run_store.append_event(
                 self.project_id,
@@ -725,6 +751,8 @@ class CodingAgentRunner:
                     raise _RunCancelled()
                 tool_result, dispatched = self._dispatch_tool(run_id, step, action, phase=phase)
                 self._observe_tool_result(action, tool_result)
+                # Flush progressive metrics so pollers see counts climb live.
+                self._persist_live_metrics()
                 run_store.append_event(
                     self.project_id,
                     run_id,
@@ -805,6 +833,70 @@ class CodingAgentRunner:
         record.plan = plan
         run_store.write_plan_json(self.project_id, run_id, plan)
         run_store.write_run_json(self.project_id, run_id, record)
+
+    def _persist_live_metrics(self) -> None:
+        """Flush observed file/command activity to run.json mid-execution.
+
+        Called after every side-effecting tool result so the right-side Runs
+        panel, chat card, and Live Trace see files/commands counts climb *during*
+        a run instead of snapping to the final values at finalize. Only the
+        observed (progressive) lists are written here; ``_finalize`` still sets
+        the authoritative file/command lists (the agent's ``final`` action for a
+        single task, the multi-task aggregation otherwise), so run semantics and
+        every existing test are unchanged.
+
+        Bounded + safe:
+        - No-op unless a run is active and still ``RUNNING`` — so it never
+          clobbers a settled / cancelled record, and never fires during the
+          post-terminal repair pass.
+        - Writes only when the deduped observed lists actually changed
+          (``_observe_tool_result`` appends only *new* paths/commands), so this
+          costs at most one run.json write per new file or command, not one per
+          tool call.
+        - When a task unit is executing, also attributes the live delta to that
+          unit and rewrites plan.json, so a long task's per-task progress shows
+          before its terminal ``task_status``.
+        - Appends no events (the granular tool_call/tool_result events already
+          carry the per-op detail); this only updates the structured counts.
+        """
+        record = self._live_record
+        run_id = self._live_run_id
+        if record is None or run_id is None:
+            return
+        if record.status != RunStatus.RUNNING:
+            return
+
+        changed = False
+        if record.files_changed != self._observed_files_changed:
+            record.files_changed = list(self._observed_files_changed)
+            changed = True
+        if record.commands_run != self._observed_commands_run:
+            record.commands_run = list(self._observed_commands_run)
+            changed = True
+
+        plan_changed = False
+        unit = self._active_unit
+        if unit is not None:
+            unit_files = self._observed_files_changed[self._active_unit_base_f:]
+            unit_cmds = self._observed_commands_run[self._active_unit_base_c:]
+            if unit.files_changed != unit_files:
+                unit.files_changed = list(unit_files)
+                plan_changed = True
+            if unit.commands_run != unit_cmds:
+                unit.commands_run = list(unit_cmds)
+                plan_changed = True
+
+        if not (changed or plan_changed):
+            return
+        if plan_changed and record.plan is not None:
+            run_store.write_plan_json(self.project_id, run_id, record.plan)
+        run_store.write_run_json(self.project_id, run_id, record)
+
+    def _begin_unit(self, unit: "ExecutionTask", before_f: int, before_c: int) -> None:
+        """Mark ``unit`` as the live-attribution target for _persist_live_metrics."""
+        self._active_unit = unit
+        self._active_unit_base_f = before_f
+        self._active_unit_base_c = before_c
 
     # ---------- internals ----------
 

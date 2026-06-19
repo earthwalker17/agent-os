@@ -441,6 +441,52 @@ unchanged. The fixes, each tied to an observed failure mode:
   on 5174 → Playwright screenshot). 15 new backend tests guard the fixes
   (`test_llm_retry.py`, `test_autonomy_hardening.py`); full suite green.
 
+### Real-Time Run Trace, Progressive Metrics & Timeline Settling
+Made run observability track reality *during* a run instead of snapping to final
+values at completion. All additive — the run lifecycle, sandbox chokepoint, role
+separation, explicit-dispatch contract, verification/browser/preview/
+reconciliation semantics, and the Aegis success sample are unchanged.
+- **Progressive run metrics.** The runner now flushes observed file/command
+  activity to run.json *during* execution (`runner._persist_live_metrics`,
+  called after each side-effecting tool result), so the Runs panel + chat card
+  files/cmds counts climb live instead of sitting at 0 until finalize. Writes are
+  bounded (one per *new* file/command, only while the record is `RUNNING`) and
+  finalize still owns the authoritative lists, so run semantics + every test are
+  unchanged. A live `_active_unit` also attributes the delta to the executing
+  task and rewrites plan.json, so per-task progress shows before the task's
+  terminal `task_status`.
+- **Live Trace modal** (`RunTrace.tsx`, new). A dedicated, lightweight,
+  vertical chronological thread of the Coding Agent's activity — planning, every
+  file read/write/append/search, shell command, task start/finish, verification,
+  repair, browser verification, cancel/retry — with timestamps, status badges,
+  concise labels, paths/commands, and short outputs. Consecutive
+  `tool_call`+`tool_result` events collapse into one row; raw `llm_response`
+  output is **dropped** (no chain-of-thought) — intent shows only via the
+  structured `tool_call.reason` + plan goal/analysis. Opened from the chat run
+  card, a button in `RunDetailModal`, and a **Trace** button per Runs-panel row.
+  Polls `…/events?since=<cursor>` (new param) + run.json while active and
+  auto-scrolls; after the run it's a complete, replayable record from persisted
+  events.
+- **Timeline settling** (`RunTimeline.tsx`). The Run Detail timeline was an
+  event log that left a permanent "running" row for every `*_started` event — a
+  finished 8-task run showed ~8 stale spinners. It now collapses each logical
+  step's start/settle PAIR (plan, each task, verification, each repair attempt,
+  browser) into a single row showing its terminal status, and a new `runActive`
+  prop coerces any dangling "running" milestone to settled once the run is
+  terminal. The full historical record is preserved in events.jsonl + the Live
+  Trace.
+- **Backend.** `GET …/runs/{id}/events` gained an optional `since` cursor →
+  `{events: tail, total}` (backward compatible: no `since` returns all). Shared
+  frontend event helpers extracted to `runEventUtils.ts`.
+- **Tests.** New `test_live_metrics.py` (5) — progressive run-level metrics climb
+  while RUNNING, command metrics climb, `_persist_live_metrics` disk update +
+  terminal no-op, per-task plan.json attribution. `test_run_control.py` gained
+  the `since`-cursor test. Frontend `npm run build` green.
+- **Scope notes:** polling only (no SSE); the Live Trace is read-only; the
+  `since` endpoint still reads the whole events.jsonl server-side (fine for
+  local single-user — the cursor just trims the response + lets the client
+  append).
+
 ---
 
 ## Execution-trigger contract (invariant)
@@ -503,10 +549,11 @@ Anthropic key is needed. Each file is runnable standalone.
 | `test_providers.py`               |    19 | 07.1 availability, default order, dispatch/parse, chat routing |
 | `test_planner.py`                 |    28 | Phase 5 heuristic gate (+ clause heuristic), plan parse/fallback, graph + aggregation |
 | `test_runner_planning.py`         |     7 | Phase 5 plan→tasks integration: decompose, skip, fallback, gate, artifact consistency |
-| `test_run_control.py`             |    15 | Run control: events/task-card readers, cooperative cancel, cancel/retry endpoints, orphan + race guard, orphan plan-settle, retry-of-cancelled |
+| `test_run_control.py`             |    16 | Run control: events/task-card readers, cooperative cancel, cancel/retry endpoints, orphan + race guard, orphan plan-settle, retry-of-cancelled, events `since` cursor |
 | `test_llm_retry.py`               |     4 | Autonomy hardening: transient-vs-permanent LLM error classification, retry-then-succeed, no-retry-on-deterministic, exhaust-then-raise |
 | `test_autonomy_hardening.py`      |    11 | Autonomy hardening: progress-aware dependency skip (+cycle remainder), productive continuation (incl. overwrite), failed-with-files dependent runs, repair on partial, iterative-repair convergence |
-| **Total**                         | **297** |                                                            |
+| `test_live_metrics.py`            |     5 | Progressive run metrics: run-level files/cmds climb while RUNNING, `_persist_live_metrics` disk-update + terminal no-op, per-task plan.json attribution |
+| **Total**                         | **303** |                                                            |
 
 Run all (from `backend/`): `python tests/<file>.py` for each row above.
 

@@ -1400,6 +1400,36 @@ html, body, #root {
   color: var(--text-muted);
 }
 
+/* Runs-panel row + its Trace affordance share one flex line. */
+.run-row-item {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.run-row-item .run-row {
+  flex: 1;
+  min-width: 0;
+}
+
+.run-row-trace-btn {
+  flex-shrink: 0;
+  align-self: stretch;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #6ab3ff;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.run-row-trace-btn:hover {
+  background: rgba(106, 179, 255, 0.12);
+  border-color: #6ab3ff;
+}
+
 /* Status badges */
 .run-status {
   font-size: 10px;
@@ -1614,6 +1644,12 @@ html, body, #root {
 .run-verify-status.status-cancelled {
   background: rgba(176, 166, 196, 0.15);
   color: #b0a6c4;
+}
+
+/* Neutral informational anchor (e.g. "Run started") — not a status outcome. */
+.run-verify-status.status-info {
+  background: rgba(106, 179, 255, 0.1);
+  color: var(--text-muted);
 }
 
 /* Phase 5 — Plan & Tasks block in the run detail modal. */
@@ -1954,6 +1990,23 @@ html, body, #root {
   border-color: var(--text-muted);
 }
 
+/* Live Trace entry button (chat card + detail modal). */
+.run-chat-trace-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #6ab3ff;
+  background: transparent;
+  border: 1px solid rgba(106, 179, 255, 0.5);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.run-chat-trace-btn:hover {
+  background: rgba(106, 179, 255, 0.12);
+  border-color: #6ab3ff;
+}
+
 /* Run control — cancel / retry buttons + live phase badge + task checklist. */
 .run-chat-cancel-btn {
   padding: 6px 12px;
@@ -2100,6 +2153,135 @@ html, body, #root {
   color: var(--text-muted);
   font-size: 11px;
   flex-shrink: 0;
+}
+
+/* ---------- Live Trace modal ---------- */
+.run-trace-modal {
+  display: flex;
+  flex-direction: column;
+  max-height: 85vh;
+  width: min(720px, 92vw);
+}
+
+.run-trace-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.run-trace-metric {
+  color: var(--text-muted);
+}
+
+.run-trace-tasks {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.run-trace-tasks-bar {
+  display: inline-block;
+  width: 80px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.run-trace-tasks-fill {
+  display: block;
+  height: 100%;
+  background: #6ab3ff;
+  transition: width 0.3s ease;
+}
+
+.run-trace-body {
+  overflow-y: auto;
+  padding: 10px 16px 16px;
+  flex: 1;
+}
+
+.run-trace-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.run-trace-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.08);
+  font-size: 12px;
+}
+
+.run-trace-time {
+  flex-shrink: 0;
+  width: 58px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.run-trace-row .run-verify-status {
+  flex-shrink: 0;
+  min-width: 56px;
+  text-align: center;
+  margin-right: 0;
+}
+
+.run-trace-main {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.run-trace-label {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.run-trace-target {
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 5px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-trace-output {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.run-trace-phase {
+  flex-shrink: 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  opacity: 0.7;
 }
 
 .run-chat-lightbox {

@@ -6,6 +6,8 @@ interface Props {
   runId: string
   /** Open the detailed RunDetailModal for this run. */
   onOpenRun: (runId: string) => void
+  /** Open the lightweight Live Trace modal for this run. */
+  onOpenTrace?: (runId: string) => void
   /** Notify the parent that run state changed so the Runs panel can refresh. */
   onRunsChanged?: () => void
 }
@@ -53,7 +55,7 @@ function fileSummary(files: string[] | undefined): string {
  * user needing to open the RunDetailModal. The modal remains available via the
  * "Details" link for exact logs and artifacts.
  */
-function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
+function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }: Props) {
   const [record, setRecord] = useState<RunRecord | null>(null)
   const [verifying, setVerifying] = useState(false)
   const [verifyError, setVerifyError] = useState<string | null>(null)
@@ -441,6 +443,16 @@ function RunChatCard({ projectId, runId, onOpenRun, onRunsChanged }: Props) {
             title="Install dependencies, start the dev server on port 5174, and capture a screenshot"
           >
             {hadVerifyAttempt ? 'Re-run browser verification' : 'Run browser verification'}
+          </button>
+        )}
+        {onOpenTrace && (
+          <button
+            type="button"
+            className="run-chat-trace-btn"
+            onClick={() => onOpenTrace(runId)}
+            title="Open the live execution trace — a chronological thread of what the Coding Agent is doing"
+          >
+            Live trace
           </button>
         )}
         <button

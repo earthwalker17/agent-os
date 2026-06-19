@@ -1,148 +1,226 @@
 import type { RunEvent } from '../types'
+import { clockTime, kindFor, str } from './runEventUtils'
 
 interface Props {
   events: RunEvent[]
+  /**
+   * Whether the run is still active. When false (terminal run), any milestone
+   * that never received its settling event is coerced from 'running' to
+   * 'skipped' so nothing keeps spinning after the run ends.
+   */
+  runActive?: boolean
 }
 
-/** Map a status-ish word onto the shared `.run-verify-status status-*` palette. */
-function kindFor(status: string | undefined): string {
-  switch (status) {
-    case 'completed':
-    case 'passed':
-    case 'running':
-    case 'skipped':
-    case 'pending':
-    case 'failed':
-      return status
-    case 'partial':
-    case 'blocked':
-      return 'failed'
-    default:
-      return 'running'
-  }
-}
-
-function str(v: unknown): string {
-  return typeof v === 'string' ? v : v == null ? '' : String(v)
-}
-
-interface Row {
+interface Milestone {
+  key: string
   label: string
   detail: string
   kind: string
+  time: string
 }
 
 /**
- * Translate one factual run event into a timeline row, or null to drop it.
- * We deliberately surface only meaningful lifecycle/plan/task/verification
- * events and shell commands — read-only file/list/search tool calls are noise.
+ * Settled milestone view of a run's timeline.
+ *
+ * Unlike the raw event log (which the Live Trace renders), this collapses each
+ * logical step's start/settle event PAIR into a single row keyed by that step
+ * (plan, each task, verification, each repair attempt, browser). A finished step
+ * therefore shows its terminal status (completed / failed / skipped) instead of
+ * leaving a stale "Task started [running]" row behind — the historical record
+ * stays intact in events.jsonl + the Live Trace; this view just settles.
  */
-function describe(e: RunEvent): Row | null {
-  switch (e.type) {
-    case 'run_dispatched':
-    case 'run_started':
-      return { label: 'Run started', detail: str(e.title), kind: 'running' }
-    case 'plan_started':
-      return { label: 'Planning started', detail: '', kind: 'running' }
-    case 'plan_ready': {
-      const n = typeof e.task_count === 'number' ? e.task_count : undefined
-      const mode = str(e.mode)
-      const detail = [n != null ? `${n} task${n === 1 ? '' : 's'}` : '', mode && `(${mode})`]
-        .filter(Boolean)
-        .join(' ')
-      return { label: 'Plan ready', detail: detail || str(e.goal), kind: 'completed' }
-    }
-    case 'plan_failed':
-      return { label: 'Planning fell back to a single task', detail: str(e.error), kind: 'skipped' }
-    case 'task_started':
-      return { label: 'Task started', detail: str(e.title) || str(e.task_id), kind: 'running' }
-    case 'task_status': {
-      const status = str(e.status)
-      const detail = [str(e.task_id), str(e.summary) || str(e.reason)].filter(Boolean).join(' — ')
-      return { label: `Task ${status}`, detail, kind: kindFor(status) }
-    }
-    case 'tool_call': {
-      if (str(e.tool_name) !== 'run_shell') return null
-      const args = (e.arguments ?? {}) as Record<string, unknown>
-      return { label: 'Command', detail: str(args.command), kind: 'running' }
-    }
-    case 'verification_started': {
-      const n = typeof e.commands === 'number' ? e.commands : undefined
-      const detail = [str(e.mode), n != null ? `${n} command${n === 1 ? '' : 's'}` : '']
-        .filter(Boolean)
-        .join(', ')
-      return { label: 'Verification started', detail, kind: 'running' }
-    }
-    case 'verification_repair_started':
-      return { label: 'Repair pass started', detail: str(e.command), kind: 'running' }
-    case 'verification_repair_failed':
-      return { label: 'Repair pass failed', detail: str(e.error), kind: 'failed' }
-    case 'verification_reverified':
-      return { label: `Re-verified: ${str(e.status)}`, detail: str(e.command), kind: kindFor(str(e.status)) }
-    case 'verification': {
-      if (e.enabled === false) return { label: 'Verification skipped', detail: '', kind: 'skipped' }
-      return { label: `Verification ${str(e.status)}`, detail: str(e.command), kind: kindFor(str(e.status)) }
-    }
-    case 'browser_verification_started':
-      return { label: 'Browser verification started', detail: '', kind: 'running' }
-    case 'browser_verification':
-    case 'browser_verification_ui': {
-      if (e.enabled === false) return null
-      return {
-        label: `Browser verification ${str(e.status)}`,
-        detail: str(e.url),
-        kind: kindFor(str(e.status)),
-      }
-    }
-    case 'run_completed':
-      return { label: `Agent finished (${str(e.status)})`, detail: '', kind: kindFor(str(e.status)) }
-    case 'run_failed':
-      return { label: 'Run failed', detail: str(e.error), kind: 'failed' }
-    case 'run_cancel_requested':
-      return { label: 'Cancellation requested', detail: '', kind: 'skipped' }
-    case 'run_cancelled':
-      return { label: 'Run cancelled', detail: str(e.reason), kind: 'skipped' }
-    case 'run_retried':
-      return { label: 'Run retried', detail: str(e.new_run_id), kind: 'skipped' }
-    case 'run_interrupted':
-      return { label: 'Run interrupted', detail: str(e.reason), kind: 'failed' }
-    default:
-      return null
+function buildMilestones(events: RunEvent[]): Milestone[] {
+  const order: string[] = []
+  const byKey = new Map<string, Milestone>()
+  let discreteSeq = 0
+
+  const upsert = (key: string, fields: Partial<Milestone>) => {
+    const prev = byKey.get(key)
+    if (!prev) order.push(key)
+    byKey.set(key, {
+      key,
+      label: fields.label ?? prev?.label ?? '',
+      detail: fields.detail ?? prev?.detail ?? '',
+      kind: fields.kind ?? prev?.kind ?? 'running',
+      time: fields.time ?? prev?.time ?? '',
+    })
   }
+
+  for (const e of events) {
+    const time = clockTime(e.timestamp)
+    switch (e.type) {
+      case 'run_dispatched':
+      case 'run_started':
+        upsert('run', { label: 'Run started', detail: str(e.title), kind: 'info', time })
+        break
+
+      case 'plan_started':
+        upsert('plan', { label: 'Planning', detail: 'analyzing the task', kind: 'running', time })
+        break
+      case 'plan_ready': {
+        const n = typeof e.task_count === 'number' ? e.task_count : undefined
+        const mode = str(e.mode)
+        const detail = [n != null ? `${n} task${n === 1 ? '' : 's'}` : '', mode && `(${mode})`]
+          .filter(Boolean)
+          .join(' ')
+        upsert('plan', { label: 'Plan ready', detail: detail || str(e.goal), kind: 'completed', time })
+        break
+      }
+      case 'plan_failed':
+        upsert('plan', {
+          label: 'Planning fell back to a single task',
+          detail: str(e.error),
+          kind: 'skipped',
+          time,
+        })
+        break
+
+      case 'task_started': {
+        const id = str(e.task_id)
+        upsert(`task:${id}`, {
+          label: str(e.title) || `Task ${id}`,
+          detail: 'in progress…',
+          kind: 'running',
+          time,
+        })
+        break
+      }
+      case 'task_status': {
+        const id = str(e.task_id)
+        const status = str(e.status)
+        const detail = str(e.summary) || str(e.reason) || ''
+        upsert(`task:${id}`, {
+          label: byKey.get(`task:${id}`)?.label || `Task ${id}`,
+          detail,
+          kind: kindFor(status),
+          time,
+        })
+        break
+      }
+
+      case 'verification_started': {
+        const n = typeof e.commands === 'number' ? e.commands : undefined
+        const detail = [str(e.mode), n != null ? `${n} command${n === 1 ? '' : 's'}` : '']
+          .filter(Boolean)
+          .join(', ')
+        upsert('verification', { label: 'Verification', detail, kind: 'running', time })
+        break
+      }
+      case 'verification': {
+        if (e.enabled === false) {
+          upsert('verification', { label: 'Verification skipped', detail: '', kind: 'skipped', time })
+        } else {
+          upsert('verification', {
+            label: `Verification ${str(e.status)}`,
+            detail: str(e.command),
+            kind: kindFor(str(e.status)),
+            time,
+          })
+        }
+        break
+      }
+
+      case 'verification_repair_started': {
+        const attempt = typeof e.attempt === 'number' ? e.attempt : discreteSeq
+        upsert(`repair:${attempt}`, {
+          label: `Repair pass ${attempt || ''}`.trim(),
+          detail: str(e.command),
+          kind: 'running',
+          time,
+        })
+        break
+      }
+      case 'verification_reverified': {
+        const attempt = typeof e.attempt === 'number' ? e.attempt : discreteSeq
+        upsert(`repair:${attempt}`, {
+          label: `Repair pass ${attempt || ''}`.trim(),
+          detail: `re-verified: ${str(e.status)}`,
+          kind: kindFor(str(e.status)),
+          time,
+        })
+        break
+      }
+      case 'verification_repair_failed': {
+        const attempt = typeof e.attempt === 'number' ? e.attempt : discreteSeq
+        upsert(`repair:${attempt}`, {
+          label: `Repair pass ${attempt || ''}`.trim(),
+          detail: str(e.error),
+          kind: 'failed',
+          time,
+        })
+        break
+      }
+
+      case 'browser_verification_started':
+        upsert('browser', { label: 'Browser verification', detail: '', kind: 'running', time })
+        break
+      case 'browser_verification':
+      case 'browser_verification_ui': {
+        if (e.enabled === false) break
+        upsert('browser', {
+          label: `Browser verification ${str(e.status)}`,
+          detail: str(e.url),
+          kind: kindFor(str(e.status)),
+          time,
+        })
+        break
+      }
+
+      // Discrete lifecycle facts — each gets a unique key so they all show.
+      case 'run_completed':
+        upsert(`evt:${discreteSeq++}`, {
+          label: `Agent finished (${str(e.status)})`,
+          detail: '',
+          kind: kindFor(str(e.status)),
+          time,
+        })
+        break
+      case 'run_failed':
+        upsert(`evt:${discreteSeq++}`, { label: 'Run failed', detail: str(e.error), kind: 'failed', time })
+        break
+      case 'run_cancel_requested':
+        upsert(`evt:${discreteSeq++}`, { label: 'Cancellation requested', detail: '', kind: 'skipped', time })
+        break
+      case 'run_cancelled':
+        upsert(`evt:${discreteSeq++}`, { label: 'Run cancelled', detail: str(e.reason), kind: 'cancelled', time })
+        break
+      case 'run_retried':
+        upsert(`evt:${discreteSeq++}`, { label: 'Run retried', detail: str(e.new_run_id), kind: 'skipped', time })
+        break
+      case 'run_interrupted':
+        upsert(`evt:${discreteSeq++}`, { label: 'Run interrupted', detail: str(e.reason), kind: 'failed', time })
+        break
+
+      default:
+        break
+    }
+  }
+
+  return order.map((k) => byKey.get(k)!)
 }
 
-function clockTime(iso: string | undefined): string {
-  if (!iso) return ''
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return ''
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-}
+function RunTimeline({ events, runActive = false }: Props) {
+  const milestones = buildMilestones(events)
 
-/**
- * Read-only factual timeline of a run's events. Driven by the
- * `…/runs/{id}/events` endpoint (events.jsonl). Used in the Run Detail modal
- * and polled while the run is active.
- */
-function RunTimeline({ events }: Props) {
-  const rows = events
-    .map((e) => ({ row: describe(e), time: clockTime(e.timestamp) }))
-    .filter((x): x is { row: Row; time: string } => x.row !== null)
-
-  if (rows.length === 0) {
+  if (milestones.length === 0) {
     return <div className="run-detail-none">No events yet.</div>
   }
 
   return (
     <ul className="run-timeline">
-      {rows.map(({ row, time }, i) => (
-        <li key={i} className="run-timeline-event">
-          <span className={`run-verify-status status-${row.kind}`}>{row.kind}</span>
-          <span className="run-timeline-label">{row.label}</span>
-          {row.detail && <code className="run-timeline-detail">{row.detail}</code>}
-          {time && <span className="run-timeline-time">{time}</span>}
-        </li>
-      ))}
+      {milestones.map((m) => {
+        // A terminal run should never leave a milestone spinning — settle any
+        // dangling 'running' to 'skipped' (it never reached its completion event).
+        const kind = !runActive && m.kind === 'running' ? 'skipped' : m.kind
+        return (
+          <li key={m.key} className="run-timeline-event">
+            <span className={`run-verify-status status-${kind}`}>{kind}</span>
+            <span className="run-timeline-label">{m.label}</span>
+            {m.detail && <code className="run-timeline-detail">{m.detail}</code>}
+            {m.time && <span className="run-timeline-time">{m.time}</span>}
+          </li>
+        )
+      })}
     </ul>
   )
 }

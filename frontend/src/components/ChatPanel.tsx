@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import type { Message, PendingExecution, ChatAttachment, ProviderInfo } from '../types'
 import RunDetailModal from './RunDetailModal'
 import RunChatCard from './RunChatCard'
+import RunTrace from './RunTrace'
 
 interface Props {
   projectId: string | null
@@ -135,6 +136,7 @@ function ChatPanel({
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [openRunId, setOpenRunId] = useState<string | null>(null)
+  const [openTraceId, setOpenTraceId] = useState<string | null>(null)
   const [showTaskCardFor, setShowTaskCardFor] = useState<string | null>(null)
 
   // Task 07.0 — composer attachment + voice state.
@@ -164,7 +166,10 @@ function ChatPanel({
 
   // If the user navigates away from a project that had a modal open, clear it.
   useEffect(() => {
-    if (!runProjectId) setOpenRunId(null)
+    if (!runProjectId) {
+      setOpenRunId(null)
+      setOpenTraceId(null)
+    }
   }, [runProjectId])
 
   // When the user enters revise mode, focus the input so they can start
@@ -532,6 +537,7 @@ function ChatPanel({
                   projectId={runProjectId}
                   runId={runIdFromMeta}
                   onOpenRun={(rid) => setOpenRunId(rid)}
+                  onOpenTrace={(rid) => setOpenTraceId(rid)}
                   onRunsChanged={onRunsChanged}
                 />
               )}
@@ -725,7 +731,18 @@ function ChatPanel({
           projectId={runProjectId}
           runId={openRunId}
           onClose={() => setOpenRunId(null)}
+          onOpenTrace={(rid) => {
+            setOpenRunId(null)
+            setOpenTraceId(rid)
+          }}
           onRunsChanged={onRunsChanged}
+        />
+      )}
+      {openTraceId && runProjectId && (
+        <RunTrace
+          projectId={runProjectId}
+          runId={openTraceId}
+          onClose={() => setOpenTraceId(null)}
         />
       )}
     </main>
