@@ -25,6 +25,7 @@ from .manager import get_execution_root, get_project_execution_dir
 from .models import ExecutionPlan, RunRecord, RunStatus
 from .verification import render_verification_section
 from .browser_verification import render_browser_verification_section
+from .visual_judge import render_visual_review_section
 
 
 def new_run_id() -> str:
@@ -360,6 +361,19 @@ def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
         f"## Blockers\n{_bullets(record.blockers)}\n\n"
         f"{render_verification_section(record.verification)}\n"
         f"{render_browser_verification_section(record.browser_verification)}\n"
+        f"{_visual_review_block(record.visual_review)}"
         f"{_render_plan_section(record.plan)}"
         f"## Notes for Main Agent\n{notes.strip() or '_(none)_'}\n"
     )
+
+
+def _visual_review_block(visual_review) -> str:
+    """Render the optional Visual Review section with surrounding spacing.
+
+    Returns ``""`` when no review was attempted (so result.md for runs without
+    visual review stays byte-identical to the legacy output), else the section
+    followed by a blank line so it reads cleanly between the browser block and
+    the plan/notes sections.
+    """
+    section = render_visual_review_section(visual_review)
+    return f"{section}\n" if section else ""

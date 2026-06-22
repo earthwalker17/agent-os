@@ -80,6 +80,7 @@ from .tool_models import (
 )
 from .verification import plan_verification, run_verification_specs
 from .browser_verification import run_browser_verification
+from .visual_judge import run_visual_review
 
 
 log = logging.getLogger(__name__)
@@ -1284,8 +1285,42 @@ class CodingAgentRunner:
                 "url": browser_verification.url,
                 "screenshot_path": browser_verification.screenshot_path,
                 "duration_ms": browser_verification.duration_ms,
+                "pages": len(browser_verification.pages),
+                "readiness": browser_verification.readiness,
             },
         )
+
+        # AI visual judgment over the captured screenshots. Diagnostic-only:
+        # best-effort, never raises, and never changes ``record.status``. Runs
+        # only on a passing browser verification with screenshots; skips
+        # gracefully (with a reason) when no vision provider key is configured.
+        if (
+            browser_verification.enabled
+            and browser_verification.status == "passed"
+            and browser_verification.pages
+        ):
+            try:
+                record.visual_review = run_visual_review(
+                    self.project_id,
+                    run_id,
+                    task_card=task.task_card,
+                    summary=summary,
+                    browser_result=browser_verification,
+                    run_dir=run_store.get_run_dir(self.project_id, run_id),
+                )
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {
+                        "type": "visual_review",
+                        "status": record.visual_review.status,
+                        "headline": record.visual_review.headline,
+                        "provider": record.visual_review.provider,
+                        "url": browser_verification.url,
+                    },
+                )
+            except Exception:  # noqa: BLE001 — visual review never fails the run
+                log.exception("Visual review wiring failed for run %s", run_id)
 
         run_store.write_run_json(self.project_id, run_id, record)
         # Re-write plan.json with the settled per-task statuses (Phase 5). For a
@@ -1335,6 +1370,7 @@ class CodingAgentRunner:
             result_path=result_path,
             verification=verification,
             browser_verification=browser_verification,
+            visual_review=record.visual_review,
             plan=record.plan,
         )
 

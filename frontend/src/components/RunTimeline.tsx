@@ -165,6 +165,14 @@ function buildMilestones(events: RunEvent[]): Milestone[] {
         })
         break
       }
+      case 'visual_review':
+        upsert('visual_review', {
+          label: `Visual review: ${str(e.status)}`,
+          detail: str(e.headline),
+          kind: kindFor(str(e.status)),
+          time,
+        })
+        break
 
       // Discrete lifecycle facts — each gets a unique key so they all show.
       case 'run_completed':

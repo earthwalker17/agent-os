@@ -5,6 +5,7 @@ import type {
   RunEvent,
   RunRecord,
   VerificationResult,
+  VisualReviewResult,
 } from '../types'
 import RunTimeline from './RunTimeline'
 
@@ -131,16 +132,26 @@ function BrowserVerificationBlock({
     )
   }
   // Task 06.2D — the modal is the detailed inspection view, not the primary
-  // control surface. We reference the saved screenshot path + a link to the
-  // artifact rather than rendering it inline; the chat run card owns the
+  // control surface. We reference the saved screenshot path(s) + a link to each
+  // artifact rather than rendering them inline; the chat run card owns the
   // visual preview and the Run browser verification action.
-  const screenshotUrl = v.screenshot_path
-    ? `/api/projects/${projectId}/execution/runs/${runId}/screenshot`
-    : null
+  const pageUrl = (path: string) => {
+    const name = path.split('/').pop() || 'browser.png'
+    return `/api/projects/${projectId}/execution/runs/${runId}/screenshot?name=${encodeURIComponent(name)}`
+  }
+  const pages =
+    v.pages && v.pages.length > 0
+      ? v.pages
+      : v.screenshot_path
+        ? [{ path: v.screenshot_path, label: 'Home', readiness: v.readiness ?? undefined }]
+        : []
   return (
     <div className="run-detail-verification">
       <div>
         <span className={`run-verify-status status-${v.status}`}>{v.status}</span>
+        {v.readiness && (
+          <span className="run-detail-verify-meta">readiness: {v.readiness}</span>
+        )}
         {typeof v.duration_ms === 'number' && (
           <span className="run-detail-verify-meta">{v.duration_ms} ms</span>
         )}
@@ -169,24 +180,80 @@ function BrowserVerificationBlock({
           <code>{v.url}</code>
         </div>
       )}
-      {v.screenshot_path && (
+      {pages.length > 0 && (
         <div className="run-detail-verify-cmd">
-          <span className="run-detail-label">Screenshot</span>
-          <code>{v.screenshot_path}</code>
-          {screenshotUrl && (
-            <a
-              className="run-detail-screenshot-link"
-              href={screenshotUrl}
-              target="_blank"
-              rel="noreferrer"
-            >
-              open artifact
-            </a>
-          )}
+          <span className="run-detail-label">
+            {pages.length > 1 ? `Screenshots (${pages.length})` : 'Screenshot'}
+          </span>
+          <ul className="run-detail-shotlist">
+            {pages.map((p) => (
+              <li key={p.path}>
+                <code>{p.label || p.path}</code>
+                {p.readiness && (
+                  <span className="run-detail-verify-meta">{p.readiness}</span>
+                )}
+                <a
+                  className="run-detail-screenshot-link"
+                  href={pageUrl(p.path)}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  open
+                </a>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       {v.output_preview && (
         <pre className="run-detail-verify-output">{v.output_preview}</pre>
+      )}
+    </div>
+  )
+}
+
+function VisualReviewBlock({
+  v,
+}: {
+  v: VisualReviewResult | null | undefined
+}): JSX.Element {
+  if (!v || !v.enabled) {
+    return <span className="run-detail-none">Not run</span>
+  }
+  if (v.status === 'skipped') {
+    return (
+      <div className="run-detail-verification">
+        <div>
+          <span className="run-verify-status status-skipped">skipped</span>
+          {v.skipped_reason && (
+            <span className="run-detail-verify-meta">{v.skipped_reason}</span>
+          )}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="run-detail-verification">
+      <div>
+        <span className={`run-verify-status status-${v.status}`}>{v.status}</span>
+        {v.provider && (
+          <span className="run-detail-verify-meta">
+            {v.provider}
+            {v.model ? ` / ${v.model}` : ''}
+          </span>
+        )}
+        {typeof v.duration_ms === 'number' && (
+          <span className="run-detail-verify-meta">{v.duration_ms} ms</span>
+        )}
+      </div>
+      {v.headline && <p className="run-detail-visual-headline">{v.headline}</p>}
+      {v.reasoning && <p className="run-detail-visual-reason">{v.reasoning}</p>}
+      {v.evidence && v.evidence.length > 0 && (
+        <ul className="run-detail-visual-evidence">
+          {v.evidence.map((e, i) => (
+            <li key={i}>{e}</li>
+          ))}
+        </ul>
       )}
     </div>
   )
@@ -474,6 +541,15 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
                 <p className="run-detail-hint">
                   Run or re-run browser verification from the run's message in
                   the chat thread.
+                </p>
+              </section>
+
+              <section className="run-detail-result">
+                <h4>Visual Review</h4>
+                <VisualReviewBlock v={record.visual_review} />
+                <p className="run-detail-hint">
+                  AI judgment of the captured screenshots — diagnostic only; it
+                  does not change the run status.
                 </p>
               </section>
 

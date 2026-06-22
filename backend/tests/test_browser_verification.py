@@ -48,6 +48,7 @@ from execution.browser_verification import (  # noqa: E402
     run_browser_verification,
 )
 from execution.models import (  # noqa: E402
+    BrowserPageCapture,
     BrowserVerificationResult,
     RunRecord,
     RunStatus,
@@ -916,6 +917,126 @@ def test_runner_completed_with_passing_browser_stays_completed_and_records_paylo
         assert record.browser_verification.screenshot_path == "screenshots/browser.png"
 
     _run(body)
+
+
+# ---------- multi-page capture (readiness + multi-view upgrade) ----------
+
+
+def _multipage_capture_runner(
+    url, screenshots_dir, *, max_pages, readiness_timeout_seconds, screenshot_timeout_seconds
+):
+    """Fake page-capture runner: writes N files + returns a manifest."""
+    sd = Path(screenshots_dir)
+    sd.mkdir(parents=True, exist_ok=True)
+    names = ["browser.png", "page-02.png", "page-03.png"][: max(1, min(max_pages, 3))]
+    labels = ["Home", "Reports", "Settings"]
+    kinds = ["primary", "tab", "tab"]
+    pages = []
+    for i, name in enumerate(names):
+        (sd / name).write_bytes(b"\x89PNG\r\n\x1a\nstub")
+        pages.append(
+            BrowserPageCapture(
+                path=f"screenshots/{name}",
+                url=url,
+                label=labels[i],
+                readiness="confirmed",
+                nav_kind=kinds[i],
+            )
+        )
+    return pages
+
+
+def test_multipage_capture_records_pages_and_primary():
+    def body(layout: _TempLayout):
+        task_md = (
+            "## Browser Verification\n\n"
+            "```bash\nnpm run dev\nurl: http://127.0.0.1:5173\n```\n"
+        )
+        layout.init_workspace("agent-os", task_md_body=task_md)
+        run_dir = layout.make_run_dir("agent-os", "r1")
+
+        proc = _FakeProc()
+        prev_wait = bv._wait_for_url
+        bv._wait_for_url = _always_ready  # type: ignore[assignment]
+        try:
+            result = run_browser_verification(
+                "agent-os",
+                run_dir=run_dir,
+                process_starter=_fake_starter_factory(proc),
+                page_capture_runner=_multipage_capture_runner,
+                max_pages=3,
+            )
+        finally:
+            bv._wait_for_url = prev_wait  # type: ignore[assignment]
+
+        assert result.status == "passed"
+        # Primary keeps the legacy name + screenshot_path contract.
+        assert result.screenshot_path == "screenshots/browser.png"
+        assert len(result.pages) == 3
+        assert [p.path for p in result.pages] == [
+            "screenshots/browser.png",
+            "screenshots/page-02.png",
+            "screenshots/page-03.png",
+        ]
+        assert result.readiness == "confirmed"
+        assert (run_dir / "screenshots" / "page-03.png").exists()
+        assert proc.terminated or proc.killed
+
+    _run(body)
+
+
+def test_legacy_screenshot_runner_yields_single_page():
+    """A legacy ``screenshot_runner`` is adapted to a one-page manifest, and the
+    ``screenshots/browser.png`` + ``screenshot_path`` contract is preserved."""
+
+    def body(layout: _TempLayout):
+        task_md = (
+            "## Browser Verification\n\n"
+            "```bash\nnpm run dev\nurl: http://127.0.0.1:5173\n```\n"
+        )
+        layout.init_workspace("agent-os", task_md_body=task_md)
+        run_dir = layout.make_run_dir("agent-os", "r1")
+
+        proc = _FakeProc()
+        prev_wait = bv._wait_for_url
+        bv._wait_for_url = _always_ready  # type: ignore[assignment]
+        try:
+            result = run_browser_verification(
+                "agent-os",
+                run_dir=run_dir,
+                process_starter=_fake_starter_factory(proc),
+                screenshot_runner=_writing_screenshot_runner,
+            )
+        finally:
+            bv._wait_for_url = prev_wait  # type: ignore[assignment]
+
+        assert result.status == "passed"
+        assert result.screenshot_path == "screenshots/browser.png"
+        assert len(result.pages) == 1
+        assert result.pages[0].path == "screenshots/browser.png"
+        assert result.pages[0].readiness == "unknown"
+
+    _run(body)
+
+
+def test_render_section_lists_pages_and_readiness():
+    r = BrowserVerificationResult(
+        enabled=True,
+        command="npm run dev",
+        url="http://127.0.0.1:5174",
+        status="passed",
+        screenshot_path="screenshots/browser.png",
+        readiness="confirmed",
+        pages=[
+            BrowserPageCapture(path="screenshots/browser.png", label="Home", readiness="confirmed"),
+            BrowserPageCapture(path="screenshots/page-02.png", label="Reports", readiness="unconfirmed"),
+        ],
+    )
+    text = render_browser_verification_section(r)
+    assert "Render readiness" in text
+    assert "Pages captured" in text
+    assert "page-02.png" in text
+    assert "Reports" in text
 
 
 # ---------- runner ----------

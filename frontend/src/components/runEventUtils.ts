@@ -15,10 +15,14 @@ export function kindFor(status: string | undefined): string {
     case 'pending':
     case 'failed':
     case 'cancelled':
+    case 'warning':
       return status
     case 'partial':
     case 'blocked':
       return 'failed'
+    // Visual-judgment "inconclusive" maps onto the neutral skipped palette.
+    case 'inconclusive':
+      return 'skipped'
     default:
       return 'running'
   }

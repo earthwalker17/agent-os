@@ -166,3 +166,48 @@ def chat(
             if delay > 0:
                 time.sleep(delay)
             attempt += 1
+
+
+def chat_vision(
+    system: str,
+    prompt: str,
+    images: list[tuple[str, str]],
+    model: str | None = None,
+    max_tokens: int = 2048,
+    provider: str | None = None,
+) -> str:
+    """Send a single-turn text+image request and return the assistant text.
+
+    ``images`` is a list of ``(media_type, base64_data)`` tuples. When
+    ``provider`` is omitted, the default *vision-capable* provider is used
+    (``providers.default_vision_provider()``); if none is available a
+    ``providers.ProviderError`` is raised so the caller can skip gracefully.
+
+    Shares ``chat``'s transient-failure retry policy (see ``_is_transient``).
+    """
+    provider_id = provider or providers.default_vision_provider()
+    if not provider_id:
+        raise providers.ProviderError(
+            "no vision-capable provider is available — set a vision provider API key"
+        )
+
+    attempt = 0
+    while True:
+        try:
+            return providers.complete_vision(
+                provider_id, system, prompt, images, model=model, max_tokens=max_tokens
+            )
+        except Exception as exc:  # noqa: BLE001 — re-raised below if not retryable
+            if attempt >= _MAX_RETRIES or not _is_transient(exc):
+                raise
+            delay = min(_RETRY_BASE_DELAY * (2 ** attempt), _MAX_BACKOFF)
+            log.warning(
+                "llm.chat_vision transient failure (attempt %d/%d), retrying in %.1fs: %s",
+                attempt + 1,
+                _MAX_RETRIES + 1,
+                delay,
+                exc,
+            )
+            if delay > 0:
+                time.sleep(delay)
+            attempt += 1

@@ -59,7 +59,8 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
   const [record, setRecord] = useState<RunRecord | null>(null)
   const [verifying, setVerifying] = useState(false)
   const [verifyError, setVerifyError] = useState<string | null>(null)
-  const [screenshotOpen, setScreenshotOpen] = useState(false)
+  // Index of the captured page shown in the fullscreen lightbox (null = closed).
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   // Run control (cancel / retry).
   const [controlBusy, setControlBusy] = useState(false)
   const [controlError, setControlError] = useState<string | null>(null)
@@ -217,9 +218,71 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
     !commandVerifying &&
     !commandVerifyFailed
   const hadVerifyAttempt = !!bv && bv.enabled && (bv.status === 'passed' || bv.status === 'failed')
-  const screenshotUrl = bv?.screenshot_path
-    ? `/api/projects/${projectId}/execution/runs/${runId}/screenshot`
-    : null
+  const pageUrl = (path: string) => {
+    const name = path.split('/').pop() || 'browser.png'
+    return `/api/projects/${projectId}/execution/runs/${runId}/screenshot?name=${encodeURIComponent(name)}`
+  }
+  // Captured pages (multi-page). Falls back to the single primary screenshot for
+  // runs verified before the multi-page upgrade.
+  const galleryPages =
+    bv?.pages && bv.pages.length > 0
+      ? bv.pages.map((p) => ({ path: p.path, label: p.label || p.path, readiness: p.readiness }))
+      : bv?.screenshot_path
+        ? [{ path: bv.screenshot_path, label: 'Home', readiness: bv.readiness ?? undefined }]
+        : []
+  const vr = record.visual_review
+
+  // Thumbnail gallery — distinct from the "captured" vs "judged" signals below.
+  const gallery =
+    galleryPages.length > 0 ? (
+      <div className="run-chat-gallery">
+        {galleryPages.map((p, i) => (
+          <button
+            key={p.path}
+            type="button"
+            className="run-chat-shot"
+            onClick={() => setLightboxIndex(i)}
+            title={`Open ${p.label}`}
+          >
+            <img src={pageUrl(p.path)} alt={p.label} className="run-chat-screenshot-thumb" />
+            {galleryPages.length > 1 && <span className="run-chat-shot-label">{p.label}</span>}
+          </button>
+        ))}
+      </div>
+    ) : null
+
+  // AI visual judgment — the third distinct signal (server reachable → page
+  // captured → visually judged). Diagnostic only; never affects run status.
+  const visualReviewBlock =
+    vr && vr.enabled ? (
+      vr.status === 'skipped' ? (
+        <p className="run-chat-muted">
+          AI visual judgment skipped{vr.skipped_reason ? `: ${vr.skipped_reason}` : ''}.
+        </p>
+      ) : (
+        <div className={`run-chat-visual visual-${vr.status}`}>
+          <div className="run-chat-visual-head">
+            <span className={`run-verify-status status-${vr.status}`}>{vr.status}</span>
+            <strong>AI visual judgment</strong>
+          </div>
+          {vr.headline && <p className="run-chat-visual-headline">{vr.headline}</p>}
+          {vr.reasoning && <p className="run-chat-visual-reason">{vr.reasoning}</p>}
+          {vr.evidence && vr.evidence.length > 0 && (
+            <ul className="run-chat-visual-evidence">
+              {vr.evidence.map((e, i) => (
+                <li key={i}>{e}</li>
+              ))}
+            </ul>
+          )}
+          {vr.provider && (
+            <p className="run-chat-muted run-chat-visual-by">
+              Reviewed by {vr.provider}
+              {vr.model ? ` / ${vr.model}` : ''}
+            </p>
+          )}
+        </div>
+      )
+    ) : null
 
   return (
     <div className="run-chat-card">
@@ -331,8 +394,15 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
               ? 'Dependencies were installed successfully, '
               : ''}
             the dev server started{' '}
-            {bv.url ? `on ${stripScheme(bv.url)}` : ''} and the page rendered.
+            {bv.url ? `on ${stripScheme(bv.url)}` : ''} and the page rendered
+            {galleryPages.length > 1 ? ` (${galleryPages.length} views captured).` : '.'}
           </p>
+          {bv.readiness === 'unconfirmed' && (
+            <p className="run-chat-muted">
+              Note: render readiness could not be confirmed before capture — the
+              app may still have been settling.
+            </p>
+          )}
           {bv.url && (
             <p className="run-chat-preview-url">
               Preview:{' '}
@@ -341,20 +411,8 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
               </a>
             </p>
           )}
-          {screenshotUrl && (
-            <button
-              type="button"
-              className="run-chat-screenshot-btn"
-              onClick={() => setScreenshotOpen(true)}
-              title="Open the captured screenshot"
-            >
-              <img
-                src={screenshotUrl}
-                alt="browser verification screenshot"
-                className="run-chat-screenshot-thumb"
-              />
-            </button>
-          )}
+          {gallery}
+          {visualReviewBlock}
         </div>
       )}
 
@@ -375,19 +433,7 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
           {bv.output_preview && (
             <pre className="run-chat-verify-output">{bv.output_preview}</pre>
           )}
-          {screenshotUrl && (
-            <button
-              type="button"
-              className="run-chat-screenshot-btn"
-              onClick={() => setScreenshotOpen(true)}
-            >
-              <img
-                src={screenshotUrl}
-                alt="browser verification screenshot"
-                className="run-chat-screenshot-thumb"
-              />
-            </button>
-          )}
+          {gallery}
         </div>
       )}
 
@@ -465,11 +511,39 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
         </button>
       </div>
 
-      {screenshotOpen && screenshotUrl && (
-        <div className="run-chat-lightbox" onClick={() => setScreenshotOpen(false)}>
-          <img src={screenshotUrl} alt="browser verification screenshot (full)" />
-        </div>
-      )}
+      {lightboxIndex !== null && galleryPages[lightboxIndex] && (() => {
+        const idx = lightboxIndex
+        const page = galleryPages[idx]
+        const count = galleryPages.length
+        return (
+          <div className="run-chat-lightbox" onClick={() => setLightboxIndex(null)}>
+            <div className="run-chat-lightbox-inner" onClick={(e) => e.stopPropagation()}>
+              <img src={pageUrl(page.path)} alt={`${page.label} (full)`} />
+              <div className="run-chat-lightbox-bar">
+                {count > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => setLightboxIndex((idx - 1 + count) % count)}
+                  >
+                    ‹ Prev
+                  </button>
+                )}
+                <span>
+                  {page.label} ({idx + 1}/{count})
+                </span>
+                {count > 1 && (
+                  <button type="button" onClick={() => setLightboxIndex((idx + 1) % count)}>
+                    Next ›
+                  </button>
+                )}
+                <button type="button" onClick={() => setLightboxIndex(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

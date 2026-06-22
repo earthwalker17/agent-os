@@ -487,6 +487,79 @@ reconciliation semantics, and the Aegis success sample are unchanged.
   local single-user — the cursor just trims the response + lets the client
   append).
 
+### Browser Verification Readiness, Multi-Page Flow & AI Visual Judgment
+Upgraded browser verification from "a dev server is reachable and *a* screenshot
+exists" into a minimal autonomous browser review loop: wait for a genuine render,
+visit a few views, capture per-page screenshots, and ask a vision model whether
+the result actually looks usable. The dev-server lifecycle, default port 5174 +
+`--strictPort`, Windows subprocess robustness, preview keep-alive handoff,
+command verification, repair, and the Aegis sample are all unchanged.
+- **Readiness fix (the core bug).** The old path captured immediately after the
+  page's `load` event (HTTP-reachable + bundle loaded), so an SPA still hydrating
+  or fetching screenshotted as a `"Loading…"` spinner — exactly the committed
+  failure evidence in `aegis-launch-control/runs/20260619-…/screenshots/browser.png`
+  (recorded `passed`, but a spinner). Capture now runs in a Playwright subprocess
+  that, per page, waits for a *rendered* state before the shot:
+  `networkidle` (best-effort) + DOM-populated signals (`#root`/`#app`/`main` has
+  real children, visible text beyond a loading phrase, no visible
+  spinner/skeleton/`aria-busy`) + body-text **stability** across samples + a short
+  animation settle. On timeout it captures anyway and marks
+  `readiness="unconfirmed"` (a slow-but-alive app is never failed outright — the
+  visual judge is the second line of defense).
+- **Multi-page flow.** After the entry page renders, the capture script discovers
+  a few same-origin navigation targets (tabs `[role=tab]`, route links, nav
+  buttons), visits each (route-navigate or click), waits for readiness, and
+  captures it. Bounded (`MAX_BROWSER_PAGES = 4`). Stable names: `browser.png`
+  (primary, unchanged contract) + `page-02.png`, `page-03.png`, …. Each capture is
+  a `BrowserPageCapture` (path/label/title/readiness/nav_kind) on
+  `BrowserVerificationResult.pages`; `screenshot_path` still mirrors `pages[0]`.
+- **AI visual judgment** (`visual_judge.py`, new). After a passing capture, a
+  vision-capable model judges the screenshots against the task: loaded? coherent?
+  relevant? free of broken states (spinner-only, blank, error overlay, missing
+  content, wrong route)? Returns a structured verdict
+  (`passed`/`warning`/`failed`/`inconclusive`) with a concise user-facing
+  rationale + evidence (never chain-of-thought), persisted as `visual_review.json`
+  and on `RunRecord.visual_review`. **Diagnostic-only** — it never changes run
+  status, never downgrades `completed`→`partial`, never adds blockers. Runs
+  automatically inside the same UI `browser-verify` request and in the runner's
+  configured-block path; **skips gracefully** with a clear reason when no
+  vision-capable provider key is set. Vision support added to `providers.py`
+  (`complete_vision` for Claude/GPT/Gemini — DeepSeek excluded — via image
+  content blocks; no new deps) + `llm.chat_vision` (shared retry).
+- **Surfaced + replayable.** Screenshot endpoint gained a validated `name` param
+  so each page is fetchable; the chat run card shows a multi-page thumbnail
+  gallery (lightbox with prev/next) + a visual-verdict block, clearly separating
+  the three signals — **reachable** (server) / **captured** (screenshots) /
+  **judged** (verdict). `RunDetailModal` lists every page + a Visual Review block;
+  the Live Trace + settled timeline render a `visual_review` event. `result.md`
+  gains `## Visual Review`. All ride on run.json so they survive reload/restart.
+- **Tests.** New `test_visual_judge.py` (13: gate/skip rules, strict + fenced
+  JSON parse, tolerant-failure → inconclusive, never-raises, image-count cap,
+  persistence, render). Extended `test_browser_verification.py` (+3: multi-page
+  capture, legacy single-capture adapter regression, render lists pages),
+  `test_ui_browser_verification.py` (+3: visual review runs on pass without
+  changing status, failed verdict doesn't downgrade, skips without a key),
+  `test_providers.py` (+9: vision capability/availability/default, `complete_vision`
+  dispatch + payload shape per provider, `chat_vision`). Full suite **331** green;
+  frontend `npm run build` green.
+- **Live end-to-end validation.** A fresh 3-view app ("TaskDeck": Board /
+  Timeline / Stats tabs, bundled seed data) was built **through the real runner
+  path** — Agent OS planned a 7-task graph, executed it, and command verification
+  passed (`npm install` + `npm run build`, 1 repair). The build was sound, but the
+  generated project's dev toolchain hit a Node-22/`plugin-react`-babel CJS-loader
+  incompatibility, so `npm run dev` served an error overlay. The new pipeline
+  handled this **exactly right**: readiness was correctly **`unconfirmed`** (it
+  never claimed a render), and the **AI visual judgment returned `failed`** with
+  precise evidence ("error overlay, no UI, build error") — catching a real broken
+  state that HTTP readiness + `npm run build` both passed. The verdict stayed
+  **diagnostic-only** (run remained `completed`); `visual_review.json` + run.json +
+  result.md persisted and reloaded. Separately, the production
+  `_default_playwright_capture` ran against a known-good 3-tab page that shows a
+  spinner for 700 ms before rendering: it **waited past the spinner** (primary
+  `readiness=confirmed`, no spinner captured) and **discovered + captured 4 views**
+  (entry + Board/Timeline/Stats tabs) — confirming the readiness gate and
+  multi-page flow on a working app. Aegis Launch Control was untouched throughout.
+
 ---
 
 ## Execution-trigger contract (invariant)
@@ -511,7 +584,11 @@ reconciliation semantics, and the Aegis success sample are unchanged.
   `## Browser Verification` block additionally captures a headless screenshot.
   The user-facing loop lives in chat (06.2D); a managed preview server
   (one per project, sandbox-validated, torn down on shutdown) keeps the URL
-  live. **No AI visual judgment yet** — screenshots are stored, not analyzed.
+  live. Browser verification now **waits for a genuine render** (not just the
+  load event), captures a **few discovered views** (not one fixed page), and —
+  when a vision-capable provider key is set — runs an **AI visual judgment**
+  over the screenshots. The verdict is **diagnostic-only** (it never changes run
+  status) and **skips gracefully** when no vision key is configured.
 - **Up to 3–4 LLM calls per non-`@code` chat turn** — delegation judge +
   (optional inspection iterations) + chat response + memory judge. A repair
   pass adds a bounded loop only when verification fails on a `completed` run.
@@ -540,20 +617,21 @@ Anthropic key is needed. Each file is runnable standalone.
 | `test_inspect.py`                 |    29 | 06.1 sandbox, parser, orchestrator loop                      |
 | `test_verification.py`            |    21 | 06.2A parser, runner integration, sandbox path               |
 | `test_verification_inference.py`  |    23 | 06.2E inference, multi-command, pytest probe/fallback, repair |
-| `test_browser_verification.py`    |    26 | 06.2B parser, lifecycle, drainer, Playwright diagnostics     |
+| `test_browser_verification.py`    |    29 | 06.2B parser, lifecycle, drainer, Playwright diagnostics; multi-page capture + legacy single-capture adapter |
 | `test_runner_diagnostics.py`      |     9 | 06.2B.1 observed activity, sweep_stuck_runs                  |
-| `test_ui_browser_verification.py` |    12 | 06.2C UI flow: default port, install step, status recompute  |
+| `test_ui_browser_verification.py` |    15 | 06.2C UI flow: default port, install step, status recompute; visual review on pass (diagnostic-only) + graceful skip |
 | `test_preview.py`                 |    12 | 06.2D preview registry; 06.2E `deps_installed`               |
 | `test_chat_first_endpoints.py`    |     3 | 06.2D HTTP: browser-verify sub-status, preview start/stop    |
 | `test_uploads.py`                 |    14 | 07.0 sanitize/dedup/storage, workspace copy, upload HTTP      |
-| `test_providers.py`               |    19 | 07.1 availability, default order, dispatch/parse, chat routing |
+| `test_providers.py`               |    28 | 07.1 availability, default order, dispatch/parse, chat routing; vision capability/availability + `complete_vision`/`chat_vision` |
 | `test_planner.py`                 |    28 | Phase 5 heuristic gate (+ clause heuristic), plan parse/fallback, graph + aggregation |
 | `test_runner_planning.py`         |     7 | Phase 5 plan→tasks integration: decompose, skip, fallback, gate, artifact consistency |
 | `test_run_control.py`             |    16 | Run control: events/task-card readers, cooperative cancel, cancel/retry endpoints, orphan + race guard, orphan plan-settle, retry-of-cancelled, events `since` cursor |
 | `test_llm_retry.py`               |     4 | Autonomy hardening: transient-vs-permanent LLM error classification, retry-then-succeed, no-retry-on-deterministic, exhaust-then-raise |
 | `test_autonomy_hardening.py`      |    11 | Autonomy hardening: progress-aware dependency skip (+cycle remainder), productive continuation (incl. overwrite), failed-with-files dependent runs, repair on partial, iterative-repair convergence |
 | `test_live_metrics.py`            |     5 | Progressive run metrics: run-level files/cmds climb while RUNNING, `_persist_live_metrics` disk-update + terminal no-op, per-task plan.json attribution |
-| **Total**                         | **303** |                                                            |
+| `test_visual_judge.py`            |    13 | AI visual judgment: gate/skip rules, strict + fenced JSON parse, tolerant-failure → inconclusive, never-raises, image cap, persistence, render |
+| **Total**                         | **331** |                                                            |
 
 Run all (from `backend/`): `python tests/<file>.py` for each row above.
 
@@ -561,12 +639,16 @@ Run all (from `backend/`): `python tests/<file>.py` for each row above.
 
 ## Recommended Next Steps
 
-### Next up: AI-assisted visual review
-Browser verification captures a screenshot but doesn't judge it. Add a small
-model-judged pass over the screenshot + task card + `result.md` producing a
-"looks right / wrong / can't tell" verdict. Open questions: third post-run step
-vs. folding into 06.0; cost-gate to only `completed`+passing-browser runs; how
-to surface the verdict in the UI.
+### Next up
+- **Bounded auto-repair on a failed visual verdict.** Visual judgment is
+  diagnostic-only today. A natural, bounded next step: when the verdict is
+  `failed` (e.g. spinner-only / blank), feed the verdict + evidence back as one
+  repair pass (reusing the existing `_verify_with_repair` shape), then re-capture
+  + re-judge once. Keep it tightly capped and opt-in so run semantics stay
+  predictable.
+- **Per-view targeting.** Today nav discovery is heuristic (tabs/links/buttons).
+  Let a `## Browser Verification` block optionally list explicit views/paths to
+  capture for apps whose nav isn't auto-discoverable.
 
 ### After that
 - **Streaming responses** (SSE on `/api/chat`) — touches `llm.py`,

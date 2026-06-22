@@ -178,6 +178,36 @@ class VerificationResult(BaseModel):
     repair_attempts: int = 0
 
 
+class BrowserPageCapture(BaseModel):
+    """One captured page/view from a browser-verification run.
+
+    The capture pipeline visits a small, bounded set of pages (the entry
+    URL plus a few discovered navigation targets) and records one of these
+    per page. ``path`` is the run-relative artifact path (e.g.
+    ``screenshots/browser.png``) so the UI can build a fetch URL without
+    leaking absolute filesystem paths. The first capture always keeps the
+    legacy ``screenshots/browser.png`` name for backward compatibility.
+
+    ``readiness`` records how confident the capture pipeline is that the
+    page had actually rendered before the screenshot was taken:
+    ``"confirmed"`` (a render signal was observed and the DOM had settled),
+    ``"unconfirmed"`` (the readiness wait timed out — captured anyway so a
+    slow-but-alive app is never failed outright), or ``"unknown"`` (legacy
+    / single-capture path that does not run the readiness loop).
+
+    ``nav_kind`` records how the page was reached: ``"primary"`` (the entry
+    URL), ``"link"`` (a same-origin route link), ``"tab"`` (a tab control),
+    or ``"button"`` (a navigation button).
+    """
+
+    path: str
+    url: str = ""
+    label: str = ""
+    title: str = ""
+    readiness: str = "unknown"  # "confirmed" | "unconfirmed" | "unknown"
+    nav_kind: str = ""  # "primary" | "link" | "tab" | "button"
+
+
 class BrowserVerificationResult(BaseModel):
     """Outcome of the optional post-run browser verification (Task 06.2B).
 
@@ -193,8 +223,12 @@ class BrowserVerificationResult(BaseModel):
     ``"skipped"`` (recorded for completeness; rarely used).
 
     ``screenshot_path`` is the run-relative path (e.g.
-    ``screenshots/browser.png``) so the UI can build a fetch URL without
-    leaking absolute filesystem paths.
+    ``screenshots/browser.png``) of the *primary* (first) capture so the UI
+    can build a fetch URL without leaking absolute filesystem paths. The
+    multi-page upgrade adds ``pages`` (every captured view, including the
+    primary one) and ``readiness`` (the aggregate readiness of the primary
+    capture); ``screenshot_path`` continues to mirror ``pages[0].path`` so
+    existing single-screenshot consumers keep working unchanged.
     """
 
     enabled: bool = False
@@ -204,6 +238,13 @@ class BrowserVerificationResult(BaseModel):
     screenshot_path: Optional[str] = None
     output_preview: str = ""
     duration_ms: Optional[int] = None
+    # Multi-page capture (readiness + multi-view upgrade). ``pages`` carries
+    # every captured view (the primary capture is ``pages[0]`` and keeps the
+    # ``screenshots/browser.png`` name); ``readiness`` is the primary
+    # capture's readiness outcome. Both default empty/None so older records
+    # and the single-capture path round-trip unchanged.
+    pages: list[BrowserPageCapture] = Field(default_factory=list)
+    readiness: Optional[str] = None
     # Task 06.2C — optional dependency-install step for the UI-triggered
     # flow. ``None`` for the TASK.md-driven runner path (06.2B), which does
     # not install anything. For the user-triggered flow, ``install_status``
@@ -213,6 +254,40 @@ class BrowserVerificationResult(BaseModel):
     install_command: Optional[str] = None
     install_status: Optional[str] = None  # "passed" | "failed" | "skipped"
     install_output_preview: str = ""
+
+
+class VisualReviewResult(BaseModel):
+    """Outcome of the optional AI visual judgment over browser screenshots.
+
+    Runs after a passing browser verification, when a vision-capable model
+    provider key is configured. A vision model looks at the captured
+    page(s) plus the task context and judges whether the app appears
+    actually usable — loaded, visually coherent, relevant to the task, and
+    free of obvious broken states (spinner-only, blank page, error overlay,
+    missing content, wrong route).
+
+    **Diagnostic-only.** This result never changes a run's status, never
+    downgrades ``completed`` → ``partial``, and never adds blockers — it is
+    a separate, advisory signal surfaced alongside browser verification.
+
+    ``status`` is ``"passed"`` / ``"warning"`` / ``"failed"`` /
+    ``"inconclusive"`` (the model's verdict) or ``"skipped"`` (no
+    vision-capable provider, no screenshots, or otherwise not run — see
+    ``skipped_reason``). ``reasoning`` is a concise, user-facing rationale
+    only — never raw chain-of-thought. ``pages`` holds an optional per-page
+    breakdown (``{path, label, verdict, note}``).
+    """
+
+    enabled: bool = False
+    status: str = "skipped"  # passed | warning | failed | inconclusive | skipped
+    headline: str = ""
+    reasoning: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    pages: list[dict] = Field(default_factory=list)
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    duration_ms: Optional[int] = None
+    skipped_reason: str = ""
 
 
 class RunRecord(BaseModel):
@@ -255,6 +330,11 @@ class RunRecord(BaseModel):
     # populated with ``enabled=False, status="skipped"`` so the UI can
     # still display a consistent block.
     browser_verification: Optional[BrowserVerificationResult] = None
+    # AI visual judgment over the browser-verification screenshots. ``None``
+    # for runs that finished before visual review was introduced, or that
+    # never reached a passing browser verification. Diagnostic-only — it is
+    # surfaced alongside browser verification but never changes ``status``.
+    visual_review: Optional[VisualReviewResult] = None
     # Task 06.2E — transient sub-status for the automatic post-run command
     # verification phase. ``None`` outside that phase; ``"verifying"`` while
     # the inferred/manual commands run, ``"repairing"`` during the one bounded
@@ -301,4 +381,5 @@ class ResultSummary(BaseModel):
     result_path: Optional[str] = None
     verification: Optional[VerificationResult] = None
     browser_verification: Optional[BrowserVerificationResult] = None
+    visual_review: Optional[VisualReviewResult] = None
     plan: Optional[ExecutionPlan] = None

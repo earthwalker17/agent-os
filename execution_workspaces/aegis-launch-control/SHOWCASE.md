@@ -7,11 +7,13 @@ natural-language task card. No human wrote any of the application code, fixed
 its build, or edited its files. It is committed here as a concrete example of
 what Agent OS can do today.
 
-![Aegis Launch Control — the Overview tab, running locally with the bundled API online](./preview.png)
+![Aegis Launch Control — the Overview tab, captured automatically by Agent OS browser verification](./runs/20260619-044436-e65d2e61/screenshots/browser.png)
 
-*The running app: the Overview tab with the Express API online — countdown,
-readiness gauge, budget/tasks/risk metrics, and the six workstreams. Captured
-by starting the app locally (`npm run dev:all`).*
+*The running app: the Overview tab — launch countdown, readiness gauge,
+budget/tasks/risk metrics, and workstream status. This is **Agent OS's own
+automated browser-verification capture** (`npm run dev`, frontend-only with the
+bundled static-data fallback), taken after the upgraded verification waited for
+the app to actually render.*
 
 > **Built by Claude Sonnet 4.5.** The Coding Agent for this run was driven by
 > **Claude Sonnet 4.5** — deliberately *not* the strongest model available.
@@ -54,7 +56,9 @@ went in. Agent OS then, with **no further human input**:
 3. **Verified** the result by actually running `npm install` + `npm run build`
    (TypeScript `tsc` + Vite) — **the build passed**, 41 modules transformed —
    with one automated repair pass along the way.
-4. **Captured** a headless-browser screenshot of the running dev server.
+4. **Verified in a browser** — spun up the dev server, **waited for the app to
+   actually render** (not a loading spinner), captured the entry view plus each
+   tab, and had a **vision model judge** the screenshots (verdict: **passed**).
 
 Outcome: **8 / 8 tasks completed, 0 blockers, production build green.** See the
 rendered [`result.md`](./runs/20260619-044436-e65d2e61/result.md) and the full
@@ -72,25 +76,37 @@ Everything the agent did is replayable from the run artifacts in
 | `events.jsonl` | Chronological log of **every** tool call (file write, command, verification step) |
 | `result.md` | Human-readable summary + the real `npm run build` log |
 | `run.json` | The full structured run record |
-| `screenshots/browser.png` | The automated browser-verification capture |
+| `screenshots/browser.png` (+ `page-02…05.png`) | The automated, readiness-gated **multi-page** browser-verification captures (Overview + each tab) |
+| `visual_review.json` | The **AI visual-judgment** verdict over those screenshots |
 
-## Two screenshots — what's what
+## What the automated verification captured
 
-- **[`preview.png`](./preview.png)** (shown above) is the **real, populated
-  app**, captured by running it locally with both servers up (`npm run dev:all`,
-  "API Online"). This is what the dashboard actually looks like.
-- **[`runs/.../screenshots/browser.png`](./runs/20260619-044436-e65d2e61/screenshots/browser.png)**
-  is the **automated** capture taken by Agent OS during the autonomous run, and
-  it shows the app's **loading state**, not the populated dashboard. That's a
-  known, documented limitation of single-server preview — not a build failure:
-  - Browser verification starts only the **frontend** dev server (`npm run dev`).
-  - This build wired the UI to fetch from the **separate Express API**, which
-    that single-server preview doesn't start, so the capture landed during load.
-  - The app ships a static-data fallback for frontend-only use; the **production
-    build itself passes** (see the build log in `result.md`).
+Agent OS's browser verification waits for the app to genuinely render, walks its
+tabs, and screenshots each — then a vision model judges whether the result looks
+correct. These are the captures from this run's verification (all
+frontend-only, `npm run dev`, using the bundled static-data fallback):
 
-  (Teaching Agent OS's browser verification to bring up a bundled API for this
-  case is a known follow-up.)
+| Overview | Workstream Board |
+|----------|------------------|
+| ![Overview](./runs/20260619-044436-e65d2e61/screenshots/browser.png) | ![Workstream Board](./runs/20260619-044436-e65d2e61/screenshots/page-03.png) |
+| **Analytics — Risk Radar** | **Launch Timeline** |
+| ![Analytics](./runs/20260619-044436-e65d2e61/screenshots/page-04.png) | ![Timeline](./runs/20260619-044436-e65d2e61/screenshots/page-05.png) |
+
+**AI visual verdict: `passed`** — *"Aegis Launch Control dashboard is fully
+functional, visually polished, and meets all core requirements."* The model
+cited the populated countdown / readiness / budget / task metrics, the
+workstream cards, and the risk-radar matrix as evidence (full record in
+[`visual_review.json`](./runs/20260619-044436-e65d2e61/visual_review.json)). The
+verdict is **diagnostic only** — it never changes the run's status.
+
+> **Note on an earlier limitation (now fixed).** This automated capture used to
+> land on the app's brief *loading* state: single-server preview starts only the
+> frontend (`npm run dev`) while the build wired the UI to fetch from a separate
+> Express API. Agent OS's browser verification was since upgraded to **wait for a
+> real render** (the app falls back to bundled static data when the API is
+> offline), to **capture multiple views**, and to **judge the result with a
+> vision model** — so the captures above are now the populated dashboard. The
+> production build was always green (see the build log in `result.md`).
 
 ## Run it yourself
 

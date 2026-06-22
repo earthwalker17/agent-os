@@ -31,6 +31,7 @@ Design constraints (mirror 06.2A's posture):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -47,7 +48,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .manager import read_task_state
-from .models import BrowserVerificationResult, RunRecord, RunStatus
+from .models import (
+    BrowserPageCapture,
+    BrowserVerificationResult,
+    RunRecord,
+    RunStatus,
+)
 from .sandbox import ProjectSandbox, SandboxViolation
 
 
@@ -70,6 +76,20 @@ DEFAULT_SCREENSHOT_TIMEOUT_SECONDS = 20
 DEFAULT_TERMINATE_GRACE_SECONDS = 5
 READINESS_POLL_INTERVAL_SECONDS = 0.5
 
+# Multi-page capture (readiness + multi-view upgrade). The capture pipeline
+# screenshots the entry URL plus a small, bounded number of discovered
+# navigation targets (tabs / route links / nav buttons). Kept conservative and
+# local-first — this is a smoke review, not a full crawl.
+MAX_BROWSER_PAGES = 4
+# Per-page in-browser readiness budget: how long the capture script waits for a
+# page to actually RENDER (DOM populated, loading indicators gone, content
+# settled) before screenshotting. Separate from DEFAULT_READINESS_TIMEOUT_SECONDS,
+# which is the HTTP-reachability gate for the dev server. On timeout the page is
+# captured anyway and marked ``readiness="unconfirmed"`` (a slow-but-alive app is
+# never failed outright; the AI visual judgment is the second line of defense
+# against a spinner-only capture).
+DEFAULT_PAGE_READINESS_TIMEOUT_SECONDS = 12
+
 # Task 06.2C — defaults for the user-triggered browser verification flow.
 # Agent OS's own frontend runs on 5173, so the verified app must use a
 # different port to avoid a conflict. These are used only when the project
@@ -88,7 +108,12 @@ DEFAULT_DEV_URL = f"http://{DEFAULT_DEV_HOST}:{DEFAULT_DEV_PORT}"
 # on a cold cache can take a while, so the cap is generous compared to the
 # readiness/screenshot timeouts.
 DEFAULT_INSTALL_COMMAND = "npm install"
-DEFAULT_INSTALL_TIMEOUT_SECONDS = 300
+# Cold install ceiling. A cold Vite+React(+Tailwind/Express) install on Windows
+# with real-time AV scanning can exceed 300 s and time out — reporting a
+# spurious "install failed" on a fresh tree (the runner's *inferred* install was
+# already bumped to 600 s for this reason). Match it here so the UI-triggered
+# flow is just as resilient on a cold cache. Warm installs return in seconds.
+DEFAULT_INSTALL_TIMEOUT_SECONDS = 600
 
 
 # Match the heading row, then capture everything until the next top-level
@@ -441,6 +466,44 @@ def _format_exception(exc: BaseException) -> str:
     return repr(exc)
 
 
+def _raise_for_playwright_exit(returncode: int, stdout: str, stderr: str) -> None:
+    """Translate a non-zero Playwright subprocess exit into an actionable error.
+
+    Shared by the single-screenshot primitive and the multi-page capture
+    pipeline so both surface the same operator guidance. Parses the structured
+    ``{"error": ..., "message": ...}`` blob the inline scripts write to stderr
+    and maps the documented exit codes (2 = playwright missing, 3 = chromium
+    missing) to install instructions; anything else becomes a generic failure.
+    """
+    stderr = (stderr or "").strip()
+    stdout = (stdout or "").strip()
+    tag = ""
+    message = ""
+    try:
+        payload_out = json.loads(stderr)
+        tag = str(payload_out.get("error") or "")
+        message = str(payload_out.get("message") or "").strip()
+    except Exception:  # noqa: BLE001
+        message = stderr or stdout
+
+    if tag == "playwright_not_installed" or returncode == 2:
+        raise RuntimeError(
+            "Playwright is not installed in the backend environment. "
+            "Run: pip install playwright && python -m playwright install chromium"
+            + (f"\n\nDetails: {message}" if message else "")
+        )
+    if tag == "chromium_not_installed" or returncode == 3:
+        raise RuntimeError(
+            "Playwright/Chromium is not available in the backend environment. "
+            "Run: python -m playwright install chromium"
+            + (f"\n\nDetails: {message}" if message else "")
+        )
+    raise RuntimeError(
+        f"Playwright screenshot failed (exit {returncode})"
+        + (f": {message}" if message else "")
+    )
+
+
 # Inline script run in a dedicated Python subprocess so Playwright always
 # executes on the main thread of a fresh interpreter. Without this,
 # Playwright's sync API — invoked from a ``BackgroundRunManager`` worker
@@ -556,34 +619,350 @@ def _default_playwright_screenshot(url: str, output_path: Path, timeout_seconds:
     if completed.returncode == 0:
         return
 
-    # Try to parse the structured error blob the script writes to stderr.
-    stderr = (completed.stderr or "").strip()
-    stdout = (completed.stdout or "").strip()
-    tag = ""
-    message = ""
-    try:
-        payload_out = _json.loads(stderr)
-        tag = str(payload_out.get("error") or "")
-        message = str(payload_out.get("message") or "").strip()
-    except Exception:  # noqa: BLE001
-        message = stderr or stdout
-
-    if tag == "playwright_not_installed" or completed.returncode == 2:
-        raise RuntimeError(
-            "Playwright is not installed in the backend environment. "
-            "Run: pip install playwright && python -m playwright install chromium"
-            + (f"\n\nDetails: {message}" if message else "")
-        )
-    if tag == "chromium_not_installed" or completed.returncode == 3:
-        raise RuntimeError(
-            "Playwright/Chromium is not available in the backend environment. "
-            "Run: python -m playwright install chromium"
-            + (f"\n\nDetails: {message}" if message else "")
-        )
-    raise RuntimeError(
-        f"Playwright screenshot failed (exit {completed.returncode})"
-        + (f": {message}" if message else "")
+    # Translate the documented exit codes into actionable operator guidance.
+    _raise_for_playwright_exit(
+        completed.returncode, completed.stdout or "", completed.stderr or ""
     )
+
+
+# ---------- multi-page readiness-gated capture ----------
+
+
+# Signature: (url, screenshots_dir, *, max_pages, readiness_timeout_seconds,
+#             screenshot_timeout_seconds) -> list[BrowserPageCapture].
+# Captures the entry URL plus a bounded set of discovered navigation targets,
+# each only after the page has actually rendered. Raises on failure; tests can
+# swap in a stub. The default implementation drives Playwright.
+PageCaptureRunner = Callable[..., "list[BrowserPageCapture]"]
+
+
+# Marker that delimits the JSON manifest on the capture subprocess's stdout, so
+# the parent can find it even if Playwright/Chromium prints stray warnings.
+_CAPTURE_MANIFEST_MARKER = "__AGENTOS_CAPTURE_MANIFEST__"
+
+
+# Inline script run in a dedicated Python subprocess (same Windows
+# SelectorEventLoop workaround as the single-screenshot primitive). For each
+# page it (1) navigates, (2) waits for a *rendered* state — DOM populated,
+# loading indicators gone, body text settled — rather than just the load event,
+# then (3) screenshots. After the entry page it discovers a few same-origin
+# navigation targets (tabs / route links / nav buttons) and captures each.
+#
+# Communication contract:
+#   args via sys.argv[1] as JSON: {url, screenshots_dir, max_pages,
+#       readiness_timeout_ms, nav_timeout_ms, primary_name}
+#   exit 0 = success; stdout carries  <marker><json manifest list>
+#   exit 2 = playwright not importable
+#   exit 3 = chromium not installed
+#   exit 4 = capture failed
+# stderr carries a JSON {"error","message"} blob on the error exits.
+_PLAYWRIGHT_CAPTURE_SCRIPT = (
+    r'''
+import json
+import os
+import sys
+import time
+
+_MARKER = "''' + _CAPTURE_MANIFEST_MARKER + r'''"
+
+args = json.loads(sys.argv[1])
+url = args["url"]
+screenshots_dir = args["screenshots_dir"]
+max_pages = max(1, int(args["max_pages"]))
+readiness_timeout_ms = int(args["readiness_timeout_ms"])
+nav_timeout_ms = int(args["nav_timeout_ms"])
+primary_name = args.get("primary_name", "browser.png")
+
+os.makedirs(screenshots_dir, exist_ok=True)
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception as exc:
+    sys.stderr.write(json.dumps({
+        "error": "playwright_not_installed",
+        "message": f"{type(exc).__name__}: {exc}",
+    }))
+    sys.exit(2)
+
+READINESS_JS = """
+() => {
+  const body = document.body;
+  const bodyText = (body && body.innerText || "").trim();
+  const root = document.querySelector("#root, #app, main, [data-reactroot]") || body;
+  const rootChildren = root ? root.querySelectorAll("*").length : 0;
+  const sel = '[class*="spinner" i],[class*="loading" i],[class*="skeleton" i],[aria-busy="true"]';
+  let visibleLoaders = 0;
+  for (const el of document.querySelectorAll(sel)) {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    if (r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0") visibleLoaders++;
+  }
+  const lower = bodyText.toLowerCase();
+  const loadingOnly = bodyText.length > 0 && bodyText.length <= 40 && (lower.indexOf("loading") === 0 || lower.indexOf("please wait") >= 0);
+  return {textLen: bodyText.length, rootChildren: rootChildren, visibleLoaders: visibleLoaders, loadingOnly: loadingOnly, title: document.title || ""};
+}
+"""
+
+NAV_DISCOVER_JS = """
+(maxTargets) => {
+  const out = [];
+  const seen = new Set();
+  const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().slice(0, 60);
+  const push = (kind, label, href) => {
+    label = norm(label);
+    if (!label) return;
+    const key = label.toLowerCase();
+    if (seen.has(key)) return;
+    if (out.length >= maxTargets) return;
+    seen.add(key);
+    out.push({kind: kind, label: label, href: href || ""});
+  };
+  for (const el of document.querySelectorAll('[role="tab"]')) push("tab", el.innerText || el.getAttribute("aria-label"), "");
+  for (const a of document.querySelectorAll('nav a[href], header a[href], a[href^="/"], a[href^="#/"], a[href^="./"]')) {
+    let abs;
+    try { abs = new URL(a.getAttribute("href"), location.href); } catch (e) { continue; }
+    if (abs.origin !== location.origin) continue;
+    if (abs.href === location.href) continue;
+    push("link", a.innerText || a.getAttribute("aria-label"), abs.href);
+  }
+  for (const b of document.querySelectorAll('nav button, header button, [class*="tab" i] button')) push("button", b.innerText || b.getAttribute("aria-label"), "");
+  return out.slice(0, maxTargets);
+}
+"""
+
+def wait_ready(page):
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(readiness_timeout_ms, 5000))
+    except Exception:
+        pass
+    deadline = time.monotonic() + readiness_timeout_ms / 1000.0
+    last_len = -1
+    stable_ready = 0
+    title = ""
+    while time.monotonic() < deadline:
+        try:
+            s = page.evaluate(READINESS_JS)
+        except Exception:
+            time.sleep(0.3)
+            continue
+        title = s.get("title") or title
+        rendered = (
+            (not s.get("loadingOnly"))
+            and s.get("rootChildren", 0) >= 5
+            and s.get("textLen", 0) >= 30
+            and s.get("visibleLoaders", 0) == 0
+        )
+        cur = s.get("textLen", 0)
+        stable = last_len >= 0 and abs(cur - last_len) <= max(5, int(0.02 * max(cur, 1)))
+        last_len = cur
+        if rendered and stable:
+            stable_ready += 1
+            if stable_ready >= 2:
+                time.sleep(0.4)
+                return "confirmed", title
+        else:
+            stable_ready = 0
+        time.sleep(0.4)
+    time.sleep(0.3)
+    return "unconfirmed", title
+
+manifest = []
+try:
+    with sync_playwright() as pw:
+        try:
+            browser = pw.chromium.launch(headless=True)
+        except Exception as exc:
+            text = str(exc) or repr(exc)
+            tag = "capture_failed"
+            if ("Executable doesn't exist" in text or "playwright install" in text or ("BrowserType.launch" in text and "chromium" in text.lower())):
+                tag = "chromium_not_installed"
+            sys.stderr.write(json.dumps({"error": tag, "message": text}))
+            sys.exit(3 if tag == "chromium_not_installed" else 4)
+        try:
+            ctx = browser.new_context(viewport={"width": 1280, "height": 800})
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+            readiness, title = wait_ready(page)
+            page.screenshot(path=os.path.join(screenshots_dir, primary_name), full_page=False)
+            manifest.append({"file": primary_name, "url": page.url, "label": (title or "Home"), "title": title, "readiness": readiness, "nav_kind": "primary"})
+            try:
+                targets = page.evaluate(NAV_DISCOVER_JS, max(0, max_pages - 1)) or []
+            except Exception:
+                targets = []
+            idx = 1
+            for t in targets:
+                if len(manifest) >= max_pages:
+                    break
+                try:
+                    if t.get("kind") == "link" and t.get("href"):
+                        page.goto(t["href"], wait_until="domcontentloaded", timeout=nav_timeout_ms)
+                    else:
+                        label = t.get("label") or ""
+                        clicked = False
+                        for role in ("tab", "button", "link"):
+                            try:
+                                loc = page.get_by_role(role, name=label)
+                                if loc.count() > 0:
+                                    loc.first.click(timeout=4000)
+                                    clicked = True
+                                    break
+                            except Exception:
+                                continue
+                        if not clicked:
+                            try:
+                                page.get_by_text(label, exact=False).first.click(timeout=4000)
+                                clicked = True
+                            except Exception:
+                                clicked = False
+                        if not clicked:
+                            continue
+                    readiness, title = wait_ready(page)
+                    idx += 1
+                    fname = "page-%02d.png" % idx
+                    page.screenshot(path=os.path.join(screenshots_dir, fname), full_page=False)
+                    manifest.append({"file": fname, "url": page.url, "label": (t.get("label") or title or fname), "title": title, "readiness": readiness, "nav_kind": t.get("kind") or "link"})
+                except Exception:
+                    continue
+        finally:
+            browser.close()
+except SystemExit:
+    raise
+except Exception as exc:
+    text = str(exc) or repr(exc)
+    sys.stderr.write(json.dumps({"error": "capture_failed", "message": f"{type(exc).__name__}: {text}"}))
+    sys.exit(4)
+
+if not manifest:
+    sys.stderr.write(json.dumps({"error": "capture_failed", "message": "no pages captured"}))
+    sys.exit(4)
+
+sys.stdout.write(_MARKER + json.dumps(manifest))
+'''
+)
+
+
+def _default_playwright_capture(
+    url: str,
+    screenshots_dir: Path,
+    *,
+    max_pages: int = MAX_BROWSER_PAGES,
+    readiness_timeout_seconds: int = DEFAULT_PAGE_READINESS_TIMEOUT_SECONDS,
+    screenshot_timeout_seconds: int = DEFAULT_SCREENSHOT_TIMEOUT_SECONDS,
+) -> list[BrowserPageCapture]:
+    """Capture the entry URL + a few rendered navigation targets via Playwright.
+
+    Runs in a fresh Python subprocess (Windows asyncio workaround). Returns one
+    :class:`BrowserPageCapture` per captured page (primary first, keeping the
+    ``screenshots/browser.png`` name). Raises ``RuntimeError`` on any failure so
+    the caller records a clean ``failed`` browser verification.
+    """
+    screenshots_dir = Path(screenshots_dir)
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        {
+            "url": url,
+            "screenshots_dir": str(screenshots_dir),
+            "max_pages": max(1, int(max_pages)),
+            "readiness_timeout_ms": max(1, int(readiness_timeout_seconds)) * 1000,
+            "nav_timeout_ms": max(1, int(screenshot_timeout_seconds)) * 1000,
+            "primary_name": "browser.png",
+        }
+    )
+    # Generous outer cap: readiness + nav budget per page, plus headroom, so a
+    # hung subprocess can't pin the verification phase forever.
+    pages = max(1, int(max_pages))
+    outer_timeout = max(
+        30, (readiness_timeout_seconds + screenshot_timeout_seconds) * pages + 30
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _PLAYWRIGHT_CAPTURE_SCRIPT, payload],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=outer_timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "could not spawn Python subprocess for Playwright capture: "
+            f"{_format_exception(exc)}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Playwright capture subprocess timed out after {outer_timeout}s"
+        ) from exc
+
+    if completed.returncode != 0:
+        _raise_for_playwright_exit(
+            completed.returncode, completed.stdout or "", completed.stderr or ""
+        )
+
+    out = completed.stdout or ""
+    marker_at = out.rfind(_CAPTURE_MANIFEST_MARKER)
+    if marker_at < 0:
+        raise RuntimeError("Playwright capture produced no manifest")
+    try:
+        raw = json.loads(out[marker_at + len(_CAPTURE_MANIFEST_MARKER):].strip() or "[]")
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"could not parse capture manifest: {_format_exception(exc)}")
+
+    captures: list[BrowserPageCapture] = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        fname = str(entry.get("file") or "").strip()
+        if not fname:
+            continue
+        captures.append(
+            BrowserPageCapture(
+                path=f"screenshots/{fname}",
+                url=str(entry.get("url") or ""),
+                label=str(entry.get("label") or ""),
+                title=str(entry.get("title") or ""),
+                readiness=str(entry.get("readiness") or "unknown"),
+                nav_kind=str(entry.get("nav_kind") or ""),
+            )
+        )
+    if not captures:
+        raise RuntimeError("Playwright capture returned no pages")
+    return captures
+
+
+def _legacy_single_capture_adapter(
+    screenshot_runner: BrowserScreenshotRunner,
+) -> PageCaptureRunner:
+    """Wrap a legacy single-screenshot runner as a one-page capture runner.
+
+    Lets callers (and the existing test suite) keep passing the simple
+    ``(url, path, timeout) -> None`` ``screenshot_runner`` while the rest of the
+    pipeline speaks the multi-page manifest shape. Produces exactly the legacy
+    ``screenshots/browser.png`` so ``screenshot_path`` stays byte-compatible.
+    """
+
+    def capture(
+        url: str,
+        screenshots_dir: Path,
+        *,
+        max_pages: int = 1,
+        readiness_timeout_seconds: int = 0,
+        screenshot_timeout_seconds: int = DEFAULT_SCREENSHOT_TIMEOUT_SECONDS,
+    ) -> list[BrowserPageCapture]:
+        screenshots_dir = Path(screenshots_dir)
+        primary = screenshots_dir / "browser.png"
+        screenshot_runner(url, primary, screenshot_timeout_seconds)
+        return [
+            BrowserPageCapture(
+                path="screenshots/browser.png",
+                url=url,
+                label="Home",
+                readiness="unknown",
+                nav_kind="primary",
+            )
+        ]
+
+    return capture
 
 
 # ---------- public entry point ----------
@@ -614,6 +993,9 @@ def _core_browser_verification(
     screenshot_runner: Optional[BrowserScreenshotRunner],
     process_starter: Optional[Callable[[str, Path], subprocess.Popen]],
     keep_alive_registrar: Optional[KeepAliveRegistrar] = None,
+    page_capture_runner: Optional[PageCaptureRunner] = None,
+    max_pages: int = MAX_BROWSER_PAGES,
+    page_readiness_timeout_seconds: int = DEFAULT_PAGE_READINESS_TIMEOUT_SECONDS,
 ) -> BrowserVerificationResult:
     """Shared dev-server -> readiness -> screenshot -> teardown lifecycle.
 
@@ -660,7 +1042,16 @@ def _core_browser_verification(
         )
 
     starter = process_starter or _start_dev_server
-    runner = screenshot_runner or _default_playwright_screenshot
+    # Resolve the page capturer. An explicit ``page_capture_runner`` wins; else a
+    # legacy single-screenshot ``screenshot_runner`` (used by the existing test
+    # suite) is wrapped to the one-page manifest shape; else the default
+    # multi-page, readiness-gated Playwright capture runs.
+    if page_capture_runner is not None:
+        capturer = page_capture_runner
+    elif screenshot_runner is not None:
+        capturer = _legacy_single_capture_adapter(screenshot_runner)
+    else:
+        capturer = _default_playwright_capture
 
     proc: Optional[subprocess.Popen] = None
     stdout_drainer: Optional[_StreamDrainer] = None
@@ -724,9 +1115,14 @@ def _core_browser_verification(
             )
 
         screenshots_dir = run_dir / "screenshots"
-        screenshot_abs_path = screenshots_dir / "browser.png"
         try:
-            runner(config.url, screenshot_abs_path, screenshot_timeout_seconds)
+            captures = capturer(
+                config.url,
+                screenshots_dir,
+                max_pages=max_pages,
+                readiness_timeout_seconds=page_readiness_timeout_seconds,
+                screenshot_timeout_seconds=screenshot_timeout_seconds,
+            )
         except Exception as exc:  # noqa: BLE001
             stdout_text = stdout_drainer.snapshot()
             stderr_text = stderr_drainer.snapshot()
@@ -745,7 +1141,9 @@ def _core_browser_verification(
                 duration_ms=int((time.perf_counter() - start) * 1000),
             )
 
-        if not screenshot_abs_path.exists():
+        primary = captures[0] if captures else None
+        primary_abs = (run_dir / primary.path) if primary is not None else None
+        if primary is None or primary_abs is None or not primary_abs.exists():
             stdout_text = stdout_drainer.snapshot()
             stderr_text = stderr_drainer.snapshot()
             extra_msg = "screenshot runner returned but file is missing"
@@ -761,9 +1159,13 @@ def _core_browser_verification(
                 duration_ms=int((time.perf_counter() - start) * 1000),
             )
 
-        screenshot_rel_path = "screenshots/browser.png"
+        screenshot_rel_path = primary.path
         status = "passed"
-        extra_msg = f"screenshot captured at {screenshot_rel_path}"
+        page_count = len(captures)
+        extra_msg = (
+            f"captured {page_count} page(s); primary at {screenshot_rel_path} "
+            f"(readiness: {primary.readiness})"
+        )
         # Task 06.2D — hand the still-running dev server off to the preview
         # layer instead of tearing it down, so the captured URL stays live.
         # Only the UI flow supplies a registrar; the runner path leaves it
@@ -784,6 +1186,8 @@ def _core_browser_verification(
             screenshot_path=screenshot_rel_path,
             output_preview=_build_output_preview("", "", extra_msg),
             duration_ms=int((time.perf_counter() - start) * 1000),
+            pages=captures,
+            readiness=primary.readiness,
         )
     finally:
         # Always tear the server down, even if we hit an unexpected
@@ -803,12 +1207,16 @@ def run_browser_verification(
     terminate_grace_seconds: int = DEFAULT_TERMINATE_GRACE_SECONDS,
     screenshot_runner: Optional[BrowserScreenshotRunner] = None,
     process_starter: Optional[Callable[[str, Path], subprocess.Popen]] = None,
+    page_capture_runner: Optional[PageCaptureRunner] = None,
+    max_pages: int = MAX_BROWSER_PAGES,
 ) -> BrowserVerificationResult:
     """Run the project's configured browser verification, if any.
 
     ``run_dir`` is the run's artifact directory (e.g.
     ``execution_workspaces/{pid}/runs/{rid}/``); screenshots are written
-    under ``run_dir / 'screenshots/'``. Never raises.
+    under ``run_dir / 'screenshots/'``. Captures the entry URL plus a few
+    discovered navigation targets, each only after the page has rendered.
+    Never raises.
 
     Skips (``enabled=False``) when TASK.md has no ``## Browser Verification``
     block — this is the post-run runner path, which must NOT auto-spin a
@@ -816,9 +1224,9 @@ def run_browser_verification(
     back to a default dev command lives in
     :func:`run_ui_browser_verification`.
 
-    ``screenshot_runner`` and ``process_starter`` are seams for tests
-    so the lifecycle can be exercised without Playwright or a real
-    dev server.
+    ``screenshot_runner`` / ``page_capture_runner`` and ``process_starter``
+    are seams for tests so the lifecycle can be exercised without Playwright
+    or a real dev server.
     """
     start = time.perf_counter()
     try:
@@ -848,6 +1256,8 @@ def run_browser_verification(
             terminate_grace_seconds=terminate_grace_seconds,
             screenshot_runner=screenshot_runner,
             process_starter=process_starter,
+            page_capture_runner=page_capture_runner,
+            max_pages=max_pages,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("Browser verification crashed for project %s", project_id)
@@ -929,6 +1339,8 @@ def run_ui_browser_verification(
     process_starter: Optional[Callable[[str, Path], subprocess.Popen]] = None,
     dependency_installer: Optional[DependencyInstaller] = None,
     keep_alive_registrar: Optional[KeepAliveRegistrar] = None,
+    page_capture_runner: Optional[PageCaptureRunner] = None,
+    max_pages: int = MAX_BROWSER_PAGES,
 ) -> BrowserVerificationResult:
     """User-triggered browser verification (Task 06.2C). Never raises.
 
@@ -1034,7 +1446,7 @@ def run_ui_browser_verification(
                 )
             install_status = "passed"
 
-        # ---- dev server -> readiness -> screenshot -> teardown ----
+        # ---- dev server -> readiness -> multi-page capture -> teardown ----
         result = _core_browser_verification(
             project_id,
             config,
@@ -1046,6 +1458,8 @@ def run_ui_browser_verification(
             screenshot_runner=screenshot_runner,
             process_starter=process_starter,
             keep_alive_registrar=keep_alive_registrar,
+            page_capture_runner=page_capture_runner,
+            max_pages=max_pages,
         )
         result.install_command = install_command
         result.install_status = install_status
@@ -1130,8 +1544,17 @@ def render_browser_verification_section(
         lines.append(f"- **URL**: {result.url}")
     if result.screenshot_path:
         lines.append(f"- **Screenshot**: `{result.screenshot_path}`")
+    if result.readiness:
+        lines.append(f"- **Render readiness**: {result.readiness}")
     if result.duration_ms is not None:
         lines.append(f"- **Duration**: {result.duration_ms} ms")
+    if result.pages:
+        lines.append(f"- **Pages captured**: {len(result.pages)}")
+        for page in result.pages:
+            label = page.label or page.path
+            lines.append(
+                f"  - `{page.path}` — {label} ({page.readiness})"
+            )
     if result.install_output_preview:
         lines.append("")
         lines.append("Install output:")

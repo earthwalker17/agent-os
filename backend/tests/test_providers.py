@@ -230,6 +230,146 @@ def test_http_error_surfaces_as_provider_error():
             providers._http_post_json = prev
 
 
+# ---------- vision (AI visual judgment) ----------
+
+
+def test_vision_capability_flags():
+    assert providers.is_vision_capable("claude") is True
+    assert providers.is_vision_capable("gpt") is True
+    assert providers.is_vision_capable("gemini") is True
+    # DeepSeek's chat model is text-only.
+    assert providers.is_vision_capable("deepseek") is False
+
+
+def test_vision_available_and_default_provider():
+    with _Keys(ANTHROPIC_API_KEY="a"):
+        assert providers.vision_available() is True
+        assert providers.default_vision_provider() == "claude"
+    with _Keys(OPENAI_API_KEY="b", GOOGLE_API_KEY="c"):
+        assert providers.default_vision_provider() == "gpt"  # preference order
+    with _Keys(DEEPSEEK_API_KEY="d"):  # only a non-vision provider
+        assert providers.vision_available() is False
+        assert providers.default_vision_provider() is None
+    with _Keys():
+        assert providers.vision_available() is False
+        assert providers.default_vision_provider() is None
+
+
+def test_complete_vision_rejects_non_vision_provider():
+    with _Keys(DEEPSEEK_API_KEY="d"):
+        try:
+            providers.complete_vision("deepseek", "sys", "hi", [("image/png", "AAAA")])
+            raise AssertionError("expected ProviderError")
+        except providers.ProviderError:
+            pass
+
+
+def test_complete_vision_unavailable_raises():
+    with _Keys(ANTHROPIC_API_KEY="a"):  # gpt has no key
+        try:
+            providers.complete_vision("gpt", "sys", "hi", [("image/png", "AAAA")])
+            raise AssertionError("expected ProviderError")
+        except providers.ProviderError:
+            pass
+
+
+def test_complete_vision_routes_to_anthropic():
+    with _Keys(ANTHROPIC_API_KEY="a"):
+        captured = {}
+
+        def fake(system, prompt, images, model, max_tokens):
+            captured["images"] = images
+            captured["model"] = model
+            return "claude vision reply"
+
+        prev = providers._complete_anthropic_vision
+        providers._complete_anthropic_vision = fake
+        try:
+            out = providers.complete_vision(
+                "claude", "sys", "describe", [("image/png", "AAAA"), ("image/png", "BBBB")]
+            )
+        finally:
+            providers._complete_anthropic_vision = prev
+        assert out == "claude vision reply"
+        assert len(captured["images"]) == 2
+        assert captured["model"] == providers.default_model("claude")
+
+
+def test_complete_vision_openai_shape_has_image_url():
+    with _Keys(OPENAI_API_KEY="sk-x"):
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["payload"] = payload
+            return {"choices": [{"message": {"content": "gpt vision reply"}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            out = providers.complete_vision(
+                "gpt", "sys", "describe", [("image/png", "AAAA")]
+            )
+        finally:
+            providers._http_post_json = prev
+        assert out == "gpt vision reply"
+        content = seen["payload"]["messages"][-1]["content"]
+        kinds = [c["type"] for c in content]
+        assert "image_url" in kinds
+        img = next(c for c in content if c["type"] == "image_url")
+        assert img["image_url"]["url"].startswith("data:image/png;base64,AAAA")
+
+
+def test_complete_vision_gemini_shape_has_inline_data():
+    with _Keys(GOOGLE_API_KEY="g-x"):
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["payload"] = payload
+            return {"candidates": [{"content": {"parts": [{"text": "gemini vision reply"}]}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            out = providers.complete_vision(
+                "gemini", "sys", "describe", [("image/png", "AAAA")]
+            )
+        finally:
+            providers._http_post_json = prev
+        assert out == "gemini vision reply"
+        parts = seen["payload"]["contents"][0]["parts"]
+        assert any("inline_data" in p for p in parts)
+        inline = next(p for p in parts if "inline_data" in p)
+        assert inline["inline_data"]["mime_type"] == "image/png"
+        assert inline["inline_data"]["data"] == "AAAA"
+
+
+def test_chat_vision_uses_default_vision_provider():
+    with _Keys(OPENAI_API_KEY="sk-x"):  # gpt is vision-capable
+        captured = {}
+
+        def fake_complete_vision(provider_id, system, prompt, images, model=None, max_tokens=2048):
+            captured["provider"] = provider_id
+            return "ok"
+
+        prev = providers.complete_vision
+        providers.complete_vision = fake_complete_vision
+        try:
+            out = llm.chat_vision("sys", "describe", [("image/png", "AAAA")])
+        finally:
+            providers.complete_vision = prev
+        assert out == "ok"
+        assert captured["provider"] == "gpt"
+
+
+def test_chat_vision_raises_when_no_vision_provider():
+    with _Keys(DEEPSEEK_API_KEY="d"):  # no vision-capable key
+        try:
+            llm.chat_vision("sys", "describe", [("image/png", "AAAA")])
+            raise AssertionError("expected ProviderError")
+        except providers.ProviderError:
+            pass
+
+
 # ---------- llm.chat delegation ----------
 
 

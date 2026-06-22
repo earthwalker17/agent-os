@@ -109,6 +109,18 @@ export interface VerificationResult {
   repair_attempts?: number
 }
 
+/** One captured page/view from a browser-verification run (multi-page upgrade). */
+export interface BrowserPageCapture {
+  path: string
+  url?: string
+  label?: string
+  title?: string
+  /** 'confirmed' | 'unconfirmed' | 'unknown' — how sure we are the page rendered. */
+  readiness?: string
+  /** 'primary' | 'link' | 'tab' | 'button' — how the page was reached. */
+  nav_kind?: string
+}
+
 export interface BrowserVerificationResult {
   enabled: boolean
   command?: string | null
@@ -121,6 +133,26 @@ export interface BrowserVerificationResult {
   install_command?: string | null
   install_status?: VerificationStatus | null
   install_output_preview?: string
+  /** Multi-page upgrade — every captured view (primary first). */
+  pages?: BrowserPageCapture[]
+  /** Primary capture's render readiness: 'confirmed' | 'unconfirmed' | 'unknown'. */
+  readiness?: string | null
+}
+
+/** AI visual-judgment verdict over the captured screenshots (diagnostic-only). */
+export type VisualReviewVerdict = 'passed' | 'warning' | 'failed' | 'inconclusive' | 'skipped'
+
+export interface VisualReviewResult {
+  enabled: boolean
+  status: VisualReviewVerdict
+  headline?: string
+  reasoning?: string
+  evidence?: string[]
+  pages?: { label?: string; verdict?: string; note?: string }[]
+  provider?: string | null
+  model?: string | null
+  duration_ms?: number | null
+  skipped_reason?: string
 }
 
 /** Phase 5 — per-task status inside a run's execution plan. */
@@ -165,6 +197,8 @@ export interface RunRecord {
   summary?: string
   verification?: VerificationResult | null
   browser_verification?: BrowserVerificationResult | null
+  /** AI visual judgment over browser-verification screenshots (diagnostic-only). */
+  visual_review?: VisualReviewResult | null
   /**
    * Task 06.2E — transient sub-status for the automatic command-verification
    * phase: 'verifying' while inferred/manual commands run, 'repairing' during

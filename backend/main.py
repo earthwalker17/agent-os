@@ -66,6 +66,7 @@ from execution.browser_verification import (
     DEFAULT_DEV_COMMAND,
     DEFAULT_DEV_URL,
 )
+from execution.visual_judge import run_visual_review
 from execution import preview
 from execution.inspect import (
     list_repo_files,
@@ -1135,16 +1136,29 @@ def api_get_run_events(project_id: str, run_id: str, since: int = 0):
 
 
 @app.get("/api/projects/{project_id}/execution/runs/{run_id}/screenshot")
-def api_get_run_screenshot(project_id: str, run_id: str):
-    """Serve the browser verification screenshot for a run (Task 06.2B).
+def api_get_run_screenshot(project_id: str, run_id: str, name: str = "browser.png"):
+    """Serve a browser-verification screenshot for a run (Task 06.2B + multi-page).
 
-    Only ``screenshots/browser.png`` inside the run's artifact dir is
-    served; the path is constructed server-side so there's no caller
-    input that could escape the artifact directory.
+    Defaults to the primary ``screenshots/browser.png`` (the legacy contract).
+    The optional ``name`` query param selects an additional captured page
+    (e.g. ``page-02.png``); it is validated to a bare ``*.png`` basename inside
+    the run's ``screenshots/`` dir, so no caller input can escape the artifact
+    directory.
     """
     _require_workspace(project_id)
+    # Reject anything that isn't a plain ``*.png`` basename (no traversal, no
+    # subdirs, no absolute paths).
+    safe_name = os.path.basename(name or "browser.png")
+    if (
+        safe_name != name
+        or not safe_name.lower().endswith(".png")
+        or safe_name in (".", "..")
+        or "/" in name
+        or "\\" in name
+    ):
+        raise HTTPException(status_code=400, detail="invalid screenshot name")
     run_dir = run_store.get_run_dir(project_id, run_id)
-    screenshot = run_dir / "screenshots" / "browser.png"
+    screenshot = run_dir / "screenshots" / safe_name
     if not screenshot.exists() or not screenshot.is_file():
         raise HTTPException(status_code=404, detail="screenshot not found")
     return FileResponse(str(screenshot), media_type="image/png")
@@ -1336,6 +1350,21 @@ def api_run_browser_verification(project_id: str, run_id: str):
     # the frontend stops showing the in-progress state.
     record.browser_verification_state = result.status
 
+    # AI visual judgment over the captured screenshots — synchronously, in this
+    # same request. Diagnostic-only (never changes run status) and best-effort:
+    # skips gracefully (with a reason) when no vision-capable provider key is
+    # configured. Runs only on a passing capture with screenshots.
+    if result.status == "passed" and result.pages:
+        title, body = run_store.read_task_card(project_id, run_id)
+        record.visual_review = run_visual_review(
+            project_id,
+            run_id,
+            task_card=body or title or record.task_title,
+            summary=record.summary,
+            browser_result=result,
+            run_dir=run_store.get_run_dir(project_id, run_id),
+        )
+
     run_store.write_run_json(project_id, run_id, record)
     run_store.rerender_result_md(project_id, run_id, record)
     run_store.append_event(
@@ -1349,9 +1378,23 @@ def api_run_browser_verification(project_id: str, run_id: str):
             "url": result.url,
             "install_status": result.install_status,
             "screenshot_path": result.screenshot_path,
+            "pages": len(result.pages),
+            "readiness": result.readiness,
             "duration_ms": result.duration_ms,
         },
     )
+    if record.visual_review is not None:
+        run_store.append_event(
+            project_id,
+            run_id,
+            {
+                "type": "visual_review",
+                "status": record.visual_review.status,
+                "headline": record.visual_review.headline,
+                "provider": record.visual_review.provider,
+                "url": result.url,
+            },
+        )
     return record.model_dump()
 
 

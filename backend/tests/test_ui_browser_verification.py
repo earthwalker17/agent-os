@@ -28,6 +28,8 @@ Run directly:
 
 from __future__ import annotations
 
+import json as _json
+import os
 import sys
 import tempfile
 import threading
@@ -47,11 +49,57 @@ from execution.browser_verification import (  # noqa: E402
     apply_ui_browser_verification_to_record,
     run_ui_browser_verification,
 )
+from execution.visual_judge import run_visual_review  # noqa: E402
 from execution.models import (  # noqa: E402
     BrowserVerificationResult,
     RunRecord,
     RunStatus,
 )
+
+
+_VISION_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "DEEPSEEK_API_KEY",
+)
+
+
+class _VisionEnv:
+    """Set exactly the given vision API keys (clearing the rest) for a block."""
+
+    def __init__(self, **keys: str) -> None:
+        self._keys = keys
+        self._prev: dict[str, str | None] = {}
+
+    def __enter__(self) -> "_VisionEnv":
+        for k in _VISION_ENV_KEYS:
+            self._prev[k] = os.environ.get(k)
+            os.environ.pop(k, None)
+        for k, v in self._keys.items():
+            os.environ[k] = v
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for k, v in self._prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _vision_stub(verdict: str = "passed"):
+    def caller(system, prompt, images, model=None, max_tokens=2048):
+        return _json.dumps(
+            {
+                "verdict": verdict,
+                "headline": f"{verdict} verdict",
+                "reasoning": "stub reasoning",
+                "evidence": ["a thing"],
+            }
+        )
+
+    return caller
 
 
 # ---------- harness ----------
@@ -494,6 +542,99 @@ def test_endpoint_flow_writes_artifacts_and_preserves_summary():
         assert "## Browser Verification" in result_md
         assert "passed" in result_md
         assert "Dependency install" in result_md
+
+    _run(body)
+
+
+# ---------- visual review integration (mirrors the endpoint) ----------
+
+
+def _verified_run(layout: _TempLayout, run_id: str):
+    """Run a passing UI browser verification and return (record, result, run_dir)."""
+    layout.init_workspace("agent-os", task_md_body="# TASK\n")
+    run_dir = layout.make_run_dir("agent-os", run_id)
+    record = RunRecord(
+        run_id=run_id,
+        project_id="agent-os",
+        task_title="Build a dashboard",
+        status=RunStatus.COMPLETED,
+        summary="built it",
+    )
+    prev = _patch_ready()
+    try:
+        result = run_ui_browser_verification(
+            "agent-os",
+            run_dir=run_dir,
+            process_starter=lambda _c, _w: _FakeProc(),
+            screenshot_runner=_writing_screenshot_runner,
+            dependency_installer=_ok_installer,
+        )
+    finally:
+        _restore_ready(prev)
+    apply_ui_browser_verification_to_record(record, result)
+    return record, result, run_dir
+
+
+def test_visual_review_runs_on_pass_without_changing_status():
+    def body(layout: _TempLayout):
+        record, result, run_dir = _verified_run(layout, "r-vr1")
+        assert result.status == "passed"
+        with _VisionEnv(ANTHROPIC_API_KEY="test"):
+            record.visual_review = run_visual_review(
+                "agent-os",
+                "r-vr1",
+                task_card="build a dashboard",
+                summary=record.summary,
+                browser_result=result,
+                run_dir=run_dir,
+                vision_caller=_vision_stub("passed"),
+            )
+        assert record.visual_review is not None
+        assert record.visual_review.status == "passed"
+        # Diagnostic-only: the run status is untouched by the verdict.
+        assert record.status == RunStatus.COMPLETED
+        assert (run_dir / "visual_review.json").exists()
+
+    _run(body)
+
+
+def test_visual_review_failed_verdict_does_not_downgrade():
+    def body(layout: _TempLayout):
+        record, result, run_dir = _verified_run(layout, "r-vr2")
+        with _VisionEnv(ANTHROPIC_API_KEY="test"):
+            record.visual_review = run_visual_review(
+                "agent-os",
+                "r-vr2",
+                task_card="build a dashboard",
+                summary=record.summary,
+                browser_result=result,
+                run_dir=run_dir,
+                vision_caller=_vision_stub("failed"),
+            )
+        assert record.visual_review.status == "failed"
+        # A failed visual verdict must NOT downgrade the run or add a blocker.
+        assert record.status == RunStatus.COMPLETED
+        assert not any("visual" in b.lower() for b in record.blockers)
+
+    _run(body)
+
+
+def test_visual_review_skips_without_vision_key():
+    def body(layout: _TempLayout):
+        record, result, run_dir = _verified_run(layout, "r-vr3")
+        with _VisionEnv():  # no vision keys configured
+            review = run_visual_review(
+                "agent-os",
+                "r-vr3",
+                task_card="build a dashboard",
+                summary=record.summary,
+                browser_result=result,
+                run_dir=run_dir,
+                vision_caller=_vision_stub("passed"),
+            )
+        assert review.status == "skipped"
+        assert review.skipped_reason
+        assert record.status == RunStatus.COMPLETED
 
     _run(body)
 

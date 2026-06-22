@@ -1652,6 +1652,17 @@ html, body, #root {
   color: var(--text-muted);
 }
 
+/* AI visual-judgment verdicts. */
+.run-verify-status.status-warning {
+  background: rgba(210, 153, 34, 0.18);
+  color: #d29922;
+}
+
+.run-verify-status.status-inconclusive {
+  background: rgba(139, 148, 158, 0.15);
+  color: var(--text-muted);
+}
+
 /* Phase 5 — Plan & Tasks block in the run detail modal. */
 .run-detail-plan {
   display: flex;
@@ -2301,6 +2312,149 @@ html, body, #root {
   max-height: 95%;
   border-radius: 6px;
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+}
+
+.run-chat-lightbox-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  cursor: default;
+  max-width: 95%;
+  max-height: 95%;
+}
+
+.run-chat-lightbox-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: #fff;
+  font-size: 12px;
+}
+
+.run-chat-lightbox-bar button {
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.run-chat-lightbox-bar button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* --- multi-page screenshot gallery (chat run card) --- */
+.run-chat-gallery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.run-chat-shot {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: zoom-in;
+}
+
+.run-chat-shot-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- AI visual judgment block (chat run card) --- */
+.run-chat-visual {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.run-chat-visual.visual-passed {
+  border-left: 3px solid #2ea043;
+}
+.run-chat-visual.visual-warning {
+  border-left: 3px solid #d29922;
+}
+.run-chat-visual.visual-failed {
+  border-left: 3px solid #f85149;
+}
+.run-chat-visual.visual-inconclusive {
+  border-left: 3px solid var(--text-muted);
+}
+
+.run-chat-visual-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.run-chat-visual-headline {
+  margin: 2px 0;
+  font-weight: 600;
+}
+
+.run-chat-visual-reason {
+  margin: 2px 0;
+  font-size: 13px;
+}
+
+.run-chat-visual-evidence {
+  margin: 4px 0 2px;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.run-chat-visual-by {
+  margin-top: 4px;
+}
+
+/* --- run detail modal: screenshot list + visual review --- */
+.run-detail-shotlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.run-detail-shotlist li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.run-detail-visual-headline {
+  margin: 6px 0 2px;
+  font-weight: 600;
+}
+
+.run-detail-visual-reason {
+  margin: 2px 0;
+  font-size: 13px;
+}
+
+.run-detail-visual-evidence {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 /* ---------- Task 06.2D — Runs panel preview control ---------- */

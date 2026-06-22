@@ -164,6 +164,8 @@ function describeEvent(e: RunEvent, key: string): TraceRow | null {
     case 'browser_verification_ui':
       if (e.enabled === false) return null
       return { ...base, kind: kindFor(str(e.status)), badge: 'browser', label: `Browser verification ${str(e.status)}`, target: str(e.url) }
+    case 'visual_review':
+      return { ...base, kind: kindFor(str(e.status)), badge: 'visual', label: `Visual review: ${str(e.status)}`, output: str(e.headline), target: str(e.url) }
     case 'run_completed':
       return { ...base, kind: kindFor(str(e.status)), badge: 'done', label: `Agent finished (${str(e.status)})` }
     case 'run_failed':

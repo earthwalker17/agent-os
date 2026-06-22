@@ -127,8 +127,10 @@ should accomplish)
 # For a frontend project you usually do NOT need to fill this in: after a
 # run completes, open it in the Runs panel and click "Run browser
 # verification" (Task 06.2C). That flow installs dependencies, starts the
-# dev server on port 5174, captures a screenshot, and shows the result —
-# no TASK.md edits required.
+# dev server on port 5174, waits for the app to actually RENDER (not just a
+# loading spinner), captures a screenshot of the entry page plus a few
+# discovered views/tabs, and — when a vision-capable model key is set — has
+# an AI judge whether the result looks correct. No TASK.md edits required.
 #
 # Uncomment both lines below only to override the command/URL or to run
 # the check automatically after every run. Agent OS uses port 5173 for

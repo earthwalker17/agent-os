@@ -46,20 +46,23 @@ build. Agent OS planned the work into an **8-task dependency graph**, executed i
 task-by-task, and verified the result with a real `npm install` + `npm run build`
 (passed). All 8 tasks completed with zero blockers.
 
-[![Aegis Launch Control dashboard](./execution_workspaces/aegis-launch-control/preview.png)](./execution_workspaces/aegis-launch-control/SHOWCASE.md)
+[![Aegis Launch Control dashboard](./execution_workspaces/aegis-launch-control/runs/20260619-044436-e65d2e61/screenshots/browser.png)](./execution_workspaces/aegis-launch-control/SHOWCASE.md)
 
 Notably, this run was driven by **Claude Sonnet 4.5** — a mid-tier model, not
 the strongest available — so it's a useful *lower bound* on what the system can
 produce.
 
-The full generated source plus the complete run evidence — the task card, the
-plan, a chronological log of every tool call, the build log, and the
-browser-verification capture — are committed under
+The screenshot above is **Agent OS's own automated browser-verification capture**
+of the running app — the upgraded verification waits for the app to actually
+render, walks its tabs, and an AI visual judgment confirmed the result looks
+correct. The full generated source plus the complete run evidence — the task
+card, the plan, a chronological log of every tool call, the build log, and the
+multi-page browser-verification captures + visual-review verdict — are committed
+under
 [`execution_workspaces/aegis-launch-control/`](./execution_workspaces/aegis-launch-control/)
 as a public, replayable example. See its
 [SHOWCASE.md](./execution_workspaces/aegis-launch-control/SHOWCASE.md) for the
-details (including an honest note on the verification screenshot). Every other
-project and workspace stays private.
+details. Every other project and workspace stays private.
 
 ## Why this exists
 
@@ -92,9 +95,14 @@ screenshot of a project-managed dev server (06.2B). The whole
 build-and-preview loop now lives in the chat thread (06.2D): a run
 posts a natural "running" note, then a completion summary with a
 **Run browser verification** button; clicking it installs dependencies,
-starts the dev server on port 5174, captures a screenshot, and returns
-a live preview URL + thumbnail inline — and keeps the dev server alive
-so the URL stays usable. The Runs panel gained **Start / Stop preview**
+starts the dev server on port 5174, **waits for the app to actually
+render** (not just a loading spinner), captures screenshots of the entry
+page **plus a few discovered views/tabs**, and — when a vision-capable
+model key is set — runs an **AI visual judgment** that returns a
+`passed`/`warning`/`failed`/`inconclusive` verdict over the screenshots
+(diagnostic-only; it never changes the run status, and skips gracefully
+with no key). It returns a live preview URL + a multi-page thumbnail
+gallery inline, and keeps the dev server alive so the URL stays usable. The Runs panel gained **Start / Stop preview**
 controls; the run detail modal is now a detailed inspection view.
 Command verification is now **automatic** (06.2E): Agent OS infers the
 right checks from the repo (`npm run build`, `pytest`, or a syntax

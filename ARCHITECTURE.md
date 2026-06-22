@@ -79,7 +79,8 @@ Agent OS/
 ├─ execution_workspaces/{project_id}/
 │  ├─ repo/                     working code tree (Coding Agent's sandbox)
 │  ├─ runs/{run_id}/            task_card.md, events.jsonl, run.json, plan.json,
-│  │                            result.md, screenshots/browser.png
+│  │                            result.md, visual_review.json,
+│  │                            screenshots/browser.png (+ page-02.png …)
 │  ├─ logs/  AGENT.md  TASK.md
 │  └─ repo/uploads/             chat files copied in via "add to workspace" (07.0)
 ├─ chat_uploads/{conversation}/ chat-only attachments (07.0, gitignored)
@@ -100,8 +101,8 @@ conversations, messages, and pending executions.
 |-------------------|-------------------------------------------------------------------------|
 | `main.py`         | FastAPI app + all HTTP endpoints (projects, conversations, chat, memory, execution, inspection, verification, preview, **run control** — events / cancel / retry). Wires everything together. |
 | `orchestrator.py` | The chat brain. Loads SOUL + memory, assembles context, produces the reply, runs the bounded inspection loop, then the memory-writeback judge. |
-| `llm.py`          | Thin LLM entry point: `chat(system, messages, model?, provider?) -> str`. Delegates to `providers.py` (07.1); no context assembly — callers own that. |
-| `providers.py`    | Task 07.1 — pluggable model providers (Claude / GPT / Gemini / DeepSeek). Key-presence availability, default-provider preference (Claude first), per-provider default model (env-overridable), and a `complete()` dispatcher. Anthropic via SDK; the rest via `urllib` HTTPS (no new deps). |
+| `llm.py`          | Thin LLM entry point: `chat(system, messages, model?, provider?) -> str` + `chat_vision(system, prompt, images, …)` for image input. Delegates to `providers.py` (07.1); shared transient-retry; no context assembly — callers own that. |
+| `providers.py`    | Task 07.1 — pluggable model providers (Claude / GPT / Gemini / DeepSeek). Key-presence availability, default-provider preference (Claude first), per-provider default model (env-overridable), a `complete()` dispatcher, and a `complete_vision()` text+image dispatcher (`is_vision_capable`/`vision_available`/`default_vision_provider`; DeepSeek excluded). Anthropic via SDK; the rest via `urllib` HTTPS (no new deps). |
 | `database.py`     | SQLite persistence: conversations, messages, `pending_executions`. |
 | `uploads.py`      | Task 07.0 — chat attachment storage: filename sanitization + allow-list, per-dir dedup, chat-only storage under `chat_uploads/{conv}/`, optional workspace copy via `ProjectSandbox`. HTTP-agnostic (takes bytes). |
 
@@ -126,7 +127,8 @@ conversations, messages, and pending executions.
 | `memory_reconciliation.py` | Post-run bounded memory reconciliation judge.                           |
 | `inspect.py`               | Main-agent on-demand, read-only file inspection (06.1).                 |
 | `verification.py`          | Command verification: parse, **infer** (`plan_verification`), run specs, render. |
-| `browser_verification.py`  | Browser verification lifecycle (dev server → readiness → Playwright screenshot → teardown) + UI flow. |
+| `browser_verification.py`  | Browser verification lifecycle (dev server → HTTP readiness → **render-readiness-gated, multi-page** Playwright capture → teardown) + UI flow. Captures the entry URL plus a few discovered views (`BrowserPageCapture[]`); a legacy single-capture adapter keeps the `screenshots/browser.png` contract. |
+| `visual_judge.py`          | AI visual judgment over the captured screenshots (`run_visual_review`): vision-model verdict (`passed`/`warning`/`failed`/`inconclusive`) + concise rationale/evidence, persisted as `visual_review.json`. **Diagnostic-only**, best-effort, skips gracefully without a vision key. |
 | `preview.py`               | Managed long-lived preview dev servers (one per project).               |
 
 `tests/` mirrors these per feature; all stub `llm.chat` so no API key is needed.
@@ -143,8 +145,8 @@ conversations, messages, and pending executions.
 | `components/ChatPanel.tsx`   | Center column: header (provider selector top-left 07.1, theme selector top-right 07.2) + message thread + the **multi-modal composer** (07.0 — auto-growing textarea, `Ctrl/Cmd+Enter` send, `+` file upload with chips + "add to workspace too", Web Speech voice button); renders `RunChatCard` on messages carrying a `run_id` and attachment chips on messages carrying `metadata.attachments`. |
 | `components/ContextPanel.tsx`| Right column: project memory files (editable) + `RunsSection`.       |
 | `components/RunsSection.tsx` | Runs list (auto-polls while active; **live files/cmds counts**) + Start/Stop **preview** control + per-row **Trace** button. |
-| `components/RunChatCard.tsx` | The in-chat run lifecycle: **live phase badge + multi-task checklist** → build progress → verification phases → completion summary → **Run browser verification** → live preview URL + screenshot; **Cancel** (active) / **Retry** (terminal) / **Live trace** controls. |
-| `components/RunDetailModal.tsx` | Detailed run inspection: per-command verification, browser status, **Plan & Tasks**, **event Timeline** (settled milestones, polls while active), `result.md`; **Cancel / Retry / Open live trace** controls. |
+| `components/RunChatCard.tsx` | The in-chat run lifecycle: **live phase badge + multi-task checklist** → build progress → verification phases → completion summary → **Run browser verification** → live preview URL + **multi-page screenshot gallery** (lightbox w/ prev-next) + **AI visual-judgment verdict** (reachable / captured / judged shown as distinct signals); **Cancel** (active) / **Retry** (terminal) / **Live trace** controls. |
+| `components/RunDetailModal.tsx` | Detailed run inspection: per-command verification, browser status (+ per-page screenshot list + readiness), **Visual Review** block, **Plan & Tasks**, **event Timeline** (settled milestones, polls while active), `result.md`; **Cancel / Retry / Open live trace** controls. |
 | `components/RunTimeline.tsx` | Read-only **settled milestone** timeline: collapses each logical step's start/settle event pair (plan / each task / verification / each repair attempt / browser) into one row showing its terminal status; a `runActive` prop settles any dangling "running" once the run is terminal. |
 | `components/RunTrace.tsx` | **Live Trace modal** — a lightweight vertical chronological thread of all run activity (planning, every file read/write/append/search, shell command, task start/finish, verification, repair, browser, cancel/retry). Pairs `tool_call`+`tool_result` into one row; drops raw `llm_response` (no chain-of-thought). Polls `…/events?since=` + run.json while active, auto-scrolls; replayable after the run. |
 | `components/runEventUtils.ts` | Shared event-rendering helpers (`kindFor` status→palette, `str`, `clockTime`) used by `RunTimeline` + `RunTrace`. |
@@ -224,11 +226,21 @@ Events now carry a `phase` tag (`planning`/`execution`/`repair`) plus
    and either way a `verification failed:` blocker is recorded. Clear
    `verification_state`.
 
-### E. Browser preview — `browser_verification.py` + `preview.py`
+### E. Browser preview + visual review — `browser_verification.py` + `visual_judge.py` + `preview.py`
 User clicks **Run browser verification** → `POST …/browser-verify`:
-`npm install` → dev server (port 5174) → poll URL → Playwright screenshot. On
-pass, the still-running server is **handed off to `preview.py`** so the URL
-stays live (Start/Stop from the Runs panel; torn down on backend shutdown).
+`npm install` → dev server (port 5174) → poll URL (HTTP reachability) →
+**render-readiness-gated, multi-page Playwright capture** (the entry page plus a
+few discovered views: tabs / route links / nav buttons; each captured only after
+the DOM has populated and settled, never on a `"Loading…"` spinner; on a
+readiness timeout it's captured anyway and marked `unconfirmed`). On pass, the
+still-running server is **handed off to `preview.py`** so the URL stays live
+(Start/Stop from the Runs panel; torn down on backend shutdown). Then — in the
+**same request** — `visual_judge.run_visual_review` sends the screenshots + task
+context to a vision model for a structured verdict; it's **diagnostic-only**
+(never changes run status) and **skips gracefully** without a vision key.
+Screenshots are served by name via `GET …/runs/{id}/screenshot?name=`; the
+verdict persists on `RunRecord.visual_review` + `visual_review.json`. The runner's
+own configured-block path (pipeline C step 6) runs the same capture + review.
 
 ### F. Chat attachment upload (07.0) — `uploads.py`
 Composer sends files to `POST /api/chat/upload` (multipart) **before** the
@@ -273,8 +285,11 @@ is **cooperative**: an in-flight LLM call or shell command finishes first.
 `run_id`, `project_id`, `task_title`, `status` (`running`/`completed`/
 `partial`/`blocked`/`failed`/**`cancelled`**), `summary`, `files_changed`,
 `commands_run`, `blockers`; verification fields (`verification`,
-`verification_state`), browser fields (`browser_verification`,
-`browser_verification_state`), memory-reconciliation fields, the **Phase 5**
+`verification_state`), browser fields (`browser_verification` — now carrying a
+`pages: BrowserPageCapture[]` manifest + a `readiness` outcome — plus
+`browser_verification_state`), the diagnostic-only `visual_review`
+(`VisualReviewResult`, also written standalone as `visual_review.json`),
+memory-reconciliation fields, the **Phase 5**
 `plan` field (an `ExecutionPlan` of `ExecutionTask` units, also written
 standalone as `plan.json`), and **run-control** fields `cancel_requested`
 (transient — set while a cancel is pending, status still `running`) +
