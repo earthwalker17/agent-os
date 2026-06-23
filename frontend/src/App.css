@@ -566,6 +566,156 @@ html, body, #root {
   cursor: default;
 }
 
+/* Provider Registry 2.0 — composer-side model picker (compact, opens UPWARD,
+   right-aligned over the input area) + per-model image-upload gating cues. */
+.composer-modelbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 20px 0;
+}
+
+.model-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.model-picker-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 5px 10px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.model-picker-trigger:hover:not(:disabled),
+.model-picker-trigger:focus:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.model-picker-trigger:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.model-picker-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-picker-cap {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.model-picker-cap.text {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 3px;
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  font-weight: 700;
+  font-size: 9px;
+}
+
+.model-picker-caret {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.model-picker-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px); /* opens upward, above the trigger */
+  z-index: 30;
+  min-width: 230px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.model-picker-menu li {
+  list-style: none;
+}
+
+.model-picker-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 7px 9px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.model-picker-option:hover {
+  background: var(--bg-input);
+}
+
+.model-picker-option.selected {
+  background: var(--bg-input);
+  font-weight: 600;
+}
+
+.model-picker-option-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-picker-vision {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.model-picker-vision.yes {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.model-picker-vision.no {
+  color: var(--text-muted);
+}
+
+/* Image-upload-disabled cues for a text-only model. */
+.composer .composer-attach-btn.no-image {
+  color: var(--text-muted);
+}
+
+.composer-image-blocked {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* Tray above the composer: file chips, workspace toggle, inline errors. */
 .composer-tray {
   display: flex;

@@ -33,9 +33,10 @@ function App() {
   const [isGeneralActive, setIsGeneralActive] = useState(false)
   const [generalConversations, setGeneralConversations] = useState<Conversation[]>([])
 
-  // Task 07.1 — model provider selection.
+  // Task 07.1 + Provider Registry 2.0 — model provider + model selection.
   const [providersList, setProvidersList] = useState<ProviderInfo[]>([])
   const [selectedProvider, setSelectedProvider] = useState<string>('claude')
+  const [selectedModel, setSelectedModel] = useState<string>('')
 
   // Task 07.2 — color theme (dark default), persisted across reloads.
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -116,19 +117,36 @@ function App() {
     localStorage.setItem('agentos-theme', theme)
   }, [theme])
 
-  // Task 07.1 — load provider availability once and pre-select the default
-  // (Claude when available, otherwise the first available provider).
+  // Task 07.1 + Provider Registry 2.0 — load provider availability + model
+  // options once, pre-select the default provider (Claude when available,
+  // otherwise the first available), and seed its default model.
   useEffect(() => {
     fetch('/api/providers')
       .then(res => res.json())
       .then((data: { providers: ProviderInfo[]; default: string }) => {
         const list = data.providers ?? []
         setProvidersList(list)
-        const fallback = list.find(p => p.available)?.id
-        const def = list.find(p => p.id === data.default && p.available)?.id
-        if (def || fallback) setSelectedProvider(def || fallback!)
+        const fallback = list.find(p => p.available)
+        const def = list.find(p => p.id === data.default && p.available)
+        const chosen = def || fallback
+        if (chosen) {
+          setSelectedProvider(chosen.id)
+          setSelectedModel(chosen.default_model || chosen.models?.[0]?.id || '')
+        }
       })
       .catch(console.error)
+  }, [])
+
+  // Switching provider resets the model to that provider's default so the
+  // selection is always a valid (provider, model) pair.
+  const handleSelectProvider = useCallback((providerId: string) => {
+    setSelectedProvider(providerId)
+    const p = providersList.find(pp => pp.id === providerId)
+    setSelectedModel(p?.default_model || p?.models?.[0]?.id || '')
+  }, [providersList])
+
+  const handleSelectModel = useCallback((modelId: string) => {
+    setSelectedModel(modelId)
   }, [])
 
   useEffect(() => {
@@ -458,11 +476,13 @@ function App() {
         revise_pending_id?: string
         attachments?: ChatAttachment[]
         provider?: string
+        model?: string
       } = {
         conversation_id: activeConversation,
         message,
         provider: selectedProvider,
       }
+      if (selectedModel) body.model = selectedModel
       if (revisingId) body.revise_pending_id = revisingId
       if (attachments && attachments.length) body.attachments = attachments
 
@@ -614,6 +634,10 @@ function App() {
   // Determine chat header label
   const chatLabel = isGeneralActive ? 'General' : activeProject
 
+  // Provider Registry 2.0 — the selected provider's model options for the
+  // composer-side model picker + image-upload gating.
+  const currentModels = providersList.find(p => p.id === selectedProvider)?.models ?? []
+
   return (
     <div className="app-layout">
       <ProjectList
@@ -650,7 +674,10 @@ function App() {
         onRunsChanged={() => setRunsRefreshKey(k => k + 1)}
         providers={providersList}
         selectedProvider={selectedProvider}
-        onSelectProvider={setSelectedProvider}
+        onSelectProvider={handleSelectProvider}
+        models={currentModels}
+        selectedModel={selectedModel}
+        onSelectModel={handleSelectModel}
         theme={theme}
         onSelectTheme={setTheme}
       />

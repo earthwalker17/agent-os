@@ -130,10 +130,16 @@ multi-modal chat composer — auto-growing multiline input (`Enter` for a
 newline, `Ctrl`/`Cmd`+`Enter` to send), voice dictation via the Web Speech
 API, and file attachments (images, `.txt`/`.md`/`.pdf`/`.doc`/`.docx`) that
 can be attached to the chat message and optionally copied into the project's
-sandboxed workspace. **Task 07.1** added pluggable **model providers** —
-Claude, GPT, Gemini, and DeepSeek — selectable from a dropdown in the chat
-header. A provider is available when its API key is set; missing-key providers
-show disabled, and Claude stays the default for backward compatibility.
+sandboxed workspace. **Task 07.1** added pluggable **model providers**, since upgraded to a
+capability-aware **provider/model registry**: six providers — Claude, GPT,
+Gemini, DeepSeek, **Kimi (Moonshot)**, and **Zhipu GLM** — each exposing a
+selectable list of current models. The provider is chosen from the chat header
+and the specific model from a compact upward-opening picker next to the
+composer; a provider is available when its API key is set (missing-key ones show
+disabled), and Claude stays the default. Each model carries **capability
+metadata** (notably image input), so chat image upload is offered only for
+vision-capable models and the AI browser visual judgment runs only when a
+vision-capable model is available — skipping gracefully otherwise.
 **Task 07.2** added a light color theme alongside the original dark one,
 switchable from a dropdown top-right in the chat header and remembered
 across reloads.
@@ -204,7 +210,8 @@ python -m playwright install chromium
 cp .env.example .env
 # Edit .env and add at least one provider key:
 #   ANTHROPIC_API_KEY (Claude), OPENAI_API_KEY (GPT),
-#   GOOGLE_API_KEY (Gemini), DEEPSEEK_API_KEY (DeepSeek)
+#   GOOGLE_API_KEY (Gemini), DEEPSEEK_API_KEY (DeepSeek),
+#   MOONSHOT_API_KEY (Kimi), ZHIPUAI_API_KEY (Zhipu GLM)
 uvicorn main:app --reload --port 8000
 ```
 

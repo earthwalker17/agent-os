@@ -102,7 +102,7 @@ conversations, messages, and pending executions.
 | `main.py`         | FastAPI app + all HTTP endpoints (projects, conversations, chat, memory, execution, inspection, verification, preview, **run control** — events / cancel / retry). Wires everything together. |
 | `orchestrator.py` | The chat brain. Loads SOUL + memory, assembles context, produces the reply, runs the bounded inspection loop, then the memory-writeback judge. |
 | `llm.py`          | Thin LLM entry point: `chat(system, messages, model?, provider?) -> str` + `chat_vision(system, prompt, images, …)` for image input. Delegates to `providers.py` (07.1); shared transient-retry; no context assembly — callers own that. |
-| `providers.py`    | Task 07.1 — pluggable model providers (Claude / GPT / Gemini / DeepSeek). Key-presence availability, default-provider preference (Claude first), per-provider default model (env-overridable), a `complete()` dispatcher, and a `complete_vision()` text+image dispatcher (`is_vision_capable`/`vision_available`/`default_vision_provider`; DeepSeek excluded). Anthropic via SDK; the rest via `urllib` HTTPS (no new deps). |
+| `providers.py`    | **Provider Registry 2.0** — capability-aware model providers (Claude / GPT / Gemini / DeepSeek / Kimi / GLM). Key-presence availability (+ accepted env aliases, e.g. `ZAI_API_KEY` for GLM), default-provider preference (Claude first), a per-provider **model registry** with per-model `vision` flags, env-overridable default model + base URL, model validation (`is_known_model`), a `complete()` dispatcher, and a `complete_vision()` text+image dispatcher gated on the **selected model's** vision flag (`is_vision_capable`/`model_is_vision`/`default_vision_model`/`vision_available`/`default_vision_provider`). Anthropic via SDK; GPT/DeepSeek/Kimi/GLM via OpenAI-compatible `urllib` HTTPS; Gemini via `generateContent` (no new deps). |
 | `database.py`     | SQLite persistence: conversations, messages, `pending_executions`. |
 | `uploads.py`      | Task 07.0 — chat attachment storage: filename sanitization + allow-list, per-dir dedup, chat-only storage under `chat_uploads/{conv}/`, optional workspace copy via `ProjectSandbox`. HTTP-agnostic (takes bytes). |
 
@@ -128,7 +128,7 @@ conversations, messages, and pending executions.
 | `inspect.py`               | Main-agent on-demand, read-only file inspection (06.1).                 |
 | `verification.py`          | Command verification: parse, **infer** (`plan_verification`), run specs, render. |
 | `browser_verification.py`  | Browser verification lifecycle (dev server → HTTP readiness → **render-readiness-gated, multi-page** Playwright capture → teardown) + UI flow. Captures the entry URL plus a few discovered views (`BrowserPageCapture[]`); a legacy single-capture adapter keeps the `screenshots/browser.png` contract. |
-| `visual_judge.py`          | AI visual judgment over the captured screenshots (`run_visual_review`): vision-model verdict (`passed`/`warning`/`failed`/`inconclusive`) + concise rationale/evidence, persisted as `visual_review.json`. **Diagnostic-only**, best-effort, skips gracefully without a vision key. |
+| `visual_judge.py`          | AI visual judgment over the captured screenshots (`run_visual_review`): vision-model verdict (`passed`/`warning`/`failed`/`inconclusive`) + concise rationale/evidence, persisted as `visual_review.json`. Resolves a vision-capable `(provider, model)` — preferring the user's **selected** one, else any available vision model — and **skips gracefully** when none is configured. **Diagnostic-only**, best-effort. |
 | `preview.py`               | Managed long-lived preview dev servers (one per project).               |
 
 `tests/` mirrors these per feature; all stub `llm.chat` so no API key is needed.
@@ -140,9 +140,10 @@ conversations, messages, and pending executions.
 | File                         | Purpose                                                              |
 |------------------------------|---------------------------------------------------------------------|
 | `main.tsx` / `App.tsx`       | Entry + three-column layout and all top-level state (projects, conversations, messages, context, modals, model provider, color theme). Theme (07.2) is applied via `data-theme` on `<html>` and persisted to `localStorage`. |
-| `types.ts`                   | Shared TS types mirroring backend models.                           |
+| `types.ts`                   | Shared TS types mirroring backend models (+ `ModelInfo` / `ProviderInfo.models` for the model picker). |
 | `components/ProjectList.tsx` | Left column: projects + conversations + create/rename/delete.       |
-| `components/ChatPanel.tsx`   | Center column: header (provider selector top-left 07.1, theme selector top-right 07.2) + message thread + the **multi-modal composer** (07.0 — auto-growing textarea, `Ctrl/Cmd+Enter` send, `+` file upload with chips + "add to workspace too", Web Speech voice button); renders `RunChatCard` on messages carrying a `run_id` and attachment chips on messages carrying `metadata.attachments`. |
+| `components/ChatPanel.tsx`   | Center column: header (provider selector top-left 07.1, theme selector top-right 07.2) + message thread + the **multi-modal composer** (07.0 — auto-growing textarea, `Ctrl/Cmd+Enter` send, `+` file upload with chips + "add to workspace too", Web Speech voice button); renders `RunChatCard` on messages carrying a `run_id` and attachment chips on messages carrying `metadata.attachments`. **Provider Registry 2.0:** a compact upward-opening `ModelPicker` sits above the composer; chat image upload is gated by the selected model's `vision` flag (text-only models drop/refuse images with a clear note). |
+| `components/ModelPicker.tsx` | Provider Registry 2.0 — compact, upward-opening per-provider model dropdown (right of the composer). Trigger shows the selected model + a vision/text cue; the popover lists the provider's models, each tagged image-capable or text-only. |
 | `components/ContextPanel.tsx`| Right column: project memory files (editable) + `RunsSection`.       |
 | `components/RunsSection.tsx` | Runs list (auto-polls while active; **live files/cmds counts**) + Start/Stop **preview** control + per-row **Trace** button. |
 | `components/RunChatCard.tsx` | The in-chat run lifecycle: **live phase badge + multi-task checklist** → build progress → verification phases → completion summary → **Run browser verification** → live preview URL + **multi-page screenshot gallery** (lightbox w/ prev-next) + **AI visual-judgment verdict** (reachable / captured / judged shown as distinct signals); **Cancel** (active) / **Retry** (terminal) / **Live trace** controls. |
@@ -168,12 +169,13 @@ conversations, messages, and pending executions.
 
 → Up to 3–4 LLM calls per turn.
 
-**Provider routing (07.1).** The chat request carries a `provider` id
-(`claude`/`gpt`/`gemini`/`deepseek`); the endpoint validates it (unknown /
-unavailable → 400) and the **main response** (step 3) routes to it via
-`orchestrate(..., provider=)`. Internal subsystem calls (judge, delegation,
-Coding Agent) use the default provider. Availability is key-presence; see
-`providers.py`.
+**Provider routing (07.1 + Provider Registry 2.0).** The chat request carries a
+`provider` id (`claude`/`gpt`/`gemini`/`deepseek`/`kimi`/`glm`) and an optional
+`model`; the endpoint validates both (unknown/unavailable provider or unknown
+provider/model combo → 400) and the **main response** (step 3) routes to them via
+`orchestrate(..., provider=, model=)`. Internal subsystem calls (judge,
+delegation, Coding Agent) use the default provider + its default model.
+Availability is key-presence; see `providers.py`.
 
 ### B. Delegation → run
 `@code` → `chat_delegation` → `BackgroundRunManager.dispatch()`.
@@ -236,8 +238,10 @@ readiness timeout it's captured anyway and marked `unconfirmed`). On pass, the
 still-running server is **handed off to `preview.py`** so the URL stays live
 (Start/Stop from the Runs panel; torn down on backend shutdown). Then — in the
 **same request** — `visual_judge.run_visual_review` sends the screenshots + task
-context to a vision model for a structured verdict; it's **diagnostic-only**
-(never changes run status) and **skips gracefully** without a vision key.
+context to a vision model for a structured verdict; the UI forwards the user's
+**selected provider/model** so the judge prefers a vision-capable selection
+(falling back to any available vision model). It's **diagnostic-only**
+(never changes run status) and **skips gracefully** without a vision-capable model.
 Screenshots are served by name via `GET …/runs/{id}/screenshot?name=`; the
 verdict persists on `RunRecord.visual_review` + `visual_review.json`. The runner's
 own configured-block path (pipeline C step 6) runs the same capture + review.
@@ -366,8 +370,10 @@ values.
   uses `CODING_AGENT_MAX_TOKENS = 16384` and the prompt tells the agent to split a
   very large file across `write_file` + `append_file`.
 - **Pinned model ids go stale.** `claude-sonnet-4-20250514` now 404s; a dead
-  default model breaks every LLM call. The default is a current alias
-  (`claude-sonnet-4-5`), overridable via `AGENT_OS_CLAUDE_MODEL`.
+  default model breaks every LLM call. Provider Registry 2.0 refreshed every
+  provider's default to a current API-available id (Claude → `claude-opus-4-8`),
+  each overridable via env (`AGENT_OS_{CLAUDE,OPENAI,GEMINI,DEEPSEEK,KIMI,GLM}_MODEL`).
+  Re-verify model ids against official docs when bumping — don't trust memory.
 - **A transient LLM blip must not kill a task.** One mid-run "Connection error"
   used to fail a task and cascade its dependents to `skipped`. `llm.chat` retries
   transient errors (connection/timeout/429/5xx) with backoff; deterministic ones

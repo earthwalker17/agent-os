@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import type { Message, PendingExecution, ChatAttachment, ProviderInfo } from '../types'
+import type { Message, PendingExecution, ChatAttachment, ProviderInfo, ModelInfo } from '../types'
 import RunDetailModal from './RunDetailModal'
 import RunChatCard from './RunChatCard'
 import RunTrace from './RunTrace'
+import ModelPicker from './ModelPicker'
 
 interface Props {
   projectId: string | null
@@ -36,6 +37,14 @@ interface Props {
   providers?: ProviderInfo[]
   selectedProvider?: string
   onSelectProvider?: (providerId: string) => void
+  /**
+   * Provider Registry 2.0 — the selected provider's capability-tagged models +
+   * current model selection for the composer-side model picker. Drives the
+   * per-model image-upload gating (a text-only model can't attach images).
+   */
+  models?: ModelInfo[]
+  selectedModel?: string
+  onSelectModel?: (modelId: string) => void
   /** Task 07.2 — active color theme + setter for the top-right theme dropdown. */
   theme?: 'dark' | 'light'
   onSelectTheme?: (theme: 'dark' | 'light') => void
@@ -77,6 +86,9 @@ const MAX_TEXTAREA_HEIGHT = 200
 
 // Accepted upload types, mirroring the backend allow-list (uploads.py).
 const ACCEPT_TYPES = 'image/*,.txt,.md,.pdf,.doc,.docx'
+// Provider Registry 2.0 — when the selected model can't read images, restrict
+// the file picker to non-image document types so images can't be attached.
+const ACCEPT_TYPES_NO_IMAGE = '.txt,.md,.pdf,.doc,.docx'
 
 function isImage(mime: string | undefined): boolean {
   return !!mime && mime.startsWith('image/')
@@ -128,6 +140,9 @@ function ChatPanel({
   providers,
   selectedProvider,
   onSelectProvider,
+  models,
+  selectedModel,
+  onSelectModel,
   theme,
   onSelectTheme,
 }: Props) {
@@ -144,6 +159,9 @@ function ChatPanel({
   const [addToWorkspace, setAddToWorkspace] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  // Provider Registry 2.0 — transient note shown when image attachments are
+  // blocked/removed because the selected model can't process images.
+  const [imageBlockedNote, setImageBlockedNote] = useState<string | null>(null)
   const [recording, setRecording] = useState(false)
   const [voiceError, setVoiceError] = useState<string | null>(null)
   const recognitionRef = useRef<SpeechRecognition | null>(null)
@@ -159,6 +177,12 @@ function ChatPanel({
   // Real project conversations get the "add to workspace" option; GENERAL does not.
   const isProjectConversation = !!runProjectId
   const voiceSupported = getSpeechRecognition() !== null
+
+  // Provider Registry 2.0 — does the selected model accept image input? Defaults
+  // to allowed when the capability is not yet known (providers still loading) so
+  // existing behavior is preserved until the model list arrives.
+  const selectedModelInfo = models?.find(m => m.id === selectedModel)
+  const visionEnabled = selectedModelInfo ? selectedModelInfo.vision : true
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -196,6 +220,7 @@ function ChatPanel({
     setFiles([])
     setUploadError(null)
     setVoiceError(null)
+    setImageBlockedNote(null)
     manualStopRef.current = true
     if (recognitionRef.current) {
       try { recognitionRef.current.abort() } catch { /* already stopped */ }
@@ -209,11 +234,41 @@ function ChatPanel({
     if (!isProjectConversation) setAddToWorkspace(false)
   }, [isProjectConversation])
 
+  // Provider Registry 2.0 — if the user switches to a text-only model while
+  // image files are staged, drop the images (a text-only model can't read them)
+  // and note it. Non-image attachments are untouched.
+  useEffect(() => {
+    if (visionEnabled) {
+      // Back on a vision model — clear any lingering "images blocked" note.
+      setImageBlockedNote(null)
+      return
+    }
+    if (files.some(f => f.type.startsWith('image/'))) {
+      setFiles(prev => prev.filter(f => !f.type.startsWith('image/')))
+      setImageBlockedNote(
+        "Removed attached image(s) — the selected model can't read images.",
+      )
+    }
+  }, [visionEnabled, files])
+
   const handleFilesPicked = (e: React.ChangeEvent<HTMLInputElement>) => {
     const picked = e.target.files ? Array.from(e.target.files) : []
     if (picked.length) {
-      setFiles(prev => [...prev, ...picked])
-      setUploadError(null)
+      // Gate images out when the selected model is text-only.
+      const allowed = visionEnabled
+        ? picked
+        : picked.filter(f => !f.type.startsWith('image/'))
+      if (allowed.length < picked.length) {
+        setImageBlockedNote(
+          "Images can't be attached — the selected model doesn't read images.",
+        )
+      } else {
+        setImageBlockedNote(null)
+      }
+      if (allowed.length) {
+        setFiles(prev => [...prev, ...allowed])
+        setUploadError(null)
+      }
     }
     // Reset so picking the same file again re-fires onChange.
     e.target.value = ''
@@ -359,18 +414,23 @@ function ChatPanel({
   const doSend = async () => {
     const trimmed = input.trim()
     if (!conversationId || loading || uploading) return
+    // Provider Registry 2.0 — never upload images for a text-only model, even if
+    // some slipped into the staged set (e.g. a late model switch).
+    const filesToSend = visionEnabled
+      ? files
+      : files.filter(f => !f.type.startsWith('image/'))
     // Nothing to send: no text and no files.
-    if (!trimmed && files.length === 0) return
+    if (!trimmed && filesToSend.length === 0) return
 
     let attachments: ChatAttachment[] | undefined
-    if (files.length > 0) {
+    if (filesToSend.length > 0) {
       setUploading(true)
       setUploadError(null)
       try {
         const form = new FormData()
         form.append('conversation_id', conversationId)
         form.append('add_to_workspace', String(addToWorkspace && isProjectConversation))
-        for (const f of files) form.append('files', f)
+        for (const f of filesToSend) form.append('files', f)
         const res = await fetch('/api/chat/upload', { method: 'POST', body: form })
         if (!res.ok) {
           const err = await res.json().catch(() => ({}))
@@ -539,6 +599,8 @@ function ChatPanel({
                   onOpenRun={(rid) => setOpenRunId(rid)}
                   onOpenTrace={(rid) => setOpenTraceId(rid)}
                   onRunsChanged={onRunsChanged}
+                  provider={selectedProvider}
+                  model={selectedModel}
                 />
               )}
               {runId && (
@@ -634,9 +696,12 @@ function ChatPanel({
       )}
       {/* Task 07.0 — selected file chips + "add to workspace" toggle, shown
           above the composer before sending. */}
-      {(files.length > 0 || uploadError || voiceError) && (
+      {(files.length > 0 || uploadError || voiceError || imageBlockedNote) && (
         <div className="composer-tray">
           {voiceError && <div className="composer-voice-error">{voiceError}</div>}
+          {imageBlockedNote && (
+            <div className="composer-image-blocked">{imageBlockedNote}</div>
+          )}
           {uploadError && <div className="composer-upload-error">{uploadError}</div>}
           {files.length > 0 && (
             <>
@@ -672,21 +737,35 @@ function ChatPanel({
           )}
         </div>
       )}
+      {models && models.length > 0 && (
+        <div className="composer-modelbar">
+          <ModelPicker
+            models={models}
+            selectedModel={selectedModel ?? ''}
+            onSelect={(m) => onSelectModel && onSelectModel(m)}
+            disabled={loading || uploading}
+          />
+        </div>
+      )}
       <form className="chat-input composer" onSubmit={handleSubmit}>
         <input
           ref={fileInputRef}
           type="file"
           multiple
-          accept={ACCEPT_TYPES}
+          accept={visionEnabled ? ACCEPT_TYPES : ACCEPT_TYPES_NO_IMAGE}
           style={{ display: 'none' }}
           onChange={handleFilesPicked}
         />
         <button
           type="button"
-          className="composer-icon-btn composer-attach-btn"
+          className={`composer-icon-btn composer-attach-btn${visionEnabled ? '' : ' no-image'}`}
           onClick={() => fileInputRef.current?.click()}
           disabled={loading || uploading}
-          title="Attach files"
+          title={
+            visionEnabled
+              ? 'Attach files'
+              : 'Attach files — images unavailable for the selected model'
+          }
           aria-label="Attach files"
         >
           +

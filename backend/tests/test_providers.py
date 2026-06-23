@@ -40,6 +40,13 @@ _ALL_KEYS = [
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
     "DEEPSEEK_API_KEY",
+    "MOONSHOT_API_KEY",
+    "ZHIPUAI_API_KEY",
+    # Accepted env-var aliases — cleared too so a stray real key can't leak into
+    # availability/default-provider assertions.
+    "GEMINI_API_KEY",
+    "KIMI_API_KEY",
+    "ZAI_API_KEY",
 ]
 
 
@@ -49,8 +56,11 @@ class _Keys:
     def __init__(self, **present: str) -> None:
         self._present = present
         self._saved: dict[str, str | None] = {}
-        # Also save the model-override envs in case a test sets them.
-        self._model_envs = list(providers._MODEL_ENV.values())
+        # Also save the model-override + base-URL-override envs in case a test
+        # sets them (so they don't leak between tests).
+        self._model_envs = list(providers._MODEL_ENV.values()) + list(
+            providers._BASE_URL_ENV.values()
+        )
 
     def __enter__(self):
         for k in _ALL_KEYS + self._model_envs:
@@ -98,18 +108,66 @@ def test_default_falls_back_to_claude_when_none():
 def test_list_providers_shape_and_order():
     with _Keys(ANTHROPIC_API_KEY="a"):
         listed = providers.list_providers()
-        assert [p["id"] for p in listed] == ["claude", "gpt", "gemini", "deepseek"]
+        assert [p["id"] for p in listed] == [
+            "claude", "gpt", "gemini", "deepseek", "kimi", "glm"
+        ]
         by_id = {p["id"]: p for p in listed}
         assert by_id["claude"]["available"] is True
         assert by_id["gpt"]["available"] is False
         # default_model is exposed + overridable via env.
         assert by_id["claude"]["default_model"]
+        # Each provider exposes capability-tagged model options.
+        for p in listed:
+            assert p["models"], f"{p['id']} should list models"
+            for m in p["models"]:
+                assert set(m) == {"id", "label", "vision"}
+            ids = [m["id"] for m in p["models"]]
+            assert p["default_model"] in ids  # default is one of the options
+
+
+def test_default_model_is_first_registry_entry():
+    with _Keys():
+        assert providers.default_model("claude") == "claude-opus-4-8"
+        assert providers.default_model("gpt") == "gpt-5.5"
+        assert providers.default_model("gemini") == "gemini-3.5-flash"
+        assert providers.default_model("deepseek") == "deepseek-v4-flash"
+        assert providers.default_model("kimi") == "kimi-k2.6"
+        assert providers.default_model("glm") == "glm-5.2"
+
+
+def test_known_model_validation():
+    assert providers.is_known_model("claude", "claude-opus-4-8") is True
+    assert providers.is_known_model("kimi", "kimi-k2.6") is True
+    assert providers.is_known_model("glm", "glm-5v-turbo") is True
+    assert providers.is_known_model("claude", "gpt-5.5") is False  # wrong provider
+    assert providers.is_known_model("gpt", "not-a-model") is False
+    assert providers.is_known_model("nope", "x") is False
 
 
 def test_model_override_via_env():
     with _Keys(OPENAI_API_KEY="x"):
         os.environ["AGENT_OS_OPENAI_MODEL"] = "gpt-4o-mini"
         assert providers.default_model("gpt") == "gpt-4o-mini"
+
+
+def test_known_model_accepts_env_overridden_default():
+    # An off-registry env-pinned default must not be rejected by validation —
+    # otherwise the chat endpoint 400s on every turn for that deployment.
+    with _Keys(OPENAI_API_KEY="x"):
+        os.environ["AGENT_OS_OPENAI_MODEL"] = "gpt-4o-mini"
+        assert providers.default_model("gpt") == "gpt-4o-mini"
+        assert providers.is_known_model("gpt", "gpt-4o-mini") is True
+        assert providers.is_known_model("gpt", "still-bogus") is False
+        # A registry model stays valid regardless of the override.
+        assert providers.is_known_model("gpt", "gpt-5.5") is True
+
+
+def test_glm_env_key_alias_accepted():
+    # GLM accepts ZAI_API_KEY in addition to the primary ZHIPUAI_API_KEY.
+    with _Keys(ZAI_API_KEY="z"):
+        assert providers.is_available("glm") is True
+    with _Keys(ZHIPUAI_API_KEY="z"):
+        assert providers.is_available("glm") is True
 
 
 # ---------- dispatch + errors ----------
@@ -186,6 +244,127 @@ def test_deepseek_uses_openai_shape():
         assert seen["model"] == providers.default_model("deepseek")
 
 
+def test_kimi_uses_openai_shape():
+    with _Keys(MOONSHOT_API_KEY="k"):
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["url"] = url
+            seen["model"] = payload["model"]
+            seen["auth"] = headers.get("Authorization")
+            return {"choices": [{"message": {"content": "kimi reply"}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            out = providers.complete("kimi", "sys", [{"role": "user", "content": "hi"}])
+        finally:
+            providers._http_post_json = prev
+        assert out == "kimi reply"
+        assert "moonshot" in seen["url"]
+        assert seen["model"] == providers.default_model("kimi")
+        assert seen["auth"] == "Bearer k"
+
+
+def test_glm_uses_openai_shape():
+    with _Keys(ZHIPUAI_API_KEY="g"):
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["url"] = url
+            seen["model"] = payload["model"]
+            return {"choices": [{"message": {"content": "glm reply"}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            out = providers.complete("glm", "sys", [{"role": "user", "content": "hi"}])
+        finally:
+            providers._http_post_json = prev
+        assert out == "glm reply"
+        assert "z.ai" in seen["url"]
+        assert seen["model"] == providers.default_model("glm")
+
+
+def test_base_url_env_override():
+    with _Keys(MOONSHOT_API_KEY="k"):
+        os.environ["AGENT_OS_KIMI_BASE_URL"] = "https://api.moonshot.cn/v1/chat/completions"
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["url"] = url
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            providers.complete("kimi", "sys", [{"role": "user", "content": "hi"}])
+        finally:
+            providers._http_post_json = prev
+        assert seen["url"] == "https://api.moonshot.cn/v1/chat/completions"
+
+
+def test_complete_vision_kimi_shape_has_image_url():
+    with _Keys(MOONSHOT_API_KEY="k"):
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["payload"] = payload
+            seen["url"] = url
+            return {"choices": [{"message": {"content": "kimi vision reply"}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            out = providers.complete_vision(
+                "kimi", "sys", "describe", [("image/png", "AAAA")]
+            )
+        finally:
+            providers._http_post_json = prev
+        assert out == "kimi vision reply"
+        content = seen["payload"]["messages"][-1]["content"]
+        assert any(c["type"] == "image_url" for c in content)
+        assert "moonshot" in seen["url"]
+
+
+def test_complete_vision_glm_uses_explicit_vision_model():
+    with _Keys(ZHIPUAI_API_KEY="g"):
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["payload"] = payload
+            return {"choices": [{"message": {"content": "glm vision reply"}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            out = providers.complete_vision(
+                "glm", "sys", "describe", [("image/png", "AAAA")], model="glm-5v-turbo"
+            )
+        finally:
+            providers._http_post_json = prev
+        assert out == "glm vision reply"
+        assert seen["payload"]["model"] == "glm-5v-turbo"
+
+
+def test_complete_vision_rejects_text_only_model():
+    # GLM's default (glm-5.2) is text-only — complete_vision must reject it even
+    # though the provider has *other* vision models.
+    with _Keys(ZHIPUAI_API_KEY="g"):
+        try:
+            providers.complete_vision("glm", "sys", "x", [("image/png", "AAAA")])
+            raise AssertionError("expected ProviderError (default model is text-only)")
+        except providers.ProviderError:
+            pass
+        try:
+            providers.complete_vision(
+                "glm", "sys", "x", [("image/png", "AAAA")], model="glm-5.2"
+            )
+            raise AssertionError("expected ProviderError (glm-5.2 is text-only)")
+        except providers.ProviderError:
+            pass
+
+
 def test_gemini_parsing_and_role_mapping():
     with _Keys(GOOGLE_API_KEY="g-x"):
         seen = {}
@@ -234,11 +413,39 @@ def test_http_error_surfaces_as_provider_error():
 
 
 def test_vision_capability_flags():
+    # Provider-level (model omitted) = "has at least one vision-capable model".
     assert providers.is_vision_capable("claude") is True
     assert providers.is_vision_capable("gpt") is True
     assert providers.is_vision_capable("gemini") is True
-    # DeepSeek's chat model is text-only.
+    assert providers.is_vision_capable("kimi") is True  # kimi-k2.6 does vision
+    assert providers.is_vision_capable("glm") is True   # glm-5v-turbo does vision
+    # DeepSeek's chat models are text-only via the API.
     assert providers.is_vision_capable("deepseek") is False
+
+
+def test_model_level_vision_flags():
+    # Capability is per-model, not per-provider.
+    assert providers.model_is_vision("claude", "claude-opus-4-8") is True
+    assert providers.model_is_vision("kimi", "kimi-k2.6") is True
+    assert providers.model_is_vision("kimi", "kimi-k2.7-code") is False  # text-only
+    assert providers.model_is_vision("glm", "glm-5v-turbo") is True
+    assert providers.model_is_vision("glm", "glm-5.2") is False  # text-only flagship
+    assert providers.model_is_vision("deepseek", "deepseek-v4-flash") is False
+    # is_vision_capable(provider, model) mirrors model_is_vision.
+    assert providers.is_vision_capable("glm", "glm-5.2") is False
+    assert providers.is_vision_capable("glm", "glm-5v-turbo") is True
+    # Unknown model → conservative False.
+    assert providers.model_is_vision("glm", "mystery") is False
+
+
+def test_default_vision_model_resolution():
+    # Default model is vision → itself.
+    assert providers.default_vision_model("claude") == "claude-opus-4-8"
+    # Default is text-only but a vision option exists → first vision option.
+    assert providers.default_vision_model("glm") == "glm-5v-turbo"
+    assert providers.default_vision_model("kimi") == "kimi-k2.6"
+    # No vision option at all → None.
+    assert providers.default_vision_model("deepseek") is None
 
 
 def test_vision_available_and_default_provider():
@@ -463,7 +670,13 @@ def test_http_providers_endpoint_reflects_env():
                 "gpt": False,
                 "gemini": False,
                 "deepseek": False,
+                "kimi": False,
+                "glm": False,
             }
+            # Provider Registry 2.0 — each provider ships its model options.
+            by_id = {p["id"]: p for p in j["providers"]}
+            assert by_id["claude"]["models"]
+            assert all("vision" in m for m in by_id["claude"]["models"])
         finally:
             _restore_env(tmp, saved, main, database)
 

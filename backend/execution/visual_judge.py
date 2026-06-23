@@ -198,6 +198,31 @@ def _skipped(reason: str, duration_ms: Optional[int] = None) -> VisualReviewResu
     )
 
 
+def _resolve_vision_target(
+    provider: Optional[str], model: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """Pick the ``(provider, model)`` to run visual judgment with.
+
+    Prefers the *selected* provider/model when that provider is available and a
+    vision-capable model can be used (the selected model if it does vision,
+    otherwise that provider's default vision model). Falls back to the first
+    available vision-capable provider. Returns ``None`` when no vision-capable
+    provider has a key configured, so the caller skips gracefully.
+    """
+    if provider and providers.is_available(provider):
+        if model and providers.model_is_vision(provider, model):
+            return (provider, model)
+        fallback_model = providers.default_vision_model(provider)
+        if fallback_model:
+            return (provider, fallback_model)
+    pid = providers.default_vision_provider()
+    if pid:
+        mid = providers.default_vision_model(pid)
+        if mid:
+            return (pid, mid)
+    return None
+
+
 def run_visual_review(
     project_id: str,
     run_id: str,
@@ -206,14 +231,21 @@ def run_visual_review(
     summary: str,
     browser_result: Optional[BrowserVerificationResult],
     run_dir: Path,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     vision_caller: Optional[VisionCaller] = None,
 ) -> VisualReviewResult:
     """Judge the captured screenshots with a vision model. Never raises.
 
     Returns ``status="skipped"`` (with ``skipped_reason``) when there is nothing
-    to judge or no vision-capable provider is configured. Otherwise returns the
+    to judge or no vision-capable model is available. Otherwise returns the
     model's verdict (``passed`` / ``warning`` / ``failed`` / ``inconclusive``).
     Persists ``visual_review.json`` next to the run's other artifacts.
+
+    ``provider`` / ``model`` are the user's selected chat model (Provider
+    Registry 2.0). When that selection is a vision-capable model it is used;
+    otherwise the call gracefully falls back to any available vision-capable
+    provider, and skips with a clear reason when none is configured.
     """
     start = time.perf_counter()
     try:
@@ -222,12 +254,14 @@ def run_visual_review(
         if browser_result.status != "passed":
             return _skipped("browser verification did not pass; nothing to review")
 
-        provider_id = providers.default_vision_provider()
-        if not provider_id:
+        target = _resolve_vision_target(provider, model)
+        if target is None:
             return _skipped(
-                "no vision-capable model provider configured "
-                "(set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY)"
+                "no vision-capable model provider configured (set a vision "
+                "provider key: ANTHROPIC_API_KEY / OPENAI_API_KEY / "
+                "GOOGLE_API_KEY / MOONSHOT_API_KEY / ZHIPUAI_API_KEY)"
             )
+        provider_id, model_id = target
 
         images = _load_images(run_dir, browser_result)
         if not images:
@@ -242,6 +276,8 @@ def run_visual_review(
                 _SYSTEM_PROMPT,
                 prompt,
                 image_payload,
+                model=model_id,
+                provider=provider_id,
                 max_tokens=_VISION_MAX_TOKENS,
             )
         except Exception as exc:  # noqa: BLE001 — graceful skip, never fail the run
@@ -257,7 +293,7 @@ def run_visual_review(
                 headline="Could not parse the visual review response.",
                 reasoning="The vision model did not return a usable verdict.",
                 provider=provider_id,
-                model=providers.default_model(provider_id),
+                model=model_id,
                 duration_ms=duration_ms,
             )
         else:
@@ -285,7 +321,7 @@ def run_visual_review(
                 evidence=evidence_list,
                 pages=page_notes,
                 provider=provider_id,
-                model=providers.default_model(provider_id),
+                model=model_id,
                 duration_ms=duration_ms,
             )
 

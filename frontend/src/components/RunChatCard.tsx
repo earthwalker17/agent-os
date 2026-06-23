@@ -10,6 +10,13 @@ interface Props {
   onOpenTrace?: (runId: string) => void
   /** Notify the parent that run state changed so the Runs panel can refresh. */
   onRunsChanged?: () => void
+  /**
+   * Provider Registry 2.0 — the user's selected chat provider/model, forwarded
+   * to browser verification so the diagnostic AI visual judgment prefers a
+   * vision-capable selection (and skips gracefully when none is available).
+   */
+  provider?: string
+  model?: string
 }
 
 const POLL_INTERVAL_MS = 2000
@@ -55,7 +62,7 @@ function fileSummary(files: string[] | undefined): string {
  * user needing to open the RunDetailModal. The modal remains available via the
  * "Details" link for exact logs and artifacts.
  */
-function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }: Props) {
+function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, provider, model }: Props) {
   const [record, setRecord] = useState<RunRecord | null>(null)
   const [verifying, setVerifying] = useState(false)
   const [verifyError, setVerifyError] = useState<string | null>(null)
@@ -111,7 +118,11 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
     try {
       const res = await fetch(
         `/api/projects/${projectId}/execution/runs/${runId}/browser-verify`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider: provider ?? null, model: model ?? null }),
+        },
       )
       if (!res.ok) {
         let detail = `HTTP ${res.status}`
@@ -134,7 +145,7 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged }
       if (mounted.current) setVerifying(false)
       onRunsChanged?.()
     }
-  }, [projectId, runId, onRunsChanged])
+  }, [projectId, runId, onRunsChanged, provider, model])
 
   const cancelRun = useCallback(async () => {
     setControlBusy(true)

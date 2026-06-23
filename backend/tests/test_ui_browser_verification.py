@@ -62,6 +62,13 @@ _VISION_ENV_KEYS = (
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
     "DEEPSEEK_API_KEY",
+    # Provider Registry 2.0 — clear the new providers + accepted aliases too, so
+    # a key in the developer's real env can't make "no vision key" tests flaky.
+    "MOONSHOT_API_KEY",
+    "ZHIPUAI_API_KEY",
+    "GEMINI_API_KEY",
+    "KIMI_API_KEY",
+    "ZAI_API_KEY",
 )
 
 
@@ -89,7 +96,7 @@ class _VisionEnv:
 
 
 def _vision_stub(verdict: str = "passed"):
-    def caller(system, prompt, images, model=None, max_tokens=2048):
+    def caller(system, prompt, images, model=None, provider=None, max_tokens=2048):
         return _json.dumps(
             {
                 "verdict": verdict,

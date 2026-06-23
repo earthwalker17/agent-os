@@ -265,6 +265,7 @@ def orchestrate(
     *,
     llm_caller: Optional[Callable] = None,
     provider: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> tuple[str, list[dict]]:
     """
     Main orchestration entry point.
@@ -286,15 +287,17 @@ def orchestrate(
 
     ``llm_caller`` is an optional injection seam for tests; the default is
     the live LLM. ``provider`` selects the model provider for the main
-    response (Task 07.1); when omitted the default provider is used. It is
-    ignored when ``llm_caller`` is supplied.
+    response (Task 07.1); ``model`` optionally pins a specific model within
+    that provider (Provider Registry 2.0) — when omitted the provider's
+    default model is used. Both are ignored when ``llm_caller`` is supplied.
     """
     ctx = load_memory(project_id, history=history)
     inspection_enabled = _inspection_enabled_for(project_id)
-    # Bind the selected provider to the default caller so every LLM call in the
-    # response loop routes to it. Tests pass ``llm_caller`` to bypass entirely.
+    # Bind the selected provider + model to the default caller so every LLM
+    # call in the response loop routes to it. Tests pass ``llm_caller`` to
+    # bypass entirely.
     caller = llm_caller or (
-        lambda **kwargs: llm_chat(provider=provider, **kwargs)
+        lambda **kwargs: llm_chat(provider=provider, model=model, **kwargs)
     )
 
     if not inspection_enabled:

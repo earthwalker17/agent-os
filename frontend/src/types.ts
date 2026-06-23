@@ -1,9 +1,23 @@
-/** Task 07.1 — a selectable model provider and its availability. */
+/** Provider Registry 2.0 — capability metadata for one selectable model. */
+export interface ModelInfo {
+  id: string
+  label: string
+  /** Accepts image input (vision) — gates chat image upload + visual judgment. */
+  vision: boolean
+}
+
+/**
+ * Task 07.1 + Provider Registry 2.0 — a selectable model provider, its
+ * availability, default model, and the capability-tagged model options the
+ * per-provider model picker offers.
+ */
 export interface ProviderInfo {
   id: string
   label: string
   available: boolean
   default_model: string
+  /** The provider's selectable models (capability-aware). May be empty. */
+  models: ModelInfo[]
 }
 
 /** Task 07.0 — metadata for a file attached to a chat message. */

@@ -42,6 +42,14 @@ _VISION_ENV_KEYS = (
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
     "DEEPSEEK_API_KEY",
+    # Provider Registry 2.0 — the new providers + accepted env aliases. Clearing
+    # them keeps the "no vision key" gate deterministic on a dev box that has a
+    # Kimi/GLM/Gemini key set.
+    "MOONSHOT_API_KEY",
+    "ZHIPUAI_API_KEY",
+    "GEMINI_API_KEY",
+    "KIMI_API_KEY",
+    "ZAI_API_KEY",
 )
 
 
@@ -98,11 +106,13 @@ def _write_pages(run_dir: Path, n: int) -> list[BrowserPageCapture]:
 
 
 def _stub_caller(response: str, captured: dict | None = None):
-    def caller(system, prompt, images, model=None, max_tokens=2048):
+    def caller(system, prompt, images, model=None, provider=None, max_tokens=2048):
         if captured is not None:
             captured["images"] = images
             captured["prompt"] = prompt
             captured["called"] = True
+            captured["model"] = model
+            captured["provider"] = provider
         return response
 
     return caller
@@ -250,7 +260,7 @@ def test_unknown_verdict_normalizes_to_inconclusive():
 
 
 def test_caller_exception_skips_gracefully():
-    def boom(system, prompt, images, model=None, max_tokens=2048):
+    def boom(system, prompt, images, model=None, provider=None, max_tokens=2048):
         raise RuntimeError("vision provider exploded")
 
     with _Env(ANTHROPIC_API_KEY="test"):
@@ -307,6 +317,65 @@ def test_fallback_to_screenshot_path_without_pages():
     assert len(captured["images"]) == 1
 
 
+# ---------- model selection / capability gating ----------
+
+
+def test_selected_vision_model_is_used():
+    """A vision-capable selected provider/model is passed straight to the caller."""
+    captured: dict = {}
+    response = json.dumps({"verdict": "passed", "headline": "ok"})
+    with _Env(ANTHROPIC_API_KEY="test"):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            pages = _write_pages(run_dir, 1)
+            result = run_visual_review(
+                "p", "r", task_card="x", summary="x",
+                browser_result=_passed_result(pages), run_dir=run_dir,
+                provider="claude", model="claude-sonnet-4-6",
+                vision_caller=_stub_caller(response, captured),
+            )
+    assert captured["provider"] == "claude"
+    assert captured["model"] == "claude-sonnet-4-6"
+    assert result.provider == "claude"
+    assert result.model == "claude-sonnet-4-6"
+
+
+def test_text_selected_model_falls_back_to_provider_vision_model():
+    """A text-only selected model resolves to that provider's vision model."""
+    captured: dict = {}
+    response = json.dumps({"verdict": "passed", "headline": "ok"})
+    with _Env(ZHIPUAI_API_KEY="z"):  # GLM default (glm-5.2) is text-only
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            pages = _write_pages(run_dir, 1)
+            result = run_visual_review(
+                "p", "r", task_card="x", summary="x",
+                browser_result=_passed_result(pages), run_dir=run_dir,
+                provider="glm", model="glm-5.2",
+                vision_caller=_stub_caller(response, captured),
+            )
+    assert captured["provider"] == "glm"
+    assert captured["model"] == "glm-5v-turbo"  # GLM's vision model
+    assert result.status == "passed"
+
+
+def test_skipped_when_only_text_only_provider_available():
+    """A provider with no vision model (DeepSeek) skips with a clear reason."""
+    with _Env(DEEPSEEK_API_KEY="d"):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            pages = _write_pages(run_dir, 1)
+            captured = {"called": False}
+            result = run_visual_review(
+                "p", "r", task_card="x", summary="x",
+                browser_result=_passed_result(pages), run_dir=run_dir,
+                provider="deepseek", model="deepseek-v4-flash",
+                vision_caller=_stub_caller("{}", captured),
+            )
+    assert result.status == "skipped"
+    assert captured["called"] is False
+
+
 # ---------- render ----------
 
 
@@ -316,7 +385,7 @@ def test_render_section_passed():
     r = VisualReviewResult(
         enabled=True, status="passed", headline="Looks good",
         reasoning="All sections render.", evidence=["nav present"],
-        provider="claude", model="claude-sonnet-4-5",
+        provider="claude", model="claude-sonnet-4-6",
     )
     text = render_visual_review_section(r)
     assert "## Visual Review" in text

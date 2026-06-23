@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -462,10 +462,14 @@ class ChatRequest(BaseModel):
     # the chat re-renders the file chips (and their chat/workspace scope) on
     # reload. Empty for ordinary text-only turns.
     attachments: list[dict] = []
-    # Task 07.1 — selected model provider id (claude / gpt / gemini / deepseek).
-    # None falls back to the default provider (Claude when available). An unknown
-    # or unavailable provider yields a clean 400.
+    # Task 07.1 — selected model provider id (claude / gpt / gemini / deepseek /
+    # kimi / glm). None falls back to the default provider (Claude when
+    # available). An unknown or unavailable provider yields a clean 400.
     provider: str | None = None
+    # Provider Registry 2.0 — selected model id within that provider. None falls
+    # back to the provider's default model. An unknown provider/model combo
+    # yields a clean 400.
+    model: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -524,6 +528,17 @@ def api_chat(req: ChatRequest):
             detail=(
                 f"Model provider '{providers.label(provider_id)}' is not available "
                 "— its API key is not configured on the server."
+            ),
+        )
+    # Provider Registry 2.0 — validate the selected model within the provider.
+    # None falls back to the provider's default; an unknown combo is a clean 400.
+    model_id = (req.model or "").strip() or None
+    if model_id is not None and not providers.is_known_model(provider_id, model_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown model {model_id!r} for provider "
+                f"'{providers.label(provider_id)}'."
             ),
         )
 
@@ -625,9 +640,11 @@ def api_chat(req: ChatRequest):
             )
 
     # Generate orchestration response (with optional on-demand file inspection).
-    # Task 07.1 — route the main response to the selected provider.
+    # Task 07.1 — route the main response to the selected provider; Provider
+    # Registry 2.0 — pin the selected model within that provider.
     response_content, inspected_files = orchestrate(
-        project_id, effective_message, history=history, provider=provider_id
+        project_id, effective_message, history=history,
+        provider=provider_id, model=model_id,
     )
 
     # Persist assistant reply. When inspections happened, include them in the
@@ -1292,8 +1309,21 @@ def api_retry_run(project_id: str, run_id: str):
     return new_record.model_dump()
 
 
+class BrowserVerifyRequest(BaseModel):
+    # Provider Registry 2.0 — the user's currently-selected chat model, so the
+    # diagnostic AI visual judgment prefers a vision-capable selection (and
+    # skips gracefully when neither it nor any provider key supports vision).
+    # Both optional: an empty POST body keeps the legacy default-provider path.
+    provider: str | None = None
+    model: str | None = None
+
+
 @app.post("/api/projects/{project_id}/execution/runs/{run_id}/browser-verify")
-def api_run_browser_verification(project_id: str, run_id: str):
+def api_run_browser_verification(
+    project_id: str,
+    run_id: str,
+    req: BrowserVerifyRequest | None = Body(default=None),
+):
     """User-triggered browser verification for an existing run (Task 06.2C).
 
     Reuses the 06.2B browser-verification infrastructure but adds a frontend
@@ -1363,6 +1393,8 @@ def api_run_browser_verification(project_id: str, run_id: str):
             summary=record.summary,
             browser_result=result,
             run_dir=run_store.get_run_dir(project_id, run_id),
+            provider=(req.provider if req else None),
+            model=(req.model if req else None),
         )
 
     run_store.write_run_json(project_id, run_id, record)
