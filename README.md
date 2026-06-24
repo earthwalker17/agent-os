@@ -155,6 +155,14 @@ failed, blocked, or fails verification, the main agent **assesses it and propose
 a bounded next step** ("Run suggested fix") that you confirm with one click —
 never auto-run. Run cards now also show whether project memory was reconciled.
 
+**Phase 6.1** polishes this: the recovery assessment now shows in the run detail
+modal too; the "Memory updated" chip expands to show exactly which file ›
+section changed; long project memory is compacted for the agent's context as it
+grows; and when you confirm a plan you can optionally approve a **bounded
+auto-recovery budget** (none / 1 / 2) so a non-green run can fix itself once or
+twice — capped, linked, and fully audited — without giving up explicit-dispatch
+safety.
+
 Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 
 ## Architecture

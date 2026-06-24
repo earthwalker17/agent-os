@@ -410,6 +410,18 @@ def test_pipeline_applies_update_and_persists_outcome():
         assert record_dict["memory_reconciled"] is True
         assert record_dict["memory_reconciliation"] == TAG_APPLIED
         assert record_dict["memory_reconciliation_error"] is None
+        # Phase 6.1 — the reason is persisted for audit, and the event carries a
+        # content-stripped applied list.
+        assert record_dict["memory_reconciliation_reason"] == (
+            "Run added a new endpoint, STATUS update warranted."
+        )
+        events = run_store.read_events("agent-os", record.run_id)
+        recon_events = [e for e in events if e.get("type") == "memory_reconciled"]
+        assert recon_events, "expected a memory_reconciled event"
+        applied = recon_events[-1].get("applied")
+        assert applied == [{"file": "STATUS.md", "section": "What Works", "action": "append"}]
+        # The written markdown body must NOT be in the event payload.
+        assert "content" not in (applied[0] if applied else {})
 
     _run_e2e(body)
 

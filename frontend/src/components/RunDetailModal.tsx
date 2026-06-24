@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type {
   BrowserVerificationResult,
   ExecutionPlan,
+  RecoveryAssessment,
   RunEvent,
   RunRecord,
   VerificationResult,
@@ -259,6 +260,43 @@ function VisualReviewBlock({
   )
 }
 
+function RecoveryBlock({
+  ra,
+  recoveredBy,
+}: {
+  ra: RecoveryAssessment | null | undefined
+  recoveredBy?: string | null
+}): JSX.Element {
+  if (!ra || !ra.assessed) {
+    return <span className="run-detail-none">Not assessed (run is green or pre-6.1)</span>
+  }
+  return (
+    <div className="run-detail-verification">
+      <div>
+        <span className={`run-verify-status status-${ra.verdict === 'ok' ? 'passed' : ra.verdict === 'exhausted' ? 'failed' : 'partial'}`}>
+          {ra.verdict}
+        </span>
+        <span className="run-detail-verify-meta">{ra.recommended_action}</span>
+        {recoveredBy && <span className="run-detail-verify-meta">recovery run dispatched</span>}
+      </div>
+      {ra.diagnosis && <p className="run-detail-visual-headline">{ra.diagnosis}</p>}
+      {ra.rationale && <p className="run-detail-visual-reason">{ra.rationale}</p>}
+      {ra.follow_up_task_card && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Proposed fix</span>
+          <pre className="run-detail-resultmd">{ra.follow_up_task_card}</pre>
+        </div>
+      )}
+      {recoveredBy && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Recovery run</span>
+          <code>{recoveredBy}</code>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function PlanBlock({ plan }: { plan: ExecutionPlan | null | undefined }): JSX.Element | null {
   const tasks = plan?.tasks ?? []
   if (!plan || tasks.length === 0) return null
@@ -311,6 +349,8 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
   const [controlBusy, setControlBusy] = useState(false)
   const [controlError, setControlError] = useState<string | null>(null)
   const [retriedRunId, setRetriedRunId] = useState<string | null>(null)
+  // Bounded post-terminal settle polling (Phase 6.1) — see the poll effect.
+  const [settleTicks, setSettleTicks] = useState(0)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -363,12 +403,26 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
     load()
   }, [load])
 
-  // Poll while the run is active so the timeline + status update live.
+  // Poll while the run is active so the timeline + status update live, plus a
+  // bounded "settle" window after it goes terminal — memory reconciliation +
+  // the recovery assessment are written ~2-4s AFTER the terminal status, so the
+  // Recovery / Memory sections would otherwise need a manual reopen.
+  const active = isActive(record)
+  const terminalSettlePending =
+    !!record &&
+    !active &&
+    record.status !== 'cancelled' &&
+    record.memory_reconciliation == null &&
+    settleTicks < 15
+  const shouldPoll = active || terminalSettlePending
   useEffect(() => {
-    if (!isActive(record)) return
-    const id = window.setInterval(refresh, POLL_INTERVAL_MS)
+    if (!shouldPoll) return
+    const id = window.setInterval(() => {
+      refresh()
+      setSettleTicks((t) => (active ? 0 : t + 1))
+    }, POLL_INTERVAL_MS)
     return () => window.clearInterval(id)
-  }, [record, refresh])
+  }, [shouldPoll, refresh, active])
 
   const cancelRun = useCallback(async () => {
     setControlBusy(true)
@@ -552,6 +606,51 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
                   does not change the run status.
                 </p>
               </section>
+
+              {/* Phase 6.1 — Main-Agent recovery assessment (non-green runs). */}
+              {record.recovery_assessment && (
+                <section className="run-detail-result">
+                  <h4>Recovery</h4>
+                  <RecoveryBlock
+                    ra={record.recovery_assessment}
+                    recoveredBy={record.recovered_by}
+                  />
+                  <p className="run-detail-hint">
+                    The Main Agent's read of a non-green run — proposes a bounded
+                    next step; never auto-runs unless a recovery budget was approved.
+                  </p>
+                </section>
+              )}
+
+              {/* Phase 6.1 — memory reconciliation outcome (audit). */}
+              {record.memory_reconciliation && (
+                <section className="run-detail-result">
+                  <h4>Memory reconciliation</h4>
+                  <div className="run-detail-verification">
+                    <div>
+                      <span
+                        className={`run-verify-status status-${
+                          record.memory_reconciled
+                            ? 'passed'
+                            : record.memory_reconciliation === 'error'
+                              ? 'failed'
+                              : 'skipped'
+                        }`}
+                      >
+                        {record.memory_reconciled ? 'applied' : 'no update'}
+                      </span>
+                      <span className="run-detail-verify-meta">
+                        {record.memory_reconciliation}
+                      </span>
+                    </div>
+                    {record.memory_reconciliation_reason && (
+                      <p className="run-detail-visual-reason">
+                        {record.memory_reconciliation_reason}
+                      </p>
+                    )}
+                  </div>
+                </section>
+              )}
 
               <section className="run-detail-result">
                 <h4>result.md</h4>

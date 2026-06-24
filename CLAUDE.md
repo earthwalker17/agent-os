@@ -139,8 +139,13 @@ and execute project work.
   failed / blocked, or a failed verification / visual review), a best-effort
   `recovery.assess_run` proposes one bounded next step; a `needs_recovery`
   assessment becomes a **confirmable pending plan** (the user still clicks
-  "OK, run this"). Recovery NEVER auto-dispatches — explicit dispatch stays the
-  only path to a run.
+  "OK, run this"). **Phase 6.1 scoped exception:** when the user *explicitly
+  confirms* an execution contract they may grant a bounded **recovery budget**
+  (none / 1 / 2); a non-green run with remaining budget auto-dispatches that many
+  bounded, linked, audited recovery runs (hard cap 2, idempotent, clamped at the
+  confirm endpoint). This is the ONLY auto-dispatch path and is authorized by the
+  user's explicit prior approval — inferred intent still never runs code, and a
+  crashed run never auto-recovers.
 
 ## 6. Context Hygiene
 

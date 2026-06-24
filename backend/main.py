@@ -533,6 +533,22 @@ class ChatResponse(BaseModel):
     inspected_files: list[dict] = []
 
 
+# Phase 6.1 — map a judged intent label (delegation_judge.INTENT_LABELS) to an
+# orchestration mode string (orchestrator._MODE_GUIDANCE). Labels with no distinct
+# workflow (discussion, build) map to None → no mode block. Note the label
+# "retrospective" maps to the "review" mode and "planning" maps to "plan".
+_INTENT_TO_MODE: dict[str, str] = {
+    "planning": "plan",
+    "design": "design",
+    "debug": "debug",
+    "inspect": "inspect",
+    "retrospective": "review",
+    "memory": "memory",
+    "docs": "docs",
+    "research": "research",
+}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def api_chat(req: ChatRequest):
     conv = get_conversation(req.conversation_id)
@@ -682,13 +698,20 @@ def api_chat(req: ChatRequest):
             "memory" if decision.decision == DECISION_MEMORY_ONLY else "discussion"
         )
 
+    # Phase 6.1 — Intent → workflow routing. An explicit `@`-command (mode_command)
+    # always wins; otherwise the judged intent label routes to the matching
+    # orchestration mode so e.g. a natural debugging question folds in the latest
+    # non-green run. Still conservative: this only shapes the response, never
+    # dispatches (dispatch already early-returned above).
+    turn_mode = mode_command or _INTENT_TO_MODE.get(turn_intent)
+
     # Generate orchestration response (with optional on-demand file inspection).
     # Task 07.1 — route the main response to the selected provider; Provider
     # Registry 2.0 — pin the selected model within that provider. Phase 6 —
-    # ``mode`` shapes the system prompt for explicit `@`-commands.
+    # ``mode`` shapes the system prompt for `@`-commands and (6.1) routed intents.
     response_content, inspected_files = orchestrate(
         project_id, effective_message, history=history,
-        provider=provider_id, model=model_id, mode=mode_command,
+        provider=provider_id, model=model_id, mode=turn_mode,
     )
 
     # Memory judgment (Phase 6): one structured intake decision per turn, scoped
@@ -715,6 +738,12 @@ def api_chat(req: ChatRequest):
         assistant_meta["intent"] = turn_intent
     if memory_reason:
         assistant_meta["memory_reason"] = memory_reason
+    # Phase 6.1 — content-stripped audit list (file / section only) so the chat
+    # "Memory updated" chip can expand to show exactly what changed.
+    if applied:
+        assistant_meta["memory_applied"] = [
+            {"filename": u.get("filename"), "section": u.get("section")} for u in applied
+        ]
     assistant_msg = add_message(
         req.conversation_id, "assistant", response_content,
         metadata=assistant_meta or None,
@@ -1399,6 +1428,14 @@ def api_propose_recovery(project_id: str, run_id: str, req: ProposeRecoveryReque
     except Exception:
         raise HTTPException(status_code=500, detail="run record is corrupt")
 
+    # Phase 6.1 — one recovery per parent. If an auto-recovery (or a prior manual
+    # one) already claimed this run, don't propose another.
+    if record.recovered_by is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This run already has a recovery run ({record.recovered_by}).",
+        )
+
     ra = record.recovery_assessment
     if ra is None or not ra.assessed:
         raise HTTPException(status_code=409, detail="run has no recovery assessment")
@@ -1664,8 +1701,19 @@ def api_get_pending_execution(project_id: str, pending_id: str):
     return serialize_pending(row).to_dict()
 
 
+class ConfirmExecutionRequest(BaseModel):
+    # Phase 6.1 — the user may approve a bounded auto-recovery allowance when
+    # confirming an execution contract: 0 (none) / 1 / 2 attempts. Clamped at
+    # this boundary; this is the ONLY place a non-zero budget enters the system.
+    recovery_budget: int = 0
+
+
 @app.post("/api/projects/{project_id}/execution/pending/{pending_id}/confirm")
-def api_confirm_pending_execution(project_id: str, pending_id: str):
+def api_confirm_pending_execution(
+    project_id: str,
+    pending_id: str,
+    req: ConfirmExecutionRequest | None = Body(default=None),
+):
     """Dispatch the stored task card via the same path as `@code`.
 
     Validates project + workspace, ensures the pending plan exists, is still
@@ -1673,6 +1721,9 @@ def api_confirm_pending_execution(project_id: str, pending_id: str):
     background run manager and marks the pending row as dispatched with the
     new run id. A short assistant message is appended to the chat so the
     user sees confirmation inline (matching the `@code` placeholder UX).
+
+    Phase 6.1 — an optional ``recovery_budget`` (0/1/2) authorizes that many
+    bounded auto-recovery passes if the run comes back non-green.
     """
     if project_id == GENERAL_PROJECT_ID:
         raise HTTPException(
@@ -1705,7 +1756,11 @@ def api_confirm_pending_execution(project_id: str, pending_id: str):
         task_card=plan.task_card,
         created_by="pending_confirm",
     )
-    record = get_default_manager().dispatch(project_id, spec)
+    # Clamp the user-approved recovery budget at the trust boundary (0..2).
+    recovery_budget = max(0, min(2, (req.recovery_budget if req else 0) or 0))
+    record = get_default_manager().dispatch(
+        project_id, spec, recovery_budget=recovery_budget
+    )
 
     marked = mark_pending_execution_dispatched(pending_id, record.run_id)
     if not marked:

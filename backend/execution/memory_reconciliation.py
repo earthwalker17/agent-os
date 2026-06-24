@@ -690,7 +690,19 @@ def _persist_outcome(project_id: str, run_id: str, outcome: ReconciliationOutcom
         record.memory_reconciled = outcome.reconciled
         record.memory_reconciliation = outcome.tag
         record.memory_reconciliation_error = outcome.error
+        record.memory_reconciliation_reason = _truncate(outcome.reason, 240) or None
         run_store.write_run_json(project_id, run_id, record)
+        # Phase 6.1 — emit the structured, content-STRIPPED applied list (file /
+        # section / action only — never the written markdown body) so the UI can
+        # show exactly which memory changed without bloating run.json.
+        applied_summary = [
+            {
+                "file": u.get("filename"),
+                "section": u.get("section"),
+                "action": u.get("action"),
+            }
+            for u in outcome.applied
+        ]
         run_store.append_event(
             project_id,
             run_id,
@@ -700,6 +712,7 @@ def _persist_outcome(project_id: str, run_id: str, outcome: ReconciliationOutcom
                 "reconciled": outcome.reconciled,
                 "reason": _truncate(outcome.reason, 240),
                 "applied_count": len(outcome.applied),
+                "applied": applied_summary,
                 "error": _truncate(outcome.error or "", 240),
             },
         )

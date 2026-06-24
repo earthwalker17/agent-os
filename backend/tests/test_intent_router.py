@@ -148,6 +148,35 @@ def test_unknown_mode_adds_no_block():
     assert "# Mode" not in prompt
 
 
+def test_docs_and_research_modes_have_guidance():
+    for mode in ("docs", "research", "review"):
+        prompt = _build_system_prompt(_ctx(), mode=mode)
+        assert "# Mode" in prompt, mode
+
+
+# ---------- intent -> mode routing (Phase 6.1) ----------
+
+def test_intent_to_mode_maps_to_real_guidance_modes():
+    import main
+    import orchestrator
+    # Every routed intent must map to a mode that actually has guidance, else the
+    # routing would silently no-op.
+    for intent, mode in main._INTENT_TO_MODE.items():
+        assert mode in orchestrator._MODE_GUIDANCE, f"{intent} -> {mode}"
+
+
+def test_retrospective_maps_to_review_and_planning_to_plan():
+    import main
+    assert main._INTENT_TO_MODE["retrospective"] == "review"
+    assert main._INTENT_TO_MODE["planning"] == "plan"
+
+
+def test_discussion_and_build_intents_have_no_mode():
+    import main
+    assert main._INTENT_TO_MODE.get("discussion") is None
+    assert main._INTENT_TO_MODE.get("build") is None
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

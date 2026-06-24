@@ -226,6 +226,38 @@ steps. Recovery is **confirmable-only** (no auto-dispatch).
   survive reload). `types.ts` gained the 3 already-shipped reconciliation fields +
   `recovery_assessment`.
 
+## Phase 6.1 — Orchestration Polish, Recovery UX & Context Loader v2
+
+A polish pass over Phase 6 — additive, suite-green throughout.
+
+- **Recovery + memory now auditable everywhere.** `RunDetailModal` gained a
+  Recovery section (verdict / action / diagnosis / proposed fix + a settle-poll so
+  late-written fields appear) and a memory-reconciliation line. Reconciliation now
+  persists its **reason** (`RunRecord.memory_reconciliation_reason`) + a
+  content-stripped applied list on the `memory_reconciled` event; chat turns store
+  a stripped `memory_applied` list so the "🧠 Memory updated" chip **expands** to
+  show which file › section changed.
+- **Context Loader v2.** `orchestrator._compact_memory` keeps the main-agent
+  prompt compact as memory grows: STATUS.md / PROJECT.md (and SOUL.md) stay whole;
+  the append-growth files (TASK_QUEUE "Done", DECISIONS, RESEARCH) trim to their
+  newest entries + an elision note once over a threshold (byte-identical below it,
+  so young projects + tests are unaffected). Scoped to the main prompt only — the
+  delegation + reconciliation snapshots are separate, already-bounded paths.
+- **Intent → workflow routing.** The judged intent label now also routes to the
+  matching `orchestrate(mode=…)` (e.g. a natural debugging question folds in the
+  latest non-green run), not just the badge; `docs` / `research` modes added.
+  Still conservative — never dispatches.
+- **User-approved recovery budget.** Confirming a pending plan can now grant a
+  bounded auto-recovery allowance (none / 1 / 2). A non-green run with remaining
+  budget auto-dispatches **one** linked, audited recovery run from the Main Agent's
+  follow-up task card (`background._maybe_auto_recover`, clean-finalize path only,
+  decrementing budget, hard cap 2, idempotent via `recovered_by`). The budget is
+  clamped at the confirm endpoint (the explicit-approval boundary); `@code` /
+  retry / manual propose stay budget 0; the manual `propose-recovery` 409s once a
+  recovery exists. **Invariant extension (documented):** a user-set budget on an
+  explicitly-confirmed task authorizes that many bounded auto-dispatches — inferred
+  intent still never runs code.
+
 ## Current Constraints
 
 - **Explicit dispatch only.** `@code <task>` runs immediately; inferred coding
@@ -279,9 +311,11 @@ needed), and are each runnable standalone (`python tests/<file>.py`).
 | `test_visual_judge.py`            |    16 | gate/skip rules, JSON parse, never-raises, image cap; selected-model resolution + fallback/skip |
 | `test_memory_engine.py`           |    13 | Phase 6 apply_update policy/atomic/dedup/replace; scaffold; orchestrator write-path |
 | `test_memory_intake.py`           |    10 | Phase 6 structured intake judge: parse, policy filter, reason, no-op, apply |
-| `test_intent_router.py`           |    14 | Phase 6 mode `@`-command parser, `intent` field, mode→prompt shaping |
+| `test_intent_router.py`           |    18 | Phase 6 mode `@`-command parser, `intent` field, mode→prompt shaping; 6.1 intent→mode map |
 | `test_recovery.py`                |     8 | Phase 6 assess_run: non-green/green/cancelled/idempotent/visual-failed, never-raises |
-| **Total**                         | **391** |                                                        |
+| `test_context_loader.py`          |     8 | 6.1 `_compact_memory`: below-threshold identity, STATUS/PROJECT untrimmed, archive tail-trim |
+| `test_recovery_budget.py`         |     9 | 6.1 `_maybe_auto_recover` gating: budget/green/idempotent/cap/no-card; budget decrement |
+| **Total**                         | **412** |                                                        |
 
 Frontend: `npm run build` (tsc + vite) green.
 

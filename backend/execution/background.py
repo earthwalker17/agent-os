@@ -24,6 +24,7 @@ executor lives for the lifetime of the FastAPI process.
 
 from __future__ import annotations
 
+import logging
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -36,7 +37,14 @@ from .models import RunRecord, RunStatus, TaskSpec
 from .runner import CodingAgentRunner
 
 
+log = logging.getLogger(__name__)
+
 DEFAULT_MAX_WORKERS = 4
+
+# Phase 6.1 — hard cap on auto-recovery chain depth (belt-and-suspenders next to
+# the decrementing budget). At most this many auto-dispatched recovery runs can
+# follow an original.
+RECOVERY_HARD_CAP = 2
 
 
 class BackgroundRunManager:
@@ -60,7 +68,14 @@ class BackgroundRunManager:
         self._cancel_lock = Lock()
 
     def dispatch(
-        self, project_id: str, task: TaskSpec, *, retry_of: str | None = None
+        self,
+        project_id: str,
+        task: TaskSpec,
+        *,
+        retry_of: str | None = None,
+        recovery_of: str | None = None,
+        recovery_budget: int = 0,
+        orchestration_round: int = 0,
     ) -> RunRecord:
         """Create the run record + artifacts immediately, then run in the background.
 
@@ -68,7 +83,10 @@ class BackgroundRunManager:
         this back to the user (e.g. as an `@code` chat reply) without waiting
         for the LLM loop. Raises FileNotFoundError if the workspace doesn't
         exist — caller is responsible for ensuring it does. ``retry_of`` links
-        this run to the run it was retried from (run control).
+        this run to the run it was retried from (run control). **Phase 6.1**:
+        ``recovery_of`` / ``recovery_budget`` / ``orchestration_round`` carry a
+        user-approved bounded recovery contract (a dumb pass-through — the
+        clamping + approval check happen at the HTTP boundary).
         """
         ws = get_execution_workspace(project_id)
         if ws is None:
@@ -86,6 +104,9 @@ class BackgroundRunManager:
             task_title=task.title,
             status=RunStatus.RUNNING,
             retry_of=retry_of,
+            recovery_of=recovery_of,
+            recovery_budget=max(0, recovery_budget),
+            orchestration_round=orchestration_round,
         )
         run_store.write_run_json(project_id, run_id, record)
         run_store.append_event(
@@ -95,6 +116,9 @@ class BackgroundRunManager:
                 "type": "run_dispatched",
                 "title": task.title,
                 "created_by": task.created_by,
+                "recovery_of": recovery_of,
+                "recovery_budget": max(0, recovery_budget),
+                "orchestration_round": orchestration_round,
             },
         )
 
@@ -137,10 +161,84 @@ class BackgroundRunManager:
             CodingAgentRunner(project_id).run_task(
                 task, run_id=run_id, cancel_event=cancel_event
             )
+            # Phase 6.1 — only on a CLEAN finalize (a crash routes to
+            # _mark_failed, which has no recovery_assessment to act on). Wrapped
+            # so a bug in auto-recovery can never flip this (successful) run to
+            # failed via the except below.
+            try:
+                self._maybe_auto_recover(project_id, run_id)
+            except Exception:  # noqa: BLE001
+                log.exception("Auto-recovery wiring failed for run %s", run_id)
         except Exception as exc:
             self._mark_failed(project_id, run_id, task, exc)
         finally:
             self._discard_cancel(run_id)
+
+    # ---------- auto-recovery (Phase 6.1) ----------
+
+    def _maybe_auto_recover(self, project_id: str, run_id: str) -> None:
+        """Auto-dispatch ONE bounded recovery run when the user approved a budget.
+
+        Fires iff the finalized run is non-green, has remaining budget, hasn't
+        already been recovered, is under the hard cap, and the Main Agent's
+        recovery assessment recommends a concrete follow-up. This is the only
+        path that dispatches a run without a per-run user click — and it is
+        authorized by the recovery budget the user explicitly set when confirming
+        the original execution contract. Audited via events + lineage.
+        """
+        raw = run_store.read_run_json(project_id, run_id)
+        if raw is None:
+            return
+        try:
+            rec = RunRecord(**raw)
+        except Exception:  # noqa: BLE001
+            return
+
+        # Gates — budget is the source of truth; the rest are guards.
+        if rec.status not in (RunStatus.PARTIAL, RunStatus.FAILED, RunStatus.BLOCKED):
+            return  # green (or cancelled) — nothing to recover
+        if rec.recovery_budget <= 0:
+            return  # no user-approved budget
+        if rec.orchestration_round >= RECOVERY_HARD_CAP:
+            return  # depth cap
+        if rec.recovered_by is not None:
+            return  # idempotent — already recovered (also blocks the manual path)
+        ra = rec.recovery_assessment
+        if ra is None or not ra.assessed or ra.verdict != "needs_recovery":
+            return
+        card = (ra.follow_up_task_card or "").strip()
+        if not card:
+            return
+
+        title = card.split("\n", 1)[0].strip()[:80] or "Auto-recovery"
+        child_task = TaskSpec(title=title, task_card=card, created_by="auto_recovery")
+        child = self.dispatch(
+            project_id,
+            child_task,
+            recovery_of=run_id,
+            recovery_budget=rec.recovery_budget - 1,
+            orchestration_round=rec.orchestration_round + 1,
+        )
+
+        # Claim the parent (re-read to avoid clobbering a concurrent write).
+        fresh = run_store.read_run_json(project_id, run_id)
+        if fresh is not None:
+            try:
+                rec = RunRecord(**fresh)
+            except Exception:  # noqa: BLE001
+                pass
+        rec.recovered_by = child.run_id
+        run_store.write_run_json(project_id, run_id, rec)
+        run_store.append_event(
+            project_id,
+            run_id,
+            {
+                "type": "auto_recovery_dispatched",
+                "child_run_id": child.run_id,
+                "remaining_budget": max(0, rec.recovery_budget - 1),
+                "orchestration_round": rec.orchestration_round + 1,
+            },
+        )
 
     def _mark_failed(
         self,

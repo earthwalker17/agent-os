@@ -100,7 +100,7 @@ conversations, messages, and pending executions.
 | File              | Purpose                                                                 |
 |-------------------|-------------------------------------------------------------------------|
 | `main.py`         | FastAPI app + all HTTP endpoints (projects, conversations, chat, memory, execution, inspection, verification, preview, **run control** — events / cancel / retry). Wires everything together. |
-| `orchestrator.py` | The chat brain. Loads SOUL + memory, assembles context (incl. an optional `@`-command **mode** block), produces the reply, runs the bounded inspection loop, then the structured **memory-intake** judge (`judge_memory_intake → MemoryDecision`). |
+| `orchestrator.py` | The chat brain. Loads SOUL + memory, **compacts** project memory for the prompt (Phase 6.1 `_compact_memory` — STATUS/PROJECT/SOUL whole, archive sections tail-trimmed over a threshold), assembles context (incl. an optional **mode** block from an `@`-command or a routed intent), produces the reply, runs the bounded inspection loop, then the structured **memory-intake** judge (`judge_memory_intake → MemoryDecision`). |
 | `memory_engine.py`| **Phase 6** — stdlib-only leaf module: the single markdown memory write path (`apply_update(base_dir, allow=…)` — policy-filtered, atomic, OSError-guarded, append-deduped, robust section replace), shared writable-file sets + `CANONICAL_SECTIONS` / `DEFAULT_SECTION`, the structured `MemoryDecision`, and idempotent `ensure_memory_scaffold`. Imported by both `orchestrator` and `execution.memory_reconciliation` (de-duped the old writers). |
 | `llm.py`          | Thin LLM entry point: `chat(system, messages, model?, provider?) -> str` + `chat_vision(system, prompt, images, …)` for image input. Delegates to `providers.py` (07.1); shared transient-retry; no context assembly — callers own that. |
 | `providers.py`    | **Provider Registry 2.0** — capability-aware model providers (Claude / GPT / Gemini / DeepSeek / Kimi / GLM). Key-presence availability (+ accepted env aliases, e.g. `ZAI_API_KEY` for GLM), default-provider preference (Claude first), a per-provider **model registry** with per-model `vision` flags, env-overridable default model + base URL, model validation (`is_known_model`), a `complete()` dispatcher, and a `complete_vision()` text+image dispatcher gated on the **selected model's** vision flag (`is_vision_capable`/`model_is_vision`/`default_vision_model`/`vision_available`/`default_vision_provider`). Anthropic via SDK; GPT/DeepSeek/Kimi/GLM via OpenAI-compatible `urllib` HTTPS; Gemini via `generateContent` (no new deps). |
@@ -120,7 +120,7 @@ conversations, messages, and pending executions.
 | `planner.py`               | **Phase 5** — pure planning layer: `looks_complex` heuristic gate, tolerant `parse_plan`, `fallback_plan`, task-graph helpers (`topological_order` cycle-safe, `dependency_failed`, `aggregate_run_status`). |
 | `run_store.py`             | Per-run artifact reader/writer; `render_result_md`; `sweep_stuck_runs`; **Phase 5** `write/read_plan_json` + result.md task section; **run control** `read_events` (timeline) + `read_task_card` (retry source). |
 | `runner.py`                | `CodingAgentRunner`: **Phase 5 phased run** — plan phase → per-task execution loops → finalize, **verification + repair** orchestration. **Run control:** cooperative `cancel_event` checked at step boundaries → `_finalize_cancelled` (terminal `cancelled`, no verify/reconcile). **Live metrics:** `_persist_live_metrics` flushes observed files/commands (+ the active task's delta) to run.json/plan.json after each side-effecting tool result, so counts climb during a run; finalize still owns the authoritative lists. |
-| `background.py`            | `BackgroundRunManager`: thread-pool dispatch; crash → `failed`; **run control** per-run cancel-`Event` registry (`request_cancel`) + `dispatch(..., retry_of=)`. |
+| `background.py`            | `BackgroundRunManager`: thread-pool dispatch; crash → `failed`; **run control** per-run cancel-`Event` registry (`request_cancel`) + `dispatch(..., retry_of=, recovery_of=, recovery_budget=, orchestration_round=)`. **Phase 6.1** `_maybe_auto_recover` (clean-finalize only) auto-dispatches ONE linked recovery run when a user-approved budget remains. |
 | `chat_delegation.py`       | `@code` trigger handling + **Phase 6** deterministic mode `@`-commands (`parse_mode_command`: `@plan`/`@design`/`@debug`/`@review`/`@inspect`/`@memory` — shape the response, never dispatch). |
 | `delegation_intent.py`     | Heuristic implicit-delegation detector (fallback only).                 |
 | `delegation_judge.py`      | LLM semantic delegation judge (the primary classifier) + **Phase 6** richer `intent` label (informational; routing still keys off the 3 decisions). |
@@ -167,7 +167,10 @@ conversations, messages, and pending executions.
    judge. Otherwise the **delegation judge** (`delegation_judge`) classifies the
    message (`dispatch_suggested` / `discussion` / `memory_only`) and emits a
    richer `intent` label. On `dispatch_suggested` → create a pending plan (no
-   run). On failure → fall back to the `delegation_intent` heuristic.
+   run). On failure → fall back to the `delegation_intent` heuristic. **Phase
+   6.1:** a non-dispatch judged intent also routes to the matching
+   `orchestrate(mode=…)` (`_INTENT_TO_MODE`) so the richer labels shape the
+   response, not just a UI badge.
 3. **Main response** LLM call. May emit `{"inspect_request": …}` to read a repo
    file via `inspect.py` (max 3/turn), each result fed back before the next.
 4. **Memory-intake judge** (Phase 6: `judge_memory_intake → MemoryDecision`,
@@ -314,7 +317,10 @@ terminal status the runner sets directly on user cancel — never agent-settable
 and excluded from memory reconciliation. **Phase 6** adds `recovery_assessment`
 (a `RecoveryAssessment`: verdict / diagnosis / recommended_action /
 follow_up_task_card) — populated by `recovery.assess_run` for non-green runs,
-`None` for green/older ones. `VerificationResult` carries `mode`
+`None` for green/older ones. **Phase 6.1** adds `memory_reconciliation_reason`
+(audit) and the recovery-budget lineage `recovery_budget` / `recovery_of` /
+`recovered_by` / `orchestration_round` (`recovered_by` set once → at most one
+recovery per parent). `VerificationResult` carries `mode`
 (`manual`/`inferred`/`skipped`), a `commands[]` breakdown, and `repair_attempts`;
 its legacy top-level `command`/`exit_code`/`output_preview` mirror the aggregate.
 
@@ -339,6 +345,12 @@ values.
   in any write path.
 - **Explicit dispatch only.** No inferred-intent auto-run, ever. **Retry** is
   an explicit user click that creates a new linked run — never an auto-rerun.
+  **Phase 6.1 scoped extension:** a user-approved **recovery budget** set when
+  *explicitly confirming* an execution contract authorizes up to N (≤2) bounded,
+  linked, audited auto-recovery runs. This is the only auto-dispatch path; it is
+  gated on the user's explicit prior approval (clamped at the confirm endpoint),
+  capped, idempotent (`recovered_by`, one recovery per parent), and never fires
+  from inferred intent or from a crash path.
 - **Best-effort post-run steps.** Verification / browser / reconciliation never
   crash finalization and never get a run stuck in `running`.
 - **No auto-injection of repo contents** into the main agent's context.

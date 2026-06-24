@@ -559,12 +559,16 @@ function App() {
   // dispatched, and appends a confirmation chat message. We re-load the
   // conversation messages so the new assistant message shows up, and
   // re-hydrate the existing pending bubble so its buttons disappear.
-  const handleConfirmPending = useCallback(async (pendingId: string) => {
+  const handleConfirmPending = useCallback(async (pendingId: string, recoveryBudget = 0) => {
     if (!activeProject || isGeneralActive) return
     try {
       const res = await fetch(
         `/api/projects/${activeProject}/execution/pending/${pendingId}/confirm`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recovery_budget: recoveryBudget }),
+        },
       )
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))

@@ -258,8 +258,19 @@ export interface RunRecord {
   memory_reconciled?: boolean | null
   memory_reconciliation?: string | null
   memory_reconciliation_error?: string | null
+  /** Phase 6.1 — the reconciliation judge's one-sentence reason (applied or skipped). */
+  memory_reconciliation_reason?: string | null
   /** Phase 6 — Main-Agent recovery assessment for a non-green run (null if green). */
   recovery_assessment?: RecoveryAssessment | null
+  /** Phase 6.1 — recovery lineage + budget. ``recovery_of`` is the run this one
+   * was auto-recovered from; ``recovered_by`` is the recovery run spawned from
+   * this one (set once a recovery exists, whether auto or confirmed). */
+  recovery_of?: string | null
+  recovered_by?: string | null
+  /** Remaining user-approved auto-recovery attempts (0 = none). */
+  recovery_budget?: number
+  /** Recovery chain depth (0 = original). */
+  orchestration_round?: number
 }
 
 /** Task 06.2D — managed preview dev-server status. */

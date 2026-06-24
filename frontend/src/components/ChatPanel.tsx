@@ -21,8 +21,9 @@ interface Props {
    * have an execution workspace to copy into.
    */
   runProjectId?: string | null
-  /** Confirm a pending execution plan — dispatches the stored task card. */
-  onConfirmPending?: (pendingExecutionId: string) => void
+  /** Confirm a pending execution plan — dispatches the stored task card. The
+   * optional ``recoveryBudget`` (0/1/2) authorizes bounded auto-recovery. */
+  onConfirmPending?: (pendingExecutionId: string, recoveryBudget?: number) => void
   /** Enter "revise mode" for a pending plan; next chat send revises it. */
   onRevisePending?: (pending: PendingExecution) => void
   /** Currently active revise-mode target (null = no pending revision). */
@@ -156,6 +157,10 @@ function ChatPanel({
   const [openRunId, setOpenRunId] = useState<string | null>(null)
   const [openTraceId, setOpenTraceId] = useState<string | null>(null)
   const [showTaskCardFor, setShowTaskCardFor] = useState<string | null>(null)
+  // Phase 6.1 — which assistant message's memory-audit detail is expanded.
+  const [memoryAuditFor, setMemoryAuditFor] = useState<string | null>(null)
+  // Phase 6.1 — per-pending user-approved auto-recovery budget (0 = none).
+  const [recoveryBudgets, setRecoveryBudgets] = useState<Record<string, number>>({})
 
   // Task 07.0 — composer attachment + voice state.
   const [files, setFiles] = useState<File[]>([])
@@ -570,6 +575,13 @@ function ChatPanel({
             msg.role === 'assistant'
               ? (msg.metadata as { memory_reason?: string } | null | undefined)?.memory_reason
               : undefined
+          const metaMemoryApplied =
+            msg.role === 'assistant'
+              ? (msg.metadata as { memory_applied?: { filename?: string; section?: string }[] } | null | undefined)
+                  ?.memory_applied ?? []
+              : []
+          const memoryAuditKey = msg.id ?? `i${i}`
+          const memoryAuditOpen = memoryAuditFor === memoryAuditKey
           return (
             <div key={msg.id || i} className={`chat-message ${msg.role}`}>
               <div className="chat-message-role">{msg.role === 'user' ? 'You' : 'Agent OS'}</div>
@@ -586,12 +598,32 @@ function ChatPanel({
                   {metaIntent && (
                     <span className={`chat-intent-badge intent-${metaIntent}`}>{metaIntent}</span>
                   )}
-                  {metaMemoryReason && (
-                    <span className="chat-memory-chip" title="Project memory was updated this turn">
-                      🧠 {metaMemoryReason}
-                    </span>
-                  )}
+                  {metaMemoryReason &&
+                    (metaMemoryApplied.length > 0 ? (
+                      <button
+                        type="button"
+                        className="chat-memory-chip chat-memory-chip-btn"
+                        onClick={() => setMemoryAuditFor(memoryAuditOpen ? null : memoryAuditKey)}
+                        title="Show which memory files changed this turn"
+                      >
+                        🧠 {metaMemoryReason} {memoryAuditOpen ? '▾' : '▸'}
+                      </button>
+                    ) : (
+                      <span className="chat-memory-chip" title="Project memory was updated this turn">
+                        🧠 {metaMemoryReason}
+                      </span>
+                    ))}
                 </div>
+              )}
+              {memoryAuditOpen && metaMemoryApplied.length > 0 && (
+                <ul className="chat-memory-audit">
+                  {metaMemoryApplied.map((u, ui) => (
+                    <li key={ui}>
+                      <code>{u.filename}</code>
+                      {u.section ? <span className="chat-memory-audit-sec"> › {u.section}</span> : null}
+                    </li>
+                  ))}
+                </ul>
               )}
               {attachments.length > 0 && (
                 <div className="chat-attachments">
@@ -646,11 +678,37 @@ function ChatPanel({
                   <button
                     type="button"
                     className="pending-confirm-btn"
-                    onClick={() => onConfirmPending && onConfirmPending(pending.pending_execution_id)}
+                    onClick={() =>
+                      onConfirmPending &&
+                      onConfirmPending(
+                        pending.pending_execution_id,
+                        recoveryBudgets[pending.pending_execution_id] ?? 0,
+                      )
+                    }
                     disabled={loading}
                   >
                     OK, run this
                   </button>
+                  <label
+                    className="pending-recovery-budget"
+                    title="If this run comes back non-green, allow the Main Agent to auto-dispatch this many bounded fix runs before reporting back."
+                  >
+                    auto-recovery:
+                    <select
+                      value={recoveryBudgets[pending.pending_execution_id] ?? 0}
+                      onChange={(e) =>
+                        setRecoveryBudgets((m) => ({
+                          ...m,
+                          [pending.pending_execution_id]: Number(e.target.value),
+                        }))
+                      }
+                      disabled={loading}
+                    >
+                      <option value={0}>none</option>
+                      <option value={1}>1 pass</option>
+                      <option value={2}>2 passes</option>
+                    </select>
+                  </label>
                   <button
                     type="button"
                     className="pending-revise-btn"

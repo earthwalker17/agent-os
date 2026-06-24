@@ -2140,6 +2140,48 @@ html, body, #root {
   padding: 1px 8px;
 }
 
+.chat-memory-chip-btn {
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+
+.chat-memory-audit {
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-elev);
+  border-radius: 6px;
+}
+
+.chat-memory-audit-sec {
+  color: var(--text-muted);
+}
+
+.pending-recovery-budget {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.pending-recovery-budget select {
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.run-chat-recovery-lineage {
+  margin-top: 4px;
+}
+
 .run-chat-verify-result {
   display: flex;
   flex-direction: column;

@@ -351,6 +351,10 @@ class RunRecord(BaseModel):
     memory_reconciled: Optional[bool] = None
     memory_reconciliation: Optional[str] = None
     memory_reconciliation_error: Optional[str] = None
+    # Phase 6.1 — the reconciliation judge's one-sentence reason for the decision
+    # (applied or skipped), surfaced in the run card + detail modal so memory
+    # changes are auditable. ``None`` for older records / before reconciliation.
+    memory_reconciliation_reason: Optional[str] = None
     # Task 06.2A — optional post-run command verification. ``None`` for
     # runs that finished before verification was introduced, or that did
     # not reach the finalize step where verification runs.
@@ -398,6 +402,18 @@ class RunRecord(BaseModel):
     # for runs never involved in a retry, so old records round-trip unchanged.
     retry_of: Optional[str] = None
     retried_by: Optional[str] = None
+    # Phase 6.1 — user-approved bounded recovery. ``recovery_budget`` is the
+    # number of remaining auto-recovery attempts (set by the user at confirm time;
+    # 0 = none). It is the SINGLE SOURCE OF TRUTH for auto-recovery; a child
+    # inherits ``budget - 1``. ``recovery_of`` links a recovery run to the run it
+    # was spawned from; ``recovered_by`` is the recovery run spawned from this one
+    # (set once — by auto-recovery — so "at most one recovery per parent" holds).
+    # ``orchestration_round`` is the chain depth (redundant hard cap). All default
+    # 0/None so old records round-trip unchanged.
+    recovery_budget: int = 0
+    recovery_of: Optional[str] = None
+    recovered_by: Optional[str] = None
+    orchestration_round: int = 0
     # Phase 6 — Main-Agent recovery assessment for a non-green terminal run.
     # ``None`` until assessed (and for green runs, which are skipped). Best-effort:
     # an assessment failure never fails the run. Populated by

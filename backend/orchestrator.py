@@ -132,6 +132,83 @@ def load_memory(project_id: str, history: list[dict] | None = None) -> MemoryCon
 
 
 # ---------------------------------------------------------------------------
+# Context Loader v2 (Phase 6.1) — keep the main-agent prompt compact as memory
+# grows. Applied ONLY to the project-memory sections of the main orchestration
+# system prompt; the delegation + reconciliation snapshots are separate,
+# already-bounded code paths and are intentionally untouched. SOUL.md never
+# routes through here (it is loaded full + first).
+# ---------------------------------------------------------------------------
+
+# Per-file char budget in the main prompt. Below this a file is byte-identical,
+# so small/young projects (and tiny test fixtures) are unaffected.
+_CONTEXT_FILE_CHAR_CAP = 2400
+# Newest entries kept when an archive-style section is trimmed.
+_KEEP_RECENT_ITEMS = 8
+# "Current working state" sections — never trimmed (the live, high-signal part).
+# STATUS.md / PROJECT.md are kept whole; within TASK_QUEUE.md these stay whole.
+_CURRENT_STATE_SECTIONS = {"In Progress", "Up Next"}
+
+
+def _trim_section_body(buf: list[str]) -> list[str]:
+    """Keep the most-recent ``_KEEP_RECENT_ITEMS`` non-empty lines (the tail —
+    newest, since memory is append-mostly) with a leading elision note."""
+    content_lines = [ln for ln in buf if ln.strip()]
+    if len(content_lines) <= _KEEP_RECENT_ITEMS:
+        return buf
+    elided = len(content_lines) - _KEEP_RECENT_ITEMS
+    kept: list[str] = []
+    count = 0
+    for ln in reversed(buf):
+        kept.append(ln)
+        if ln.strip():
+            count += 1
+        if count >= _KEEP_RECENT_ITEMS:
+            break
+    kept.reverse()
+    note = f"_({elided} older entr{'y' if elided == 1 else 'ies'} elided)_"
+    return ["", note, ""] + kept
+
+
+def _compact_memory(filename: str, content: str) -> str:
+    """Compact a project-memory file for the main prompt when it grows large.
+
+    STATUS.md (current state) and PROJECT.md (identity/scope) are returned whole.
+    For the append-growth files (TASK_QUEUE.md / DECISIONS.md / RESEARCH.md),
+    once the file exceeds ``_CONTEXT_FILE_CHAR_CAP`` each ``##`` section's body is
+    trimmed to its newest entries — except the live ``In Progress`` / ``Up Next``
+    sections, which stay whole. Below the cap the content is byte-identical.
+    """
+    if filename in ("STATUS.md", "PROJECT.md"):
+        return content
+    if not content or len(content) <= _CONTEXT_FILE_CHAR_CAP:
+        return content
+
+    lines = content.split("\n")
+    out: list[str] = []
+    section_name: Optional[str] = None
+    buf: list[str] = []
+
+    def _flush() -> None:
+        if section_name is not None and section_name not in _CURRENT_STATE_SECTIONS:
+            out.extend(_trim_section_body(buf))
+        else:
+            out.extend(buf)
+
+    for line in lines:
+        if line.startswith("## "):
+            _flush()
+            buf = []
+            section_name = line[3:].strip()
+            out.append(line)
+        elif section_name is None:
+            out.append(line)  # preamble (title + intro) stays
+        else:
+            buf.append(line)
+    _flush()
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Context assembly — builds system prompt + messages for the LLM
 # ---------------------------------------------------------------------------
 
@@ -175,6 +252,19 @@ _MODE_GUIDANCE = {
         "The user invoked `@memory`. They want project knowledge captured. Confirm "
         "what you understood and how you'd record it; the system persists durable "
         "memory in a separate step — don't claim you wrote files yourself."
+    ),
+    "docs": (
+        "## This turn: DOCS\n"
+        "This turn is about documentation. Help draft or improve clear, accurate "
+        "docs (README, guides, comments-level explanations). Stay at the writing "
+        "level; if doc files in the repo need editing, that's a Coding Agent task "
+        "the user can dispatch — propose it, don't claim you wrote files."
+    ),
+    "research": (
+        "## This turn: RESEARCH\n"
+        "This turn is about research / investigation. Lay out options, references, "
+        "and tradeoffs clearly so the finding can be recorded in RESEARCH.md. Be "
+        "honest about what is and isn't known; don't fabricate sources."
     ),
 }
 
@@ -260,18 +350,19 @@ def _build_system_prompt(
     if global_parts:
         sections.append("---\n\n# Global Context\n\n" + "\n\n".join(global_parts))
 
-    # 3. Project memory
+    # 3. Project memory (Phase 6.1 — compacted for the main prompt as it grows;
+    #    STATUS.md / PROJECT.md kept whole, archive sections trimmed to newest).
     project_parts: list[str] = []
     if ctx.project:
-        project_parts.append(f"## PROJECT.md\n{ctx.project}")
+        project_parts.append(f"## PROJECT.md\n{_compact_memory('PROJECT.md', ctx.project)}")
     if ctx.status:
-        project_parts.append(f"## STATUS.md\n{ctx.status}")
+        project_parts.append(f"## STATUS.md\n{_compact_memory('STATUS.md', ctx.status)}")
     if ctx.task_queue:
-        project_parts.append(f"## TASK_QUEUE.md\n{ctx.task_queue}")
+        project_parts.append(f"## TASK_QUEUE.md\n{_compact_memory('TASK_QUEUE.md', ctx.task_queue)}")
     if ctx.decisions:
-        project_parts.append(f"## DECISIONS.md\n{ctx.decisions}")
+        project_parts.append(f"## DECISIONS.md\n{_compact_memory('DECISIONS.md', ctx.decisions)}")
     if ctx.research:
-        project_parts.append(f"## RESEARCH.md\n{ctx.research}")
+        project_parts.append(f"## RESEARCH.md\n{_compact_memory('RESEARCH.md', ctx.research)}")
     if project_parts:
         sections.append(
             f"---\n\n# Current Project: {ctx.project_name}\n\n"

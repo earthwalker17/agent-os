@@ -306,8 +306,12 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
   // Phase 6 — memory reconciliation + recovery assessment surfaces.
   const memTag = record.memory_reconciliation
   const ra = record.recovery_assessment
+  // A recovery run already exists for this run (auto or confirmed) → don't offer
+  // the manual "Run suggested fix" path again (one recovery per parent).
+  const alreadyRecovered = !!record.recovered_by
   const recoveryActionable =
-    !!ra && ra.assessed && ra.verdict === 'needs_recovery' && !!ra.follow_up_task_card
+    !!ra && ra.assessed && ra.verdict === 'needs_recovery' && !!ra.follow_up_task_card &&
+    !alreadyRecovered
 
   // Thumbnail gallery — distinct from the "captured" vs "judged" signals below.
   const gallery =
@@ -550,12 +554,44 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
               A recovery plan was added below — confirm it to run the fix.
             </p>
           )}
-          {!recoveryActionable && ra.verdict === 'exhausted' && (
+          {alreadyRecovered && (
+            <p className="run-chat-muted">
+              {record.recovery_of ? 'Recovery' : 'A recovery run was dispatched'}
+              {' '}
+              <button
+                type="button"
+                className="run-chat-link-btn"
+                onClick={() => onOpenRun(record.recovered_by as string)}
+                title={`Open recovery run ${record.recovered_by}`}
+              >
+                view recovery run
+              </button>
+            </p>
+          )}
+          {!recoveryActionable && !alreadyRecovered && ra.verdict === 'exhausted' && (
             <p className="run-chat-muted">
               Automatic recovery looks exhausted — this one likely needs a manual look.
             </p>
           )}
         </div>
+      )}
+
+      {/* --- auto-recovery lineage badge --- */}
+      {record.recovery_of && (
+        <p className="run-chat-muted run-chat-recovery-lineage">
+          ↻ Auto-recovery of run{' '}
+          <button
+            type="button"
+            className="run-chat-link-btn"
+            onClick={() => onOpenRun(record.recovery_of as string)}
+            title={`Open original run ${record.recovery_of}`}
+          >
+            {record.recovery_of}
+          </button>
+          {typeof record.recovery_budget === 'number' && record.recovery_budget > 0 && (
+            <> · {record.recovery_budget} recovery pass{record.recovery_budget === 1 ? '' : 'es'} left</>
+          )}
+        </p>
       )}
 
       {verifyError && <div className="run-chat-error">{verifyError}</div>}
