@@ -61,6 +61,13 @@ DECISION_DISCUSSION = "discussion"
 DECISION_MEMORY_ONLY = "memory_only"
 VALID_DECISIONS = {DECISION_DISPATCH, DECISION_DISCUSSION, DECISION_MEMORY_ONLY}
 
+# Phase 6 — richer intent taxonomy (informational; routing still keys off the
+# three decisions above). An unknown / missing label parses to "".
+INTENT_LABELS = {
+    "discussion", "planning", "design", "build", "debug",
+    "inspect", "memory", "docs", "retrospective", "research",
+}
+
 
 @dataclass
 class DelegationDecision:
@@ -81,6 +88,11 @@ class DelegationDecision:
     source: str
     display_plan: str = ""
     title: str = ""
+    # Phase 6 — a richer intent label (informational; does not change routing).
+    # One of INTENT_LABELS or "" when the judge didn't classify. Used for UI
+    # badges and to hint the memory-intake judge; dispatch routing still keys
+    # only off ``decision``.
+    intent: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +102,7 @@ class DelegationDecision:
             "proposed_task_card": self.proposed_task_card,
             "display_plan": self.display_plan,
             "title": self.title,
+            "intent": self.intent,
             "source": self.source,
         }
 
@@ -154,6 +167,19 @@ When you choose "dispatch_suggested", produce three extra fields:
 For "discussion" and "memory_only", these three fields must be empty
 strings.
 
+Also label the turn's intent with ONE of these (informational — it does not
+change whether a run is dispatched):
+- "planning": breaking down work, sequencing, roadmap, next steps
+- "design": product / architecture / UX design discussion
+- "build": a request to write or change code (usually pairs with dispatch_suggested)
+- "debug": diagnosing a failure, a failed run, or a bug
+- "inspect": asking to look at / review existing code or files
+- "memory": asking to record/update project memory (pairs with memory_only)
+- "docs": writing or updating documentation
+- "retrospective": reviewing what happened, post-run review
+- "research": gathering external references / investigating options
+- "discussion": ordinary strategic conversation that fits none of the above
+
 Return ONLY a single JSON object. No markdown fences, no commentary.
 
 Schema:
@@ -161,6 +187,7 @@ Schema:
   "decision": "dispatch_suggested" | "discussion" | "memory_only",
   "confidence": 0.0-1.0,
   "reason": "one short sentence justifying the decision",
+  "intent": "planning | design | build | debug | inspect | memory | docs | retrospective | research | discussion",
   "title": "short run title (empty unless dispatch_suggested)",
   "display_plan": "project-manager-tone markdown plan (empty unless dispatch_suggested)",
   "proposed_task_card": "imperative task card (empty unless dispatch_suggested)"
@@ -322,6 +349,11 @@ def _parse_decision(raw: str) -> Optional[DelegationDecision]:
     display_plan = str(parsed.get("display_plan", "")).strip()
     title = str(parsed.get("title", "")).strip()
 
+    # Phase 6 — richer intent label, validated leniently (unknown -> "").
+    intent = str(parsed.get("intent", "")).strip().lower()
+    if intent not in INTENT_LABELS:
+        intent = "build" if decision == DECISION_DISPATCH else ""
+
     # Enforce the schema invariant: dispatch-only fields are empty for
     # other decisions, regardless of what the model emitted.
     if decision != DECISION_DISPATCH:
@@ -336,6 +368,7 @@ def _parse_decision(raw: str) -> Optional[DelegationDecision]:
         proposed_task_card=task_card,
         display_plan=display_plan,
         title=title,
+        intent=intent,
         source="llm",
     )
 

@@ -12,6 +12,8 @@ import stat
 import re
 import mimetypes
 
+import memory_engine
+
 # Load .env before anything that needs ANTHROPIC_API_KEY
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -25,6 +27,7 @@ from database import (
 from orchestrator import (
     orchestrate, load_memory, judge_memory_updates, apply_memory_updates, apply_memory_update,
     judge_global_memory_updates, apply_global_memory_updates, apply_global_memory_update,
+    judge_memory_intake, apply_memory_decision,
     load_global_memory, GENERAL_PROJECT_ID, WRITABLE_GLOBAL_FILES,
 )
 from execution import (
@@ -38,9 +41,11 @@ from execution import (
     shutdown_default_manager,
     is_code_delegation,
     handle_code_delegation,
+    parse_mode_command,
     GENERAL_REJECTION_MESSAGE,
     judge_delegation,
     DECISION_DISPATCH,
+    DECISION_MEMORY_ONLY,
     PendingExecutionView,
     serialize_pending,
     revise_pending_plan,
@@ -108,6 +113,25 @@ def startup():
     except Exception as exc:  # noqa: BLE001
         print(f"[startup] sweep_stuck_runs failed: {type(exc).__name__}: {exc}")
 
+    # Phase 6 — one-time additive migration: backfill the canonical memory
+    # sections for projects created before the structured-memory upgrade so the
+    # intake judge + reconciliation always have stable sections to target. Pure
+    # backfill (never rewrites existing content); best-effort, never blocks.
+    try:
+        if PROJECTS_DIR.exists():
+            for pdir in PROJECTS_DIR.iterdir():
+                if not pdir.is_dir():
+                    continue
+                name = pdir.name
+                pmd = pdir / "PROJECT.md"
+                if pmd.exists():
+                    first = pmd.read_text(encoding="utf-8").split("\n", 1)[0]
+                    if first.startswith("# "):
+                        name = first[2:].strip() or name
+                memory_engine.ensure_memory_scaffold(pdir, name)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] memory scaffold migration failed: {type(exc).__name__}: {exc}")
+
 
 @app.on_event("shutdown")
 def shutdown():
@@ -153,8 +177,8 @@ DEFAULT_MEMORY_CONTENT = {
     "PROJECT.md": "# {name}\n\n## Vision\n(describe the project vision here)\n\n## Scope\n- (list key scope items)\n\n## Target User\n(who is this for?)\n\n## Tech Stack\n- (list technologies)\n",
     "STATUS.md": "# Status: {name}\n\n## Current Phase\nPlanning\n\n## Latest Milestone\nProject created\n\n## What Works\n- Project folder initialized\n\n## Next Up\n- Define project scope and goals\n",
     "TASK_QUEUE.md": "# Task Queue: {name}\n\n## In Progress\n- [ ] Define project scope and requirements\n\n## Up Next\n- [ ] Set up initial project structure\n\n## Done\n- [x] Project created\n",
-    "DECISIONS.md": "# Decisions: {name}\n\n(record important project decisions and their rationale here)\n",
-    "RESEARCH.md": "# Research: {name}\n\n(record research findings, external references, and technical notes here)\n",
+    "DECISIONS.md": "# Decisions: {name}\n\n## Decisions\n(record important project decisions and their rationale here)\n",
+    "RESEARCH.md": "# Research: {name}\n\n## Findings\n(record research findings, external references, and technical notes here)\n",
 }
 
 
@@ -189,6 +213,10 @@ def api_create_project(req: CreateProjectRequest):
     for filename, template in DEFAULT_MEMORY_CONTENT.items():
         content = template.replace("{name}", display_name)
         (project_path / filename).write_text(content, encoding="utf-8")
+
+    # Phase 6 — backfill any canonical memory section the templates don't cover
+    # (idempotent; templates already include them, so normally a no-op).
+    memory_engine.ensure_memory_scaffold(project_path, display_name)
 
     return {"project_id": project_id, "name": display_name}
 
@@ -478,6 +506,14 @@ class ChatResponse(BaseModel):
     timestamp: str
     memory_updated: bool = False
     memory_updates: list[dict] = []
+    # Phase 6 — the intake judge's one-sentence reason for the memory decision,
+    # surfaced as a subtle "Memory updated — <reason>" chip in chat. "" when no
+    # memory was written (or no reason given).
+    memory_reason: str = ""
+    # Phase 6 — the turn's classified intent (planning / design / build / debug /
+    # inspect / memory / docs / retrospective / research / discussion) or the
+    # explicit `@`-command mode. "" when unclassified. Drives a UI mode badge.
+    intent: str = ""
     # Populated when the assistant message has a confirmable execution plan
     # attached (Task 05.9.5). The frontend keys off `status` to decide
     # whether to render the OK/Revise buttons under the message.
@@ -614,14 +650,18 @@ def api_chat(req: ChatRequest):
 
     history = [{"role": m["role"], "content": m["content"]} for m in messages]
 
-    # --- Implicit delegation judge → confirmable plan (Task 05.9 + 05.9.5) ---
-    # In project chats only, the LLM judge classifies the message. On
-    # `dispatch_suggested` we create a pending execution plan, persist a
-    # natural project-manager-style assistant message linked to it, and let
-    # the user confirm or revise via UI buttons. `@code` and the confirm
-    # endpoint are still the only paths that actually dispatch a run. The
-    # GENERAL workspace has no execution workspace, so the judge is skipped.
-    if not is_general:
+    # --- Intent Router v2 (Phase 6) ---
+    # An explicit mode `@`-command (@plan / @design / @debug / @review /
+    # @inspect / @memory) sets the orchestration mode directly and skips the
+    # delegation judge (none of these dispatch). Otherwise, in project chats the
+    # LLM judge classifies the message: on `dispatch_suggested` we create a
+    # confirmable pending plan (the only inferred path toward a run, still
+    # gated on a user click). The richer `intent` label is informational — it
+    # hints the memory-intake judge and drives UI badges, never routing.
+    mode_command, _mode_body = parse_mode_command(req.message)
+    turn_intent: str = mode_command or ""
+
+    if not is_general and mode_command is None:
         project_name = _project_display_name(project_id)
         decision = judge_delegation(
             project_id=project_id,
@@ -638,30 +678,47 @@ def api_chat(req: ChatRequest):
                 decision=decision,
                 messages=messages,
             )
+        turn_intent = getattr(decision, "intent", "") or (
+            "memory" if decision.decision == DECISION_MEMORY_ONLY else "discussion"
+        )
 
     # Generate orchestration response (with optional on-demand file inspection).
     # Task 07.1 — route the main response to the selected provider; Provider
-    # Registry 2.0 — pin the selected model within that provider.
+    # Registry 2.0 — pin the selected model within that provider. Phase 6 —
+    # ``mode`` shapes the system prompt for explicit `@`-commands.
     response_content, inspected_files = orchestrate(
         project_id, effective_message, history=history,
-        provider=provider_id, model=model_id,
+        provider=provider_id, model=model_id, mode=mode_command,
     )
 
-    # Persist assistant reply. When inspections happened, include them in the
-    # message metadata so the chat history reflects how the answer was built.
-    inspect_metadata = {"inspected_files": inspected_files} if inspected_files else None
-    assistant_msg = add_message(
-        req.conversation_id, "assistant", response_content, metadata=inspect_metadata
-    )
-
-    # Memory judgment: route to global or project writeback
+    # Memory judgment (Phase 6): one structured intake decision per turn, scoped
+    # global vs project. Carries a reason the UI can surface; never fails the turn.
+    # Done before persisting the assistant message so its outcome (intent +
+    # memory reason) can ride in the message metadata and survive a reload.
     ctx = load_memory(project_id)
-    if is_general:
-        proposed = judge_global_memory_updates(ctx, effective_message, response_content)
-        applied = apply_global_memory_updates(proposed)
-    else:
-        proposed = judge_memory_updates(ctx, effective_message, response_content)
-        applied = apply_memory_updates(project_id, proposed)
+    scope = "global" if is_general else "project"
+    mem_decision = judge_memory_intake(
+        scope, ctx, effective_message, response_content, intent=turn_intent or None
+    )
+    applied = apply_memory_decision(
+        mem_decision, scope, project_id=None if is_general else project_id
+    )
+    memory_reason = mem_decision.reason if applied else ""
+
+    # Persist assistant reply. Include inspection list (06.1) + the Phase 6
+    # intent / memory-reason so the chat history re-renders the badges/chips on
+    # reload (these are not on the wire-only ChatResponse otherwise).
+    assistant_meta: dict = {}
+    if inspected_files:
+        assistant_meta["inspected_files"] = inspected_files
+    if turn_intent:
+        assistant_meta["intent"] = turn_intent
+    if memory_reason:
+        assistant_meta["memory_reason"] = memory_reason
+    assistant_msg = add_message(
+        req.conversation_id, "assistant", response_content,
+        metadata=assistant_meta or None,
+    )
 
     # Auto-title: if this is the first user message, set conversation title from it
     if len([m for m in messages if m["role"] == "user"]) <= 1:
@@ -674,6 +731,8 @@ def api_chat(req: ChatRequest):
         timestamp=assistant_msg["timestamp"],
         memory_updated=len(applied) > 0,
         memory_updates=applied,
+        memory_reason=memory_reason,
+        intent=turn_intent,
         message_id=assistant_msg["id"],
         inspected_files=inspected_files,
     )
@@ -722,7 +781,10 @@ def _handle_dispatch_suggested(
     )
     plan = serialize_pending(pending_row)
     body = render_pending_chat_body(plan)
-    metadata = {"pending_execution_id": plan.pending_execution_id}
+    metadata = {
+        "pending_execution_id": plan.pending_execution_id,
+        "intent": getattr(decision, "intent", "") or "build",
+    }
     assistant_msg = add_message(
         req.conversation_id, "assistant", body, metadata=metadata
     )
@@ -1307,6 +1369,74 @@ def api_retry_run(project_id: str, run_id: str):
         project_id, run_id, {"type": "run_retried", "new_run_id": new_record.run_id}
     )
     return new_record.model_dump()
+
+
+class ProposeRecoveryRequest(BaseModel):
+    conversation_id: str
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/propose-recovery")
+def api_propose_recovery(project_id: str, run_id: str, req: ProposeRecoveryRequest):
+    """Turn a run's recovery assessment into a confirmable pending plan (Phase 6).
+
+    The Main Agent assessed a non-green run and recommended a follow-up coding
+    task. This endpoint materializes that recommendation as a normal
+    **confirmable pending execution** (the user still clicks "OK, run this" to
+    dispatch — no auto-run) and posts it as an assistant message in the given
+    conversation so it renders as a recovery card. Returns the pending plan +
+    the new message id.
+    """
+    _require_workspace(project_id)
+    conv = get_conversation(req.conversation_id)
+    if not conv or conv["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="Conversation not found for this project")
+
+    raw = run_store.read_run_json(project_id, run_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        record = RunRecord(**raw)
+    except Exception:
+        raise HTTPException(status_code=500, detail="run record is corrupt")
+
+    ra = record.recovery_assessment
+    if ra is None or not ra.assessed:
+        raise HTTPException(status_code=409, detail="run has no recovery assessment")
+    task_card = (ra.follow_up_task_card or "").strip()
+    if ra.verdict != "needs_recovery" or not task_card:
+        raise HTTPException(
+            status_code=409,
+            detail="recovery assessment did not recommend a confirmable follow-up run",
+        )
+
+    title = derive_title_from_card(task_card, fallback=f"Recovery for {record.task_title or run_id}")
+    display_plan = (
+        f"I looked at the **{record.status.value}** run _{record.task_title or run_id}_ and "
+        f"recommend a **{ra.recommended_action}** follow-up.\n\n"
+        f"**Diagnosis:** {ra.diagnosis or '(none)'}\n\n"
+        f"**Proposed fix:**\n\n> {task_card}\n\n"
+        f"{ra.rationale or ''}\n\n"
+        "Confirm to dispatch this recovery run, or revise the plan first."
+    ).strip()
+
+    pending_row = create_pending_execution(
+        project_id=project_id,
+        conversation_id=req.conversation_id,
+        source_message_id=None,
+        title=title,
+        display_plan=display_plan,
+        task_card=task_card,
+    )
+    plan = serialize_pending(pending_row)
+    body = render_pending_chat_body(plan)
+    assistant_msg = add_message(
+        req.conversation_id, "assistant", body,
+        metadata={"pending_execution_id": plan.pending_execution_id, "recovery_of": run_id},
+    )
+    return {
+        "pending_execution": plan.to_dict(),
+        "message_id": assistant_msg["id"],
+    }
 
 
 class BrowserVerifyRequest(BaseModel):

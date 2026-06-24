@@ -290,6 +290,37 @@ class VisualReviewResult(BaseModel):
     skipped_reason: str = ""
 
 
+class RecoveryAssessment(BaseModel):
+    """Main-Agent assessment of a non-green run (Phase 6).
+
+    Produced best-effort by ``execution.recovery.assess_run`` after a run reaches
+    a non-green terminal state (``partial`` / ``failed`` / ``blocked``, or a
+    ``completed`` run whose command/browser verification or AI visual review
+    failed). It interprets the compact run outcome and recommends a single
+    bounded next step for the **user to confirm** — it never auto-dispatches a
+    run (explicit-dispatch invariant).
+
+    ``verdict``:
+      - ``"ok"`` — nothing to recover (rarely persisted; green runs are skipped).
+      - ``"needs_recovery"`` — a concrete bounded next step is recommended.
+      - ``"exhausted"`` — automatic progress looks exhausted; report to the user.
+
+    ``recommended_action`` is one of ``inspect`` / ``repair`` / ``split`` /
+    ``reverify`` / ``report``. ``follow_up_task_card`` is a self-contained
+    imperative task card for the Coding Agent — populated only when a follow-up
+    run is the recommendation (``repair`` / ``split`` / ``reverify``), empty
+    otherwise. ``assessed`` is False on the skip / error paths.
+    """
+
+    assessed: bool = False
+    verdict: str = "ok"  # ok | needs_recovery | exhausted
+    diagnosis: str = ""
+    recommended_action: str = "report"  # inspect | repair | split | reverify | report
+    follow_up_task_card: str = ""
+    rationale: str = ""
+    error: Optional[str] = None
+
+
 class RunRecord(BaseModel):
     """Persistent metadata for a single agent run (serialized as run.json)."""
 
@@ -367,6 +398,11 @@ class RunRecord(BaseModel):
     # for runs never involved in a retry, so old records round-trip unchanged.
     retry_of: Optional[str] = None
     retried_by: Optional[str] = None
+    # Phase 6 — Main-Agent recovery assessment for a non-green terminal run.
+    # ``None`` until assessed (and for green runs, which are skipped). Best-effort:
+    # an assessment failure never fails the run. Populated by
+    # ``execution.recovery.assess_run`` from ``runner._finalize``.
+    recovery_assessment: Optional[RecoveryAssessment] = None
 
 
 class ResultSummary(BaseModel):

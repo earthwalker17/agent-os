@@ -33,6 +33,8 @@ interface Props {
   onCancelRevise?: () => void
   /** Task 06.2D — notify parent that a run/preview changed so the Runs panel refreshes. */
   onRunsChanged?: () => void
+  /** Phase 6 — re-fetch the conversation messages (e.g. after a recovery plan is proposed). */
+  onMessagesChanged?: () => void
   /** Task 07.1 — model providers + current selection for the header dropdown. */
   providers?: ProviderInfo[]
   selectedProvider?: string
@@ -137,6 +139,7 @@ function ChatPanel({
   revisingPendingTitle,
   onCancelRevise,
   onRunsChanged,
+  onMessagesChanged,
   providers,
   selectedProvider,
   onSelectProvider,
@@ -558,6 +561,15 @@ function ChatPanel({
           // Task 07.0 — attachments attached to a (user) message.
           const attachments =
             (msg.metadata as { attachments?: ChatAttachment[] } | null | undefined)?.attachments ?? []
+          // Phase 6 — intent badge + memory chip from the assistant message metadata.
+          const metaIntent =
+            msg.role === 'assistant'
+              ? (msg.metadata as { intent?: string } | null | undefined)?.intent
+              : undefined
+          const metaMemoryReason =
+            msg.role === 'assistant'
+              ? (msg.metadata as { memory_reason?: string } | null | undefined)?.memory_reason
+              : undefined
           return (
             <div key={msg.id || i} className={`chat-message ${msg.role}`}>
               <div className="chat-message-role">{msg.role === 'user' ? 'You' : 'Agent OS'}</div>
@@ -568,6 +580,18 @@ function ChatPanel({
                 />
               ) : (
                 msg.content && <div className="chat-message-content">{msg.content}</div>
+              )}
+              {(metaIntent || metaMemoryReason) && (
+                <div className="chat-meta-row">
+                  {metaIntent && (
+                    <span className={`chat-intent-badge intent-${metaIntent}`}>{metaIntent}</span>
+                  )}
+                  {metaMemoryReason && (
+                    <span className="chat-memory-chip" title="Project memory was updated this turn">
+                      🧠 {metaMemoryReason}
+                    </span>
+                  )}
+                </div>
               )}
               {attachments.length > 0 && (
                 <div className="chat-attachments">
@@ -596,9 +620,11 @@ function ChatPanel({
                 <RunChatCard
                   projectId={runProjectId}
                   runId={runIdFromMeta}
+                  conversationId={conversationId}
                   onOpenRun={(rid) => setOpenRunId(rid)}
                   onOpenTrace={(rid) => setOpenTraceId(rid)}
                   onRunsChanged={onRunsChanged}
+                  onMessagesChanged={onMessagesChanged}
                   provider={selectedProvider}
                   model={selectedModel}
                 />

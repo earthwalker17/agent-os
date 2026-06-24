@@ -144,6 +144,17 @@ vision-capable model is available — skipping gracefully otherwise.
 switchable from a dropdown top-right in the chat header and remembered
 across reloads.
 
+**Phase 6 — Main Agent Orchestration & Memory v2** strengthens the main agent
+itself. Memory writes now flow through one atomic, policy-filtered engine, and
+each chat turn makes a single **structured memory-intake decision** that carries
+a reason (surfaced as a "🧠 Memory updated" chip). Routing is richer: an
+`intent` label plus new explicit commands — `@plan`, `@design`, `@debug`,
+`@review`, `@inspect`, `@memory` — shape the response (only `@code` and
+confirming a plan ever dispatch a run). And when a run comes back partial,
+failed, blocked, or fails verification, the main agent **assesses it and proposes
+a bounded next step** ("Run suggested fix") that you confirm with one click —
+never auto-run. Run cards now also show whether project memory was reconciled.
+
 Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 
 ## Architecture
@@ -175,7 +186,7 @@ Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 - **Execution layer** — `backend/execution/` contains the sandbox,
   tool runtime, runner, background dispatch manager, run store,
   delegation judge, pending-execution flow, memory reconciliation,
-  and on-demand file inspection.
+  on-demand file inspection, and the confirmable **recovery** assessor.
 
 ## Design philosophy
 
@@ -263,6 +274,10 @@ python tests/test_providers.py
 python tests/test_planner.py
 python tests/test_runner_planning.py
 python tests/test_run_control.py
+python tests/test_memory_engine.py
+python tests/test_memory_intake.py
+python tests/test_intent_router.py
+python tests/test_recovery.py
 ```
 
 All tests stub the LLM caller, so no Anthropic API key is needed to

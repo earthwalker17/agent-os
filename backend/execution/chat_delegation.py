@@ -48,6 +48,41 @@ def is_code_delegation(message: str) -> bool:
     return rest == "" or rest[0].isspace() or rest[0] in ":-,"
 
 
+# Phase 6 — additional explicit chat commands. Unlike `@code` (which dispatches
+# a run), these only SHAPE the Main Agent's chat response via an orchestration
+# "mode" string. NONE of them dispatch anything — execution still requires
+# `@code` or clicking "OK, run this" on a proposed plan.
+MODE_COMMANDS: dict[str, str] = {
+    "@plan": "plan",
+    "@design": "design",
+    "@debug": "debug",
+    "@review": "review",
+    "@inspect": "inspect",
+    "@memory": "memory",
+}
+
+
+def parse_mode_command(message: str) -> tuple[str | None, str]:
+    """Detect a leading mode `@`-command.
+
+    Returns ``(mode, body)`` when ``message`` starts with one of
+    ``MODE_COMMANDS`` followed by whitespace / end-of-string / punctuation
+    (the same guard ``is_code_delegation`` uses, so ``@reviewer`` does not match
+    ``@review``); ``body`` is the message with the command prefix stripped.
+    Returns ``(None, message)`` otherwise. Never raises.
+    """
+    if not isinstance(message, str):
+        return None, message
+    stripped = message.lstrip()
+    low = stripped.lower()
+    for cmd, mode in MODE_COMMANDS.items():
+        if low.startswith(cmd):
+            rest = stripped[len(cmd):]
+            if rest == "" or rest[0].isspace() or rest[0] in ":-,":
+                return mode, rest.lstrip(" :-,\t\n").strip()
+    return None, message
+
+
 def extract_task_card(message: str) -> str:
     stripped = message.lstrip()
     return stripped[len(CODE_TRIGGER) :].lstrip(" :-,\t\n").strip()

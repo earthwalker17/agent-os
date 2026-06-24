@@ -186,6 +186,21 @@ export interface ExecutionTask {
   steps_used?: number
 }
 
+/** Phase 6 — Main-Agent recovery assessment of a non-green run. */
+export type RecoveryVerdict = 'ok' | 'needs_recovery' | 'exhausted'
+export type RecoveryAction = 'inspect' | 'repair' | 'split' | 'reverify' | 'report'
+
+export interface RecoveryAssessment {
+  assessed: boolean
+  verdict: RecoveryVerdict
+  diagnosis?: string
+  recommended_action: RecoveryAction
+  /** A self-contained follow-up task card — present only for run-type actions. */
+  follow_up_task_card?: string
+  rationale?: string
+  error?: string | null
+}
+
 /** Phase 5 — the run's persisted plan + task graph. */
 export interface ExecutionPlan {
   goal?: string
@@ -234,6 +249,17 @@ export interface RunRecord {
   /** Run control — retry linkage: the run this one was retried from / into. */
   retry_of?: string | null
   retried_by?: string | null
+  /**
+   * Task 06.0 — post-run memory reconciliation outcome (shipped on the wire
+   * since 06.0; typed here in Phase 6). `memory_reconciled` is true/false once
+   * the reconciler ran (null before), `memory_reconciliation` is a short tag
+   * ('applied' / 'skipped_*' / 'error').
+   */
+  memory_reconciled?: boolean | null
+  memory_reconciliation?: string | null
+  memory_reconciliation_error?: string | null
+  /** Phase 6 — Main-Agent recovery assessment for a non-green run (null if green). */
+  recovery_assessment?: RecoveryAssessment | null
 }
 
 /** Task 06.2D — managed preview dev-server status. */

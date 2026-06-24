@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from llm import chat as llm_chat
+import memory_engine
 
 log = logging.getLogger(__name__)
 
@@ -41,11 +42,11 @@ PROJECT_MEMORY_FILES = [
 ]
 
 # Files that may be auto-written by the memory update pipeline.
-# SOUL.md is explicitly excluded — it is read-only.
-WRITABLE_GLOBAL_FILES: set[str] = {"USER.md", "WORKSTYLE.md", "MEMORY.md"}
-WRITABLE_PROJECT_FILES: set[str] = {
-    "PROJECT.md", "STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RESEARCH.md",
-}
+# SOUL.md is explicitly excluded — it is read-only. The authoritative policy
+# sets live in ``memory_engine`` (shared with post-run reconciliation); these
+# aliases keep the orchestrator's parsers reading from a single source of truth.
+WRITABLE_GLOBAL_FILES = memory_engine.WRITABLE_GLOBAL
+WRITABLE_PROJECT_FILES = memory_engine.WRITABLE_PROJECT
 
 
 GENERAL_PROJECT_ID = "__GENERAL__"
@@ -134,7 +135,102 @@ def load_memory(project_id: str, history: list[dict] | None = None) -> MemoryCon
 # Context assembly — builds system prompt + messages for the LLM
 # ---------------------------------------------------------------------------
 
-def _build_system_prompt(ctx: MemoryContext, *, inspection_enabled: bool = False) -> str:
+_MODE_GUIDANCE = {
+    "plan": (
+        "## This turn: PLANNING\n"
+        "The user invoked `@plan`. Take a planning posture: turn the request into "
+        "a concrete, sequenced set of next steps, call out dependencies and risks, "
+        "and recommend what to do first. Do not write code — propose the plan. If a "
+        "step warrants the Coding Agent, describe it so the user can dispatch it."
+    ),
+    "design": (
+        "## This turn: DESIGN\n"
+        "The user invoked `@design`. Focus on product / architecture / UX design: "
+        "explore the shape of the solution, weigh tradeoffs, and recommend a "
+        "structure. Stay at the design level; don't write implementation code."
+    ),
+    "debug": (
+        "## This turn: DEBUG / RECOVERY\n"
+        "The user invoked `@debug`. Help diagnose what went wrong and propose the "
+        "next bounded step (inspect a specific file, a focused repair task, or "
+        "splitting the work). Use the file-inspection channel when you need to see "
+        "actual code. Recommend a concrete fix the user can dispatch — don't claim "
+        "you fixed anything yourself."
+    ),
+    "review": (
+        "## This turn: REVIEW\n"
+        "The user invoked `@review`. Take a code-review / retrospective posture: "
+        "examine what exists, assess quality and risks, and summarize findings with "
+        "concrete recommendations. Use the file-inspection channel to ground your "
+        "review in the real code rather than guessing."
+    ),
+    "inspect": (
+        "## This turn: INSPECT\n"
+        "The user invoked `@inspect`. They want to understand specific code/files. "
+        "Use the bounded file-inspection channel to read what's relevant and answer "
+        "precisely from what you actually read — never invent file contents."
+    ),
+    "memory": (
+        "## This turn: MEMORY\n"
+        "The user invoked `@memory`. They want project knowledge captured. Confirm "
+        "what you understood and how you'd record it; the system persists durable "
+        "memory in a separate step — don't claim you wrote files yourself."
+    ),
+}
+
+
+def _mode_guidance_section(ctx: MemoryContext, mode: Optional[str]) -> str:
+    """Return a small mode-specific guidance block for the system prompt.
+
+    For ``debug``, also fold in a compact summary of the project's latest
+    non-green run (read-only, summary-level only — never repo contents) so the
+    Main Agent can reason about the failure. Best-effort; never raises.
+    """
+    if not mode:
+        return ""
+    block = _MODE_GUIDANCE.get(mode, "")
+    if not block:
+        return ""
+    if mode == "debug":
+        run_ctx = _latest_nongreen_run_context(ctx.project_id)
+        if run_ctx:
+            block += "\n\n### Latest non-green run\n" + run_ctx
+    return "---\n\n# Mode\n\n" + block
+
+
+def _latest_nongreen_run_context(project_id: str) -> str:
+    """Compact summary of the most recent partial/failed/blocked run, or ''.
+
+    Summary-level only (status, title, summary, blockers) — no repo contents,
+    no raw logs. Lazily imports the execution layer and swallows all errors.
+    """
+    if project_id == GENERAL_PROJECT_ID:
+        return ""
+    try:
+        from execution import run_store
+        runs = run_store.list_runs(project_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    nongreen = {"partial", "failed", "blocked"}
+    for rec in runs or []:  # list_runs is newest-first
+        status = str(rec.get("status", "")).lower()
+        if status not in nongreen:
+            continue
+        title = str(rec.get("task_title", "") or "(untitled)")
+        summary = str(rec.get("summary", "") or "").strip()
+        blockers = rec.get("blockers") or []
+        lines = [f"- **{title}** — status `{status}`"]
+        if summary:
+            lines.append(f"  - summary: {summary[:400]}")
+        for b in blockers[:5]:
+            lines.append(f"  - blocker: {str(b)[:200]}")
+        return "\n".join(lines)
+    return ""
+
+
+def _build_system_prompt(
+    ctx: MemoryContext, *, inspection_enabled: bool = False, mode: Optional[str] = None
+) -> str:
     """
     Assemble the system prompt from memory context.
 
@@ -143,7 +239,8 @@ def _build_system_prompt(ctx: MemoryContext, *, inspection_enabled: bool = False
       2. Global memory — user profile, workstyle, cross-project notes
       3. Project memory — all project files
       4. Behavioral rules for memory and honesty
-      5. (optional) File inspection channel — only when ``inspection_enabled``
+      5. (optional) Mode guidance — when an `@`-command set an orchestration mode
+      6. (optional) File inspection channel — only when ``inspection_enabled``
          is True (project has an execution workspace and is not GENERAL)
     """
     sections: list[str] = []
@@ -204,16 +301,28 @@ def _build_system_prompt(ctx: MemoryContext, *, inspection_enabled: bool = False
     sections.append(
         "---\n\n# Agent Behavioral Rules\n\n"
         + memory_rule + "\n\n"
+        "## Delegation\n"
+        "You CAN delegate code/file work to the Coding Agent, which runs inside "
+        "this project's sandboxed `repo/` workspace. There are two explicit paths: "
+        "the user types `@code <task>` (runs immediately), or you propose a plan and "
+        "the user clicks **OK, run this** on it. You never start a run yourself from "
+        "inferred intent — you propose, the user confirms. When a coding task is "
+        "warranted, help shape a crisp task and let that confirmable flow handle it.\n"
+        "- Do not claim a run has started, finished, or changed files unless a run "
+        "actually reported that outcome. Proposing a plan is not the same as running it.\n\n"
         "## Honesty\n"
         "- Never claim you updated a memory file in your chat response. "
         "Memory writes happen in a separate backend step that you do not control from chat.\n"
-        "- Never claim you delegated work to Claude Code or any execution agent. "
-        "No delegation path exists yet. If the user asks for code execution, "
-        "acknowledge that delegation is not yet built and help with planning instead.\n"
-        "- Never pretend an action happened that did not actually happen.\n\n"
+        "- Never pretend an action happened that did not actually happen. "
+        "Distinguish planning from completion.\n\n"
         "## SOUL.md\n"
         "SOUL.md is read-only. It defines your identity. Never suggest modifying it."
     )
+
+    # 5. Mode guidance (from an explicit `@`-command this turn).
+    mode_section = _mode_guidance_section(ctx, mode)
+    if mode_section:
+        sections.append(mode_section)
 
     if inspection_enabled:
         # Imported lazily to avoid pulling execution-layer code into GENERAL
@@ -266,6 +375,7 @@ def orchestrate(
     llm_caller: Optional[Callable] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> tuple[str, list[dict]]:
     """
     Main orchestration entry point.
@@ -290,6 +400,11 @@ def orchestrate(
     response (Task 07.1); ``model`` optionally pins a specific model within
     that provider (Provider Registry 2.0) — when omitted the provider's
     default model is used. Both are ignored when ``llm_caller`` is supplied.
+
+    ``mode`` (Phase 6) is an optional orchestration mode set by an explicit
+    `@`-command (``plan``/``design``/``debug``/``review``/``inspect``/``memory``);
+    it appends a small guidance block to the system prompt and never changes
+    routing or dispatch.
     """
     ctx = load_memory(project_id, history=history)
     inspection_enabled = _inspection_enabled_for(project_id)
@@ -301,7 +416,7 @@ def orchestrate(
     )
 
     if not inspection_enabled:
-        system_prompt = _build_system_prompt(ctx, inspection_enabled=False)
+        system_prompt = _build_system_prompt(ctx, inspection_enabled=False, mode=mode)
         messages = _build_messages(ctx, message)
         text = caller(system=system_prompt, messages=messages)
         return text, []
@@ -315,7 +430,7 @@ def orchestrate(
         parse_inspect_request,
     )
 
-    base_system_prompt = _build_system_prompt(ctx, inspection_enabled=True)
+    base_system_prompt = _build_system_prompt(ctx, inspection_enabled=True, mode=mode)
     messages = _build_messages(ctx, message)
     inspected_files: list[dict] = []
 
@@ -325,7 +440,7 @@ def orchestrate(
         # the model after it has exhausted the inspection budget.
         force_text = step == MAX_INSPECTIONS_PER_TURN
         system_prompt = (
-            _build_system_prompt(ctx, inspection_enabled=False)
+            _build_system_prompt(ctx, inspection_enabled=False, mode=mode)
             if force_text
             else base_system_prompt
         )
@@ -389,44 +504,222 @@ def _inspection_enabled_for(project_id: str) -> bool:
 # Memory judgment — LLM-driven semantic writeback
 # ---------------------------------------------------------------------------
 
-_MEMORY_JUDGE_SYSTEM = """\
-You are the memory maintenance subsystem of Agent OS.
+# Phase 6 — structured memory intake. The judge now returns a single reasoned
+# object ({should_update, reason, updates[]}) instead of a bare array, so the
+# decision carries a justification the UI can surface and is inspectable/testable
+# in the same shape as post-run reconciliation.
 
-Your job: examine the latest conversation turn and the current project memory files, \
-then decide whether any memory files should be updated with new durable project knowledge.
-
-## File purposes
-- PROJECT.md: project definition, vision, scope, target user, tech stack
-- STATUS.md: current phase, latest milestone, what works, what's next
-- TASK_QUEUE.md: actionable task tracking (In Progress / Up Next / Done sections with checkboxes)
-- DECISIONS.md: important project decisions with rationale
-- RESEARCH.md: useful findings, external references, technical notes
-
+_INTAKE_RULES = """\
 ## Rules
-1. Only propose updates when there is genuinely new durable project knowledge — \
-not just conversation chatter.
-2. Write clean, structured markdown that fits the file's existing format. \
-Do NOT dump raw conversation text. Summarize and structure the knowledge.
+1. Only propose updates when there is genuinely new durable knowledge — not just \
+conversation chatter. Most turns need NO update; prefer should_update=false.
+2. Write clean, structured markdown that fits the file's existing format. Do NOT \
+dump raw conversation text. Summarize and structure the knowledge.
 3. SOUL.md is read-only. Never include it in updates.
-4. Use action "append" to add new content to the end of a section. \
-Use action "replace" to overwrite a section with updated content.
-5. For TASK_QUEUE.md, use checkbox format: "- [ ] task" for open, "- [x] task" for done.
-6. Keep updates concise. One clear update per file — don't repeat existing content.
-7. If nothing worth persisting happened in this turn, return an empty array.
-8. The "section" field must match an existing ## heading in the file, or a new heading will be created.
+4. Use action "append" to add content to a section, "replace" to overwrite a \
+section. For TASK_QUEUE.md use checkbox format ("- [ ]" open, "- [x]" done).
+5. Keep each update concise: one clear update per file, no repetition of content \
+already present in the snapshot.
+6. The "section" field should match an existing ## heading in the file (a new \
+heading is created if it doesn't exist).
 
 ## Response format
-Return ONLY a JSON array. No markdown fencing, no explanation. Examples:
+Return ONLY a single JSON object. No markdown fences, no commentary.
 
-No updates needed:
-[]
+Schema:
+{
+  "should_update": true | false,
+  "reason": "one short sentence: what you're recording and why, or why nothing",
+  "updates": [
+    {"filename": "<one of the writable files>", "section": "## heading name",
+     "content": "clean markdown", "action": "append" | "replace"}
+  ]
+}
 
-One update:
-[{"filename": "DECISIONS.md", "section": "Decisions", "content": "- Chose FastAPI over Flask for async support and auto-generated docs", "action": "append"}]
-
-Multiple updates:
-[{"filename": "STATUS.md", "section": "Current Phase", "content": "Implementation", "action": "replace"}, {"filename": "TASK_QUEUE.md", "section": "Up Next", "content": "- [ ] Set up CI/CD pipeline", "action": "append"}]
+When should_update is false, "updates" must be an empty array.
 """
+
+_INTAKE_SYSTEM_PROJECT = (
+    "You are the project-memory intake subsystem of Agent OS.\n\n"
+    "Examine the latest conversation turn and the current project memory, then "
+    "decide whether any project memory file should be updated with new durable "
+    "project knowledge.\n\n"
+    "## Writable files\n"
+    "- PROJECT.md: project definition, vision, scope, target user, tech stack\n"
+    "- STATUS.md: current phase, latest milestone, what works, what's next\n"
+    "- TASK_QUEUE.md: actionable task tracking (In Progress / Up Next / Done)\n"
+    "- DECISIONS.md: important project decisions with rationale\n"
+    "- RESEARCH.md: useful findings, external references, technical notes\n\n"
+    + _INTAKE_RULES
+)
+
+_INTAKE_SYSTEM_GLOBAL = (
+    "You are the global-memory intake subsystem of Agent OS.\n\n"
+    "Examine the latest conversation turn and the current global memory, then "
+    "decide whether any global memory file should be updated with new durable "
+    "knowledge.\n\n"
+    "## Writable files\n"
+    "- USER.md: durable user profile — identity, role, long-term goals\n"
+    "- WORKSTYLE.md: collaboration/communication preferences, working habits\n"
+    "- MEMORY.md: cross-project notes — recurring lessons, reusable knowledge\n\n"
+    + _INTAKE_RULES
+)
+
+
+def _intake_snapshot(ctx: MemoryContext, scope: str) -> list[tuple[str, str]]:
+    if scope == "global":
+        return [
+            ("USER.md", ctx.user),
+            ("WORKSTYLE.md", ctx.workstyle),
+            ("MEMORY.md", ctx.global_memory),
+        ]
+    return [
+        ("PROJECT.md", ctx.project),
+        ("STATUS.md", ctx.status),
+        ("TASK_QUEUE.md", ctx.task_queue),
+        ("DECISIONS.md", ctx.decisions),
+        ("RESEARCH.md", ctx.research),
+    ]
+
+
+def judge_memory_intake(
+    scope: str,
+    ctx: MemoryContext,
+    user_message: str,
+    assistant_response: str,
+    *,
+    intent: Optional[str] = None,
+    llm_caller: Optional[Callable] = None,
+) -> "memory_engine.MemoryDecision":
+    """Structured per-turn memory intake judgment (Phase 6).
+
+    Runs after the assistant response for every meaningful turn, regardless of
+    whether the message was a coding request. Returns a reasoned
+    :class:`memory_engine.MemoryDecision` (policy-filtered to ``scope``'s writable
+    set). ``scope`` is ``"project"`` or ``"global"``. ``intent`` is an optional
+    hint from the intent router. Never raises — on any LLM/parse error it returns
+    a no-op decision so a chat turn never fails on memory writeback.
+    """
+    allow = WRITABLE_GLOBAL_FILES if scope == "global" else WRITABLE_PROJECT_FILES
+    system = _INTAKE_SYSTEM_GLOBAL if scope == "global" else _INTAKE_SYSTEM_PROJECT
+    caller = llm_caller or llm_chat
+
+    snapshot = []
+    for name, content in _intake_snapshot(ctx, scope):
+        snapshot.append(f"### {name}\n{content if content else '(empty)'}")
+
+    intent_line = f"The intent router classified this turn as: {intent}.\n\n" if intent else ""
+    user_prompt = (
+        f"## Current {'Global' if scope == 'global' else 'Project'} Memory\n\n"
+        + "\n\n".join(snapshot)
+        + "\n\n---\n\n"
+        f"{intent_line}## Latest Conversation Turn\n\n"
+        f"**User:** {user_message}\n\n"
+        f"**Assistant:** {assistant_response}\n\n"
+        "---\n\n"
+        "Decide whether to update memory based on this turn. Return ONLY the JSON object."
+    )
+
+    try:
+        raw = caller(
+            system=system,
+            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=1024,
+        )
+    except Exception as exc:  # noqa: BLE001 — memory writeback must never fail a turn
+        log.warning("Memory intake judge LLM call failed: %s", exc)
+        return memory_engine.MemoryDecision(should_update=False, reason="", updates=[])
+
+    return _parse_memory_decision(raw, allow)
+
+
+def _parse_memory_decision(raw: str, allow) -> "memory_engine.MemoryDecision":
+    """Parse the intake judge's JSON object into a policy-filtered decision.
+
+    Tolerant of markdown fences and of the legacy bare-array shape (older prompts
+    / fallbacks may still emit ``[{...}]``).
+    """
+    text = (raw or "").strip()
+    if "```" in text:
+        first = text.find("```")
+        last = text.rfind("```")
+        if first != last:
+            inner = text[first:last]
+            nl = inner.find("\n")
+            text = inner[nl + 1:].strip() if nl != -1 else ""
+
+    if not text:
+        return memory_engine.MemoryDecision(should_update=False, reason="", updates=[])
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        log.warning("Memory intake judge returned invalid JSON: %s", text[:200])
+        return memory_engine.MemoryDecision(should_update=False, reason="", updates=[])
+
+    # Accept both the structured object and a legacy bare array of updates.
+    if isinstance(parsed, list):
+        raw_updates = parsed
+        reason = ""
+        should_update = bool(raw_updates)
+    elif isinstance(parsed, dict):
+        raw_updates = parsed.get("updates", []) or []
+        reason = str(parsed.get("reason", "")).strip()
+        should_update = bool(parsed.get("should_update", False))
+        if not isinstance(raw_updates, list):
+            raw_updates = []
+    else:
+        log.warning("Memory intake judge returned unexpected type: %s", type(parsed))
+        return memory_engine.MemoryDecision(should_update=False, reason="", updates=[])
+
+    updates: list[memory_engine.MemoryUpdateSpec] = []
+    for entry in raw_updates:
+        if not isinstance(entry, dict):
+            continue
+        filename = str(entry.get("filename") or entry.get("file") or "").strip()
+        section = str(entry.get("section") or "").strip()
+        content = str(entry.get("content") or "")
+        action = str(entry.get("action") or "append").strip().lower()
+        if filename not in allow:
+            continue
+        if action not in ("append", "replace"):
+            action = "append"
+        if not section:
+            section = memory_engine.DEFAULT_SECTION.get(filename, "Notes")
+        if not content.strip():
+            continue
+        updates.append(
+            memory_engine.MemoryUpdateSpec(
+                filename=filename, section=section, content=content,
+                action=action, category=str(entry.get("category") or ""),
+            )
+        )
+
+    if not updates:
+        should_update = False
+    return memory_engine.MemoryDecision(should_update=should_update, reason=reason, updates=updates)
+
+
+def apply_memory_decision(
+    decision: "memory_engine.MemoryDecision",
+    scope: str,
+    project_id: Optional[str] = None,
+) -> list[dict]:
+    """Apply a structured ``MemoryDecision`` through the policy-filtered writers.
+
+    Returns the list of updates actually written (each with ``applied=True``).
+    """
+    applied: list[dict] = []
+    for u in decision.updates:
+        if scope == "global":
+            ok = apply_global_memory_update(u.filename, u.section, u.content, u.action)
+        else:
+            ok = apply_memory_update(project_id, u.filename, u.section, u.content, u.action)
+        if ok:
+            applied.append({**u.to_dict(), "applied": True})
+        else:
+            log.warning("Memory update rejected: %s/%s", u.filename, u.section)
+    return applied
 
 
 def judge_memory_updates(
@@ -434,102 +727,16 @@ def judge_memory_updates(
     user_message: str,
     assistant_response: str,
 ) -> list[dict]:
+    """Back-compat wrapper: project-scope intake → bare list of update dicts.
+
+    Used by the ``/extract-updates`` endpoint, which only needs the proposed
+    updates (not the reason).
     """
-    LLM-driven memory judgment step.
-
-    Given the current memory state, the latest user message, and the assistant's
-    response, ask the LLM to decide what (if any) memory updates should be written.
-
-    Returns a list of {filename, section, content, action} dicts.
-    """
-    # Build a concise view of current memory for the judge
-    memory_snapshot = []
-    for name, content in [
-        ("PROJECT.md", ctx.project),
-        ("STATUS.md", ctx.status),
-        ("TASK_QUEUE.md", ctx.task_queue),
-        ("DECISIONS.md", ctx.decisions),
-        ("RESEARCH.md", ctx.research),
-    ]:
-        if content:
-            memory_snapshot.append(f"### {name}\n{content}")
-        else:
-            memory_snapshot.append(f"### {name}\n(empty)")
-
-    user_prompt = (
-        "## Current Project Memory\n\n"
-        + "\n\n".join(memory_snapshot)
-        + "\n\n---\n\n"
-        "## Latest Conversation Turn\n\n"
-        f"**User:** {user_message}\n\n"
-        f"**Assistant:** {assistant_response}\n\n"
-        "---\n\n"
-        "Based on this turn, return a JSON array of memory updates (or [] if none needed)."
-    )
-
-    raw = llm_chat(
-        system=_MEMORY_JUDGE_SYSTEM,
-        messages=[{"role": "user", "content": user_prompt}],
-        max_tokens=1024,
-    )
-
-    return _parse_memory_updates(raw)
-
-
-def _parse_memory_updates(raw: str) -> list[dict]:
-    """
-    Parse the LLM's JSON response into a list of update dicts.
-    Handles common LLM output quirks (markdown fencing, extra text).
-    """
-    text = raw.strip()
-
-    # Strip markdown code fences if present
-    if "```" in text:
-        # Find content between first ``` and last ```
-        first = text.find("```")
-        last = text.rfind("```")
-        if first != last:
-            inner = text[first:last]
-            # Remove the opening ``` line (may include language tag like ```json)
-            first_newline = inner.find("\n")
-            if first_newline != -1:
-                text = inner[first_newline + 1:].strip()
-            else:
-                text = ""
-
-    if not text:
-        return []
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        log.warning("Memory judge returned invalid JSON: %s", text[:200])
-        return []
-
-    if not isinstance(parsed, list):
-        log.warning("Memory judge returned non-list: %s", type(parsed))
-        return []
-
-    # Validate each entry
-    valid: list[dict] = []
-    required_keys = {"filename", "section", "content", "action"}
-    for entry in parsed:
-        if not isinstance(entry, dict):
-            continue
-        if not required_keys.issubset(entry.keys()):
-            continue
-        if entry["action"] not in ("append", "replace"):
-            continue
-        if entry["filename"] not in WRITABLE_PROJECT_FILES:
-            continue
-        valid.append({
-            "filename": entry["filename"],
-            "section": entry["section"],
-            "content": entry["content"],
-            "action": entry["action"],
-        })
-
-    return valid
+    decision = judge_memory_intake("project", ctx, user_message, assistant_response)
+    return [
+        {"filename": u.filename, "section": u.section, "content": u.content, "action": u.action}
+        for u in decision.updates
+    ]
 
 
 def apply_memory_updates(project_id: str, updates: list[dict]) -> list[dict]:
@@ -562,91 +769,23 @@ def apply_memory_update(project_id: str, filename: str, section: str, content: s
       - SOUL.md is never writable (global read-only file).
       - Only files in WRITABLE_PROJECT_FILES are accepted.
 
-    Supports 'append' (add to section) and 'replace' (overwrite section).
-    Returns True if the update was applied.
+    Delegates the actual write to ``memory_engine.apply_update`` (atomic write,
+    OSError-guarded, append-dedup, robust section replace). Returns True if the
+    update was applied.
     """
-    if filename not in WRITABLE_PROJECT_FILES:
-        return False
-
-    filepath = PROJECTS_DIR / project_id / filename
-    if not filepath.parent.exists():
-        return False
-
-    current = ""
-    if filepath.exists():
-        current = filepath.read_text(encoding="utf-8")
-
-    if action == "append":
-        if current and not current.endswith("\n"):
-            current += "\n"
-        current += content + "\n"
-        filepath.write_text(current, encoding="utf-8")
-        return True
-
-    elif action == "replace":
-        lines = current.split("\n")
-        new_lines = []
-        in_section = False
-        replaced = False
-        for line in lines:
-            if line.startswith(f"## {section}"):
-                new_lines.append(line)
-                new_lines.append(content)
-                in_section = True
-                replaced = True
-                continue
-            if in_section and line.startswith("## "):
-                in_section = False
-            if not in_section:
-                new_lines.append(line)
-        if not replaced:
-            new_lines.append(f"\n## {section}")
-            new_lines.append(content)
-        filepath.write_text("\n".join(new_lines), encoding="utf-8")
-        return True
-
-    return False
+    return memory_engine.apply_update(
+        PROJECTS_DIR / project_id,
+        allow=WRITABLE_PROJECT_FILES,
+        filename=filename,
+        section=section,
+        content=content,
+        action=action,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Global memory judgment — LLM-driven semantic writeback for GENERAL chats
+# Global memory judgment — thin wrapper over the unified intake judge
 # ---------------------------------------------------------------------------
-
-_GLOBAL_MEMORY_JUDGE_SYSTEM = """\
-You are the global memory maintenance subsystem of Agent OS.
-
-Your job: examine the latest conversation turn and the current global memory files, \
-then decide whether any global memory files should be updated with new durable knowledge.
-
-## File purposes
-- USER.md: durable user profile — identity, role, long-term goals, stable personal context
-- WORKSTYLE.md: collaboration preferences — response style, communication preferences, working habits
-- MEMORY.md: cross-project notes — recurring lessons, meta-level ongoing context, reusable knowledge
-
-## Rules
-1. Only propose updates when there is genuinely new durable knowledge — \
-not just conversation chatter.
-2. Write clean, structured markdown that fits the file's existing format. \
-Do NOT dump raw conversation text. Summarize and structure the knowledge.
-3. SOUL.md is read-only. Never include it in updates.
-4. Use action "append" to add new content to the end of a section. \
-Use action "replace" to overwrite a section with updated content.
-5. Keep updates concise. One clear update per file — don't repeat existing content.
-6. If nothing worth persisting happened in this turn, return an empty array.
-7. The "section" field must match an existing ## heading in the file, or a new heading will be created.
-
-## Response format
-Return ONLY a JSON array. No markdown fencing, no explanation. Examples:
-
-No updates needed:
-[]
-
-One update:
-[{"filename": "USER.md", "section": "Role", "content": "Senior backend engineer at Acme Corp", "action": "replace"}]
-
-Multiple updates:
-[{"filename": "WORKSTYLE.md", "section": "Response Style", "content": "- Prefers concise answers with code examples", "action": "append"}, {"filename": "MEMORY.md", "section": "Lessons Learned", "content": "- Always check database indexes before optimizing queries", "action": "append"}]
-"""
 
 
 def judge_global_memory_updates(
@@ -654,89 +793,12 @@ def judge_global_memory_updates(
     user_message: str,
     assistant_response: str,
 ) -> list[dict]:
-    """
-    LLM-driven global memory judgment step for GENERAL conversations.
-
-    Returns a list of {filename, section, content, action} dicts for global files only.
-    """
-    memory_snapshot = []
-    for name, content in [
-        ("USER.md", ctx.user),
-        ("WORKSTYLE.md", ctx.workstyle),
-        ("MEMORY.md", ctx.global_memory),
-    ]:
-        if content:
-            memory_snapshot.append(f"### {name}\n{content}")
-        else:
-            memory_snapshot.append(f"### {name}\n(empty)")
-
-    user_prompt = (
-        "## Current Global Memory\n\n"
-        + "\n\n".join(memory_snapshot)
-        + "\n\n---\n\n"
-        "## Latest Conversation Turn\n\n"
-        f"**User:** {user_message}\n\n"
-        f"**Assistant:** {assistant_response}\n\n"
-        "---\n\n"
-        "Based on this turn, return a JSON array of global memory updates (or [] if none needed)."
-    )
-
-    raw = llm_chat(
-        system=_GLOBAL_MEMORY_JUDGE_SYSTEM,
-        messages=[{"role": "user", "content": user_prompt}],
-        max_tokens=1024,
-    )
-
-    return _parse_global_memory_updates(raw)
-
-
-def _parse_global_memory_updates(raw: str) -> list[dict]:
-    """Parse global memory judge response, filtering to writable global files only."""
-    text = raw.strip()
-
-    if "```" in text:
-        first = text.find("```")
-        last = text.rfind("```")
-        if first != last:
-            inner = text[first:last]
-            first_newline = inner.find("\n")
-            if first_newline != -1:
-                text = inner[first_newline + 1:].strip()
-            else:
-                text = ""
-
-    if not text:
-        return []
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        log.warning("Global memory judge returned invalid JSON: %s", text[:200])
-        return []
-
-    if not isinstance(parsed, list):
-        log.warning("Global memory judge returned non-list: %s", type(parsed))
-        return []
-
-    valid: list[dict] = []
-    required_keys = {"filename", "section", "content", "action"}
-    for entry in parsed:
-        if not isinstance(entry, dict):
-            continue
-        if not required_keys.issubset(entry.keys()):
-            continue
-        if entry["action"] not in ("append", "replace"):
-            continue
-        if entry["filename"] not in WRITABLE_GLOBAL_FILES:
-            continue
-        valid.append({
-            "filename": entry["filename"],
-            "section": entry["section"],
-            "content": entry["content"],
-            "action": entry["action"],
-        })
-
-    return valid
+    """Back-compat wrapper: global-scope intake → bare list of update dicts."""
+    decision = judge_memory_intake("global", ctx, user_message, assistant_response)
+    return [
+        {"filename": u.filename, "section": u.section, "content": u.content, "action": u.action}
+        for u in decision.updates
+    ]
 
 
 def apply_global_memory_updates(updates: list[dict]) -> list[dict]:
@@ -761,42 +823,13 @@ def apply_global_memory_update(filename: str, section: str, content: str, action
     Apply a single memory update to a global memory file.
 
     Policy: only WRITABLE_GLOBAL_FILES are accepted. SOUL.md is never writable.
+    Delegates the write to ``memory_engine.apply_update``.
     """
-    if filename not in WRITABLE_GLOBAL_FILES:
-        return False
-
-    filepath = MEMORY_DIR / filename
-    current = ""
-    if filepath.exists():
-        current = filepath.read_text(encoding="utf-8")
-
-    if action == "append":
-        if current and not current.endswith("\n"):
-            current += "\n"
-        current += content + "\n"
-        filepath.write_text(current, encoding="utf-8")
-        return True
-
-    elif action == "replace":
-        lines = current.split("\n")
-        new_lines = []
-        in_section = False
-        replaced = False
-        for line in lines:
-            if line.startswith(f"## {section}"):
-                new_lines.append(line)
-                new_lines.append(content)
-                in_section = True
-                replaced = True
-                continue
-            if in_section and line.startswith("## "):
-                in_section = False
-            if not in_section:
-                new_lines.append(line)
-        if not replaced:
-            new_lines.append(f"\n## {section}")
-            new_lines.append(content)
-        filepath.write_text("\n".join(new_lines), encoding="utf-8")
-        return True
-
-    return False
+    return memory_engine.apply_update(
+        MEMORY_DIR,
+        allow=WRITABLE_GLOBAL_FILES,
+        filename=filename,
+        section=section,
+        content=content,
+        action=action,
+    )

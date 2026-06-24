@@ -27,6 +27,8 @@ from .background import (
 from .chat_delegation import (
     is_code_delegation,
     handle_code_delegation,
+    parse_mode_command,
+    MODE_COMMANDS,
     GENERAL_REJECTION_MESSAGE,
 )
 from .delegation_intent import (
@@ -115,6 +117,8 @@ __all__ = [
     "shutdown_default_manager",
     "is_code_delegation",
     "handle_code_delegation",
+    "parse_mode_command",
+    "MODE_COMMANDS",
     "GENERAL_REJECTION_MESSAGE",
     "looks_like_code_request",
     "derive_task_card",

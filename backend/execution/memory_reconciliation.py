@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from llm import chat as llm_chat
+import memory_engine
 
 from . import run_store
 from .models import RunRecord, ResultSummary, RunStatus
@@ -58,13 +59,8 @@ _PROJECTS_DIR = Path(__file__).resolve().parent.parent.parent / "projects"
 
 # Reconciliation may only write to these four files. Notice ``PROJECT.md`` is
 # intentionally excluded — project definition shouldn't be rewritten by a
-# Coding Agent run summary.
-RECONCILIATION_WRITABLE_FILES: set[str] = {
-    "STATUS.md",
-    "TASK_QUEUE.md",
-    "DECISIONS.md",
-    "RESEARCH.md",
-}
+# Coding Agent run summary. The authoritative set lives in ``memory_engine``.
+RECONCILIATION_WRITABLE_FILES = memory_engine.RECONCILIATION_WRITABLE
 
 # Statuses worth reconciling memory from. RunStatus.CANCELLED is deliberately
 # EXCLUDED: a user-aborted run has no settled outcome, so it never updates
@@ -422,12 +418,7 @@ def _parse_decision(raw: str) -> Optional[ReconciliationDecision]:
 
 
 def _default_section_for(filename: str) -> str:
-    return {
-        "STATUS.md": "What Works",
-        "TASK_QUEUE.md": "Done",
-        "DECISIONS.md": "Decisions",
-        "RESEARCH.md": "Findings",
-    }.get(filename, "Notes")
+    return memory_engine.DEFAULT_SECTION.get(filename, "Notes")
 
 
 # ---------- judge entry point ----------
@@ -480,68 +471,18 @@ def judge_run_memory_reconciliation(
 def _apply_update(project_id: str, update: ReconciliationUpdate) -> bool:
     """Apply one update against the on-disk project memory file.
 
-    Behaves the same as ``orchestrator.apply_memory_update`` but enforces the
-    tighter ``RECONCILIATION_WRITABLE_FILES`` allow-list. Re-implemented here
-    to avoid a circular import.
+    Thin shim over ``memory_engine.apply_update`` with the tighter
+    ``RECONCILIATION_WRITABLE_FILES`` allow-list (atomic write, OSError-guarded,
+    append-dedup, robust section replace — all live in ``memory_engine`` now).
     """
-    if update.filename not in RECONCILIATION_WRITABLE_FILES:
-        return False
-    project_path = _PROJECTS_DIR / project_id
-    if not project_path.exists():
-        return False
-    filepath = project_path / update.filename
-    current = ""
-    if filepath.exists():
-        try:
-            current = filepath.read_text(encoding="utf-8")
-        except OSError as exc:
-            log.warning("Reconciliation: could not read %s: %s", filepath, exc)
-            return False
-
-    content = update.content
-    if update.action == "append":
-        if current and not current.endswith("\n"):
-            current += "\n"
-        # Cheap dedup: if the exact content body is already present, skip the
-        # write to avoid duplicate noisy entries when a run is reconciled twice
-        # in pathological cases.
-        if content.strip() and content.strip() in current:
-            return False
-        current += content + ("\n" if not content.endswith("\n") else "")
-        try:
-            filepath.write_text(current, encoding="utf-8")
-        except OSError as exc:
-            log.warning("Reconciliation: could not write %s: %s", filepath, exc)
-            return False
-        return True
-
-    if update.action == "replace":
-        lines = current.split("\n")
-        new_lines: list[str] = []
-        in_section = False
-        replaced = False
-        for line in lines:
-            if line.startswith(f"## {update.section}"):
-                new_lines.append(line)
-                new_lines.append(content)
-                in_section = True
-                replaced = True
-                continue
-            if in_section and line.startswith("## "):
-                in_section = False
-            if not in_section:
-                new_lines.append(line)
-        if not replaced:
-            new_lines.append(f"\n## {update.section}")
-            new_lines.append(content)
-        try:
-            filepath.write_text("\n".join(new_lines), encoding="utf-8")
-        except OSError as exc:
-            log.warning("Reconciliation: could not write %s: %s", filepath, exc)
-            return False
-        return True
-
-    return False
+    return memory_engine.apply_update(
+        _PROJECTS_DIR / project_id,
+        allow=RECONCILIATION_WRITABLE_FILES,
+        filename=update.filename,
+        section=update.section,
+        content=update.content,
+        action=update.action,
+    )
 
 
 # ---------- public pipeline ----------

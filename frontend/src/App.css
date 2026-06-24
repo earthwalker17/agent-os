@@ -2055,6 +2055,91 @@ html, body, #root {
   color: var(--text-muted);
 }
 
+/* Phase 6 — memory reconciliation line + recovery "next steps" + chat badges */
+.run-chat-memory {
+  margin-top: 4px;
+}
+
+.run-chat-recovery {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: rgba(245, 200, 120, 0.06);
+  border-color: #6b5a2a;
+}
+
+.run-chat-recovery.recovery-exhausted {
+  background: rgba(245, 130, 130, 0.06);
+  border-color: #6b3a3a;
+}
+
+.run-chat-recovery-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.run-chat-recovery-action {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 5px;
+}
+
+.run-chat-recovery-diagnosis {
+  font-size: 13px;
+  margin: 0;
+}
+
+.run-chat-recovery-btn {
+  align-self: flex-start;
+  padding: 5px 12px;
+  font-size: 12px;
+  border-radius: 5px;
+  border: 1px solid #6b5a2a;
+  background: rgba(245, 200, 120, 0.12);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.run-chat-recovery-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.chat-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.chat-intent-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+}
+
+.chat-memory-chip {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-elev);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+
 .run-chat-verify-result {
   display: flex;
   flex-direction: column;

@@ -132,6 +132,15 @@ and execute project work.
   files are out of scope. Read-only inspection runs and noisy failures
   skip the LLM call. Each run reconciles at most once.
   Reconciliation failure NEVER fails the run.
+- **Phase 6 — mode commands + confirmable recovery.** Besides `@code`, the
+  main agent understands deterministic mode `@`-commands (`@plan`, `@design`,
+  `@debug`, `@review`, `@inspect`, `@memory`) that only **shape the chat
+  response** — they never dispatch a run. When a run ends non-green (partial /
+  failed / blocked, or a failed verification / visual review), a best-effort
+  `recovery.assess_run` proposes one bounded next step; a `needs_recovery`
+  assessment becomes a **confirmable pending plan** (the user still clicks
+  "OK, run this"). Recovery NEVER auto-dispatches — explicit dispatch stays the
+  only path to a run.
 
 ## 6. Context Hygiene
 

@@ -44,6 +44,7 @@ from .models import (
     VerificationResult,
 )
 from .memory_reconciliation import reconcile_run_memory
+from .recovery import assess_run
 from .planner import (
     MAX_TASKS,
     PlanParseError,
@@ -1358,6 +1359,16 @@ class CodingAgentRunner:
             # `reconcile_run_memory` already swallows its own exceptions; this
             # extra guard exists only to absolutely guarantee the runner never
             # leaks a reconciliation failure to its callers.
+            pass
+
+        # Phase 6 — Main-Agent recovery assessment for a non-green run. Runs
+        # after reconciliation so memory reflects the outcome first. Best-effort
+        # and diagnostic-only: it persists a `recovery_assessment` onto run.json
+        # for the UI / Main Agent but NEVER dispatches a follow-up run and NEVER
+        # fails finalization. Green runs are skipped inside `assess_run`.
+        try:
+            assess_run(self.project_id, run_id)
+        except Exception:  # noqa: BLE001
             pass
 
         return ResultSummary(

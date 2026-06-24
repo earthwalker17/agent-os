@@ -586,6 +586,21 @@ function App() {
     }
   }, [activeProject, activeConversation, isGeneralActive, hydratePendingForMessages])
 
+  // Re-fetch + re-hydrate the active conversation's messages. Used after an
+  // action (e.g. proposing a recovery plan) appends a new assistant bubble.
+  const reloadMessages = useCallback(async () => {
+    if (!activeConversation) return
+    try {
+      const res = await fetch(`/api/conversations/${activeConversation}/messages`)
+      const msgs: Message[] = await res.json()
+      const projectIdForFetch = isGeneralActive ? null : activeProject
+      const hydrated = await hydratePendingForMessages(msgs, projectIdForFetch)
+      setMessages(hydrated)
+    } catch (err) {
+      console.error('Reload messages error:', err)
+    }
+  }, [activeConversation, activeProject, isGeneralActive, hydratePendingForMessages])
+
   const handleRevisePending = useCallback((pending: PendingExecution) => {
     setRevisingPendingId(pending.pending_execution_id)
     setRevisingPendingTitle(pending.title || 'Pending plan')
@@ -672,6 +687,7 @@ function App() {
         revisingPendingTitle={revisingPendingTitle}
         onCancelRevise={handleCancelRevise}
         onRunsChanged={() => setRunsRefreshKey(k => k + 1)}
+        onMessagesChanged={reloadMessages}
         providers={providersList}
         selectedProvider={selectedProvider}
         onSelectProvider={handleSelectProvider}

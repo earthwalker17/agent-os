@@ -182,6 +182,50 @@ tail are unchanged.
 
 ---
 
+## Phase 6 — Main Agent Orchestration & Memory v2
+
+Rebalanced the system back toward the **Main Agent** (the execution layer had
+outgrown it). Additive — every constitutional invariant is unchanged: SOUL.md
+read-only, explicit-dispatch-only, no repo auto-injection, best-effort post-run
+steps. Recovery is **confirmable-only** (no auto-dispatch).
+
+- **Memory Engine v2.** New leaf module `memory_engine.py` (stdlib-only) owns the
+  single markdown write path: a policy-filtered, **atomic** (temp + `os.replace`),
+  OSError-guarded, append-deduped `apply_update(base_dir, allow=…)`, shared
+  canonical section names + default-section map, and the structured
+  `MemoryDecision`. `orchestrator.apply_memory_update` / `apply_global_memory_update`
+  and `memory_reconciliation._apply_update` now all delegate to it (killed the
+  duplicated, non-atomic writers). `ensure_memory_scaffold()` idempotently
+  backfills missing project-memory files/sections (at project-create + a one-time
+  startup migration; never from `load_memory`).
+- **Memory Intake v2.** The two bare-array chat-turn judges collapsed into one
+  structured `judge_memory_intake(scope, …) -> MemoryDecision` (should_update +
+  reason + updates) that runs every meaningful turn; the **reason** is surfaced to
+  the UI. Fixed an active bug: the main-agent system prompt no longer claims
+  "no delegation path exists yet" (it shipped phases ago).
+- **Intent Router v2.** The delegation judge now also emits a richer `intent`
+  label (planning / design / build / debug / inspect / memory / docs /
+  retrospective / research / discussion) — informational, routing still keys off
+  the 3 dispatch decisions. New deterministic mode commands `@plan` / `@design` /
+  `@debug` / `@review` / `@inspect` / `@memory` shape the response via
+  `orchestrate(mode=…)` (e.g. `@debug` folds in the latest non-green run summary;
+  `@inspect`/`@review` nudge the bounded inspection channel). **None dispatch** —
+  only `@code` / confirm do.
+- **Confirmable recovery.** New `execution/recovery.py` `assess_run()` (best-effort,
+  never raises, mirrors reconciliation skip rules) interprets a non-green terminal
+  run — `partial`/`failed`/`blocked`, plus the signals a `completed` status hides
+  (failed command/browser verification, failed visual review) — and recommends
+  one bounded next step (`inspect`/`repair`/`split`/`reverify`/`report`). Persisted
+  to `RunRecord.recovery_assessment`; triggered in `runner._finalize` after
+  reconciliation. A `needs_recovery` assessment becomes a **confirmable pending
+  card** via `POST …/runs/{id}/propose-recovery` (reuses the existing pending-plan
+  dispatch — the user still clicks **OK, run this**).
+- **UI.** Run cards show a memory-reconciliation line + a "Next steps" recovery
+  block with a **Run suggested fix** button; chat turns carry an intent badge +
+  a "🧠 Memory updated — <reason>" chip (both persisted on the message so they
+  survive reload). `types.ts` gained the 3 already-shipped reconciliation fields +
+  `recovery_assessment`.
+
 ## Current Constraints
 
 - **Explicit dispatch only.** `@code <task>` runs immediately; inferred coding
@@ -233,7 +277,11 @@ needed), and are each runnable standalone (`python tests/<file>.py`).
 | `test_autonomy_hardening.py`      |    11 | dependency skip, productive continuation, iterative repair |
 | `test_live_metrics.py`            |     5 | progressive run-level + per-task metrics                 |
 | `test_visual_judge.py`            |    16 | gate/skip rules, JSON parse, never-raises, image cap; selected-model resolution + fallback/skip |
-| **Total**                         | **346** |                                                        |
+| `test_memory_engine.py`           |    13 | Phase 6 apply_update policy/atomic/dedup/replace; scaffold; orchestrator write-path |
+| `test_memory_intake.py`           |    10 | Phase 6 structured intake judge: parse, policy filter, reason, no-op, apply |
+| `test_intent_router.py`           |    14 | Phase 6 mode `@`-command parser, `intent` field, mode→prompt shaping |
+| `test_recovery.py`                |     8 | Phase 6 assess_run: non-green/green/cancelled/idempotent/visual-failed, never-raises |
+| **Total**                         | **391** |                                                        |
 
 Frontend: `npm run build` (tsc + vite) green.
 

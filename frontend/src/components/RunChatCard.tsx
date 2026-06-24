@@ -4,12 +4,16 @@ import type { RunRecord } from '../types'
 interface Props {
   projectId: string
   runId: string
+  /** Conversation to attach a proposed recovery plan to (Phase 6). */
+  conversationId?: string | null
   /** Open the detailed RunDetailModal for this run. */
   onOpenRun: (runId: string) => void
   /** Open the lightweight Live Trace modal for this run. */
   onOpenTrace?: (runId: string) => void
   /** Notify the parent that run state changed so the Runs panel can refresh. */
   onRunsChanged?: () => void
+  /** Re-fetch chat messages after a recovery plan is proposed (Phase 6). */
+  onMessagesChanged?: () => void
   /**
    * Provider Registry 2.0 — the user's selected chat provider/model, forwarded
    * to browser verification so the diagnostic AI visual judgment prefers a
@@ -62,7 +66,7 @@ function fileSummary(files: string[] | undefined): string {
  * user needing to open the RunDetailModal. The modal remains available via the
  * "Details" link for exact logs and artifacts.
  */
-function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, provider, model }: Props) {
+function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace, onRunsChanged, onMessagesChanged, provider, model }: Props) {
   const [record, setRecord] = useState<RunRecord | null>(null)
   const [verifying, setVerifying] = useState(false)
   const [verifyError, setVerifyError] = useState<string | null>(null)
@@ -72,6 +76,13 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, 
   const [controlBusy, setControlBusy] = useState(false)
   const [controlError, setControlError] = useState<string | null>(null)
   const [retriedRunId, setRetriedRunId] = useState<string | null>(null)
+  // Phase 6 — bounded post-terminal "settle" polling: memory reconciliation +
+  // the recovery assessment are written ~2-4s AFTER the run goes terminal, so we
+  // keep polling briefly until they land instead of freezing on a stale view.
+  const [settleTicks, setSettleTicks] = useState(0)
+  // Phase 6 — confirmable recovery handoff.
+  const [recoveryBusy, setRecoveryBusy] = useState(false)
+  const [recoveryProposed, setRecoveryProposed] = useState(false)
   const mounted = useRef(true)
 
   useEffect(() => {
@@ -104,12 +115,24 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, 
   const commandVerifyingState =
     record?.verification_state === 'verifying' || record?.verification_state === 'repairing'
   const isVerifyingState = record?.browser_verification_state === 'running'
-  const shouldPoll = isRunning || commandVerifyingState || isVerifyingState || verifying
+  // A run that just went terminal whose post-run reconciliation hasn't landed
+  // yet (cancelled runs skip reconciliation, so never settle-poll them). Capped
+  // so an old pre-reconciliation run can't poll forever.
+  const isTerminalNow = record ? TERMINAL.has(record.status) : false
+  const needsSettle =
+    isTerminalNow &&
+    record?.status !== 'cancelled' &&
+    record?.memory_reconciliation == null &&
+    settleTicks < 15
+  const shouldPoll = isRunning || commandVerifyingState || isVerifyingState || verifying || needsSettle
   useEffect(() => {
     if (!shouldPoll) return
-    const id = window.setInterval(load, POLL_INTERVAL_MS)
+    const id = window.setInterval(() => {
+      load()
+      setSettleTicks((t) => (isRunning ? 0 : t + 1))
+    }, POLL_INTERVAL_MS)
     return () => window.clearInterval(id)
-  }, [shouldPoll, load])
+  }, [shouldPoll, load, isRunning])
 
   const runBrowserVerification = useCallback(async () => {
     setVerifying(true)
@@ -207,6 +230,44 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, 
     }
   }, [projectId, runId, onRunsChanged])
 
+  // Phase 6 — turn the Main Agent's recovery assessment into a confirmable
+  // pending plan in the conversation (the user still clicks "OK, run this" to
+  // dispatch — no auto-run).
+  const proposeRecovery = useCallback(async () => {
+    if (!conversationId) return
+    setRecoveryBusy(true)
+    setControlError(null)
+    try {
+      const res = await fetch(
+        `/api/projects/${projectId}/execution/runs/${runId}/propose-recovery`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ conversation_id: conversationId }),
+        },
+      )
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`
+        try {
+          const b = await res.json()
+          if (b?.detail) detail = b.detail
+        } catch {
+          /* keep status */
+        }
+        throw new Error(detail)
+      }
+      if (mounted.current) setRecoveryProposed(true)
+      onMessagesChanged?.()
+    } catch (err) {
+      console.error('Propose recovery failed:', err)
+      if (mounted.current) {
+        setControlError(err instanceof Error ? err.message : 'Could not propose a fix')
+      }
+    } finally {
+      if (mounted.current) setRecoveryBusy(false)
+    }
+  }, [projectId, runId, conversationId, onMessagesChanged])
+
   if (!record) return null
 
   const status = record.status
@@ -242,6 +303,11 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, 
         ? [{ path: bv.screenshot_path, label: 'Home', readiness: bv.readiness ?? undefined }]
         : []
   const vr = record.visual_review
+  // Phase 6 — memory reconciliation + recovery assessment surfaces.
+  const memTag = record.memory_reconciliation
+  const ra = record.recovery_assessment
+  const recoveryActionable =
+    !!ra && ra.assessed && ra.verdict === 'needs_recovery' && !!ra.follow_up_task_card
 
   // Thumbnail gallery — distinct from the "captured" vs "judged" signals below.
   const gallery =
@@ -355,6 +421,16 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, 
           {canVerify && !verifyingNow && !hadVerifyAttempt && (
             <p className="run-chat-muted">Browser verification has not been run yet.</p>
           )}
+          {/* Phase 6 — Main Agent memory reconciliation outcome. */}
+          {memTag && (
+            <p className="run-chat-muted run-chat-memory">
+              {record.memory_reconciled
+                ? '🧠 Project memory updated to reflect this run.'
+                : memTag === 'error'
+                  ? '🧠 Memory reconciliation hit an error (run is unaffected).'
+                  : '🧠 Memory left unchanged (nothing new to record).'}
+            </p>
+          )}
         </div>
       )}
 
@@ -445,6 +521,40 @@ function RunChatCard({ projectId, runId, onOpenRun, onOpenTrace, onRunsChanged, 
             <pre className="run-chat-verify-output">{bv.output_preview}</pre>
           )}
           {gallery}
+        </div>
+      )}
+
+      {/* --- Phase 6: Main-Agent recovery assessment (next steps) --- */}
+      {ra && ra.assessed && (ra.diagnosis || ra.verdict !== 'ok') && (
+        <div className={`run-chat-recovery recovery-${ra.verdict}`}>
+          <div className="run-chat-recovery-head">
+            <span className="run-chat-recovery-icon">🛠️</span>
+            <strong>Next steps</strong>
+            <span className="run-chat-recovery-action">{ra.recommended_action}</span>
+          </div>
+          {ra.diagnosis && <p className="run-chat-recovery-diagnosis">{ra.diagnosis}</p>}
+          {ra.rationale && <p className="run-chat-muted">{ra.rationale}</p>}
+          {recoveryActionable && !recoveryProposed && (
+            <button
+              type="button"
+              className="run-chat-recovery-btn"
+              onClick={proposeRecovery}
+              disabled={recoveryBusy || !conversationId}
+              title="Draft a confirmable recovery plan you can run with one click"
+            >
+              {recoveryBusy ? 'Preparing…' : 'Run suggested fix'}
+            </button>
+          )}
+          {recoveryProposed && (
+            <p className="run-chat-muted">
+              A recovery plan was added below — confirm it to run the fix.
+            </p>
+          )}
+          {!recoveryActionable && ra.verdict === 'exhausted' && (
+            <p className="run-chat-muted">
+              Automatic recovery looks exhausted — this one likely needs a manual look.
+            </p>
+          )}
         </div>
       )}
 
