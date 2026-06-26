@@ -6,9 +6,11 @@ Layout under `execution_workspaces/{project_id}/runs/{run_id}/`:
     events.jsonl   — append-only event log (one JSON object per line)
     run.json       — structured RunRecord serialization
     result.md      — human-readable result summary
+    plan.json      — Phase 5 execution plan / task graph
+    diff.patch     — Phase 7 post-run diff (redacted, read on demand)
 
-This module only knows about reading/writing those four files. The runner
-owns the loop logic; the API endpoints query through this store.
+This module only knows about reading/writing those files. The runner owns the
+loop logic; the API endpoints query through this store.
 """
 
 from __future__ import annotations
@@ -170,6 +172,27 @@ def write_result_md(project_id: str, run_id: str, content: str) -> None:
 
 def read_result_md(project_id: str, run_id: str) -> str | None:
     path = get_run_dir(project_id, run_id) / "result.md"
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+# Phase 7 — the post-run diff is stored as a standalone artifact (read on
+# demand via the bounded ``/diff`` endpoint), never inlined into run.json /
+# result.md / the main-agent context (§6 context hygiene). The text is already
+# redacted + bounded by ``git_ops.capture_diff`` before it reaches here.
+_DIFF_PATCH_MAX_CHARS = 200_000
+
+
+def write_diff_patch(project_id: str, run_id: str, content: str) -> None:
+    text = content or ""
+    if len(text) > _DIFF_PATCH_MAX_CHARS:
+        text = text[:_DIFF_PATCH_MAX_CHARS] + "\n... [diff.patch truncated] ...\n"
+    _atomic_write_text(get_run_dir(project_id, run_id) / "diff.patch", text)
+
+
+def read_diff_patch(project_id: str, run_id: str) -> str | None:
+    path = get_run_dir(project_id, run_id) / "diff.patch"
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
@@ -363,8 +386,47 @@ def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
         f"{render_browser_verification_section(record.browser_verification)}\n"
         f"{_visual_review_block(record.visual_review)}"
         f"{_render_plan_section(record.plan)}"
+        f"{_git_section(record)}"
         f"## Notes for Main Agent\n{notes.strip() or '_(none)_'}\n"
     )
+
+
+def _git_section(record: RunRecord) -> str:
+    """Render the Phase 7 Project Ops (Git/GitHub) section for result.md.
+
+    Returns ``""`` when the run has no Git activity, so result.md for non-git
+    runs stays byte-identical to the legacy output (same discipline as
+    ``_render_plan_section`` / ``_visual_review_block``). Metadata only — never
+    the raw diff, never a secret.
+    """
+    if not any(
+        (
+            record.pre_run_checkpoint,
+            record.commit_sha,
+            record.diff_stat,
+            record.pr_url,
+            record.pushed,
+        )
+    ):
+        return ""
+    lines: list[str] = ["## Project Ops"]
+    if record.branch:
+        lines.append(f"- branch: `{record.branch}`")
+    if record.base_commit:
+        lines.append(f"- pre-run base: `{record.base_commit[:12]}`")
+    if record.pre_run_checkpoint:
+        tag = f" (tag `{record.checkpoint_tag}`)" if record.checkpoint_tag else ""
+        lines.append(f"- checkpoint: `{record.pre_run_checkpoint[:12]}`{tag}")
+    if record.diff_stat:
+        lines.append(f"- diff: {record.diff_stat}")
+    if record.commit_sha:
+        lines.append(f"- commit: `{record.commit_sha[:12]}`")
+    if record.pushed:
+        lines.append("- pushed: yes")
+    if record.pr_url:
+        num = f" (#{record.pr_number})" if record.pr_number else ""
+        lines.append(f"- pull request{num}: {record.pr_url}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _visual_review_block(visual_review) -> str:

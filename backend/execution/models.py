@@ -419,6 +419,33 @@ class RunRecord(BaseModel):
     # an assessment failure never fails the run. Populated by
     # ``execution.recovery.assess_run`` from ``runner._finalize``.
     recovery_assessment: Optional[RecoveryAssessment] = None
+    # Phase 7 — Project Ops (Git/GitHub) linkage. All default ``None``/``False``
+    # so old run.json records round-trip unchanged (mirrors the ``retry_of`` /
+    # ``recovery_of`` convention). Scalar refs only — the full diff text lives in
+    # the per-run ``diff.patch`` artifact, never on the record (§6 context
+    # hygiene). Secrets never appear here.
+    #   - ``pre_run_checkpoint``: out-of-branch checkpoint commit sha captured at
+    #     dispatch (rollback restores via ``base_commit`` + this snapshot).
+    #   - ``checkpoint_tag`` / ``base_commit``: the checkpoint tag name and the
+    #     branch HEAD at checkpoint time (the rollback reset target).
+    #   - ``head_commit``: branch HEAD observed at finalize (diff anchor).
+    #   - ``branch`` / ``commit_sha``: the user-confirmed commit's branch + sha.
+    #   - ``pushed`` / ``pr_url`` / ``pr_number``: GitHub delivery state.
+    #   - ``diff_stat``: a compact one-line diff summary (no raw diff).
+    #   - ``git_state``: transient sub-status while a Git action runs
+    #     ("checkpointing"/"committing"/"pushing"/"opening_pr"); ``None`` at rest.
+    #     Mirrors ``verification_state``; NOT a ``RunStatus`` value.
+    pre_run_checkpoint: Optional[str] = None
+    checkpoint_tag: Optional[str] = None
+    base_commit: Optional[str] = None
+    head_commit: Optional[str] = None
+    branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+    pushed: bool = False
+    pr_url: Optional[str] = None
+    pr_number: Optional[int] = None
+    diff_stat: Optional[str] = None
+    git_state: Optional[str] = None
 
 
 class ResultSummary(BaseModel):
@@ -435,3 +462,9 @@ class ResultSummary(BaseModel):
     browser_verification: Optional[BrowserVerificationResult] = None
     visual_review: Optional[VisualReviewResult] = None
     plan: Optional[ExecutionPlan] = None
+    # Phase 7 — compact Git delivery metadata for the main agent (§6: metadata
+    # only, never the raw diff). ``None`` for runs without Git activity.
+    commit_sha: Optional[str] = None
+    branch: Optional[str] = None
+    pr_url: Optional[str] = None
+    diff_stat: Optional[str] = None

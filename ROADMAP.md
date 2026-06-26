@@ -258,6 +258,60 @@ A polish pass over Phase 6 — additive, suite-green throughout.
   explicitly-confirmed task authorizes that many bounded auto-dispatches — inferred
   intent still never runs code.
 
+## Phase 7 — Project Ops & GitHub Lifecycle
+
+Turned Agent OS from a build/verify system into a **project-lifecycle** system:
+a finished run becomes a traceable, user-approved Git/GitHub delivery —
+`generated files → verified run → safe checkpoint → reviewed diff → commit →
+branch/push → PR`, every external/destructive step behind an explicit approval
+gate. Additive; every constitutional invariant preserved. (BLUEPRINT Pillar 1.)
+
+- **One Git executor + typed sandbox surface.** New `ToolRuntime.run_git`
+  (`shell=False` argv) routed through `ProjectSandbox.validate_git` (subcommand
+  allow-list + destructive gating behind `allow_destructive`). The Coding Agent's
+  free-form `run_shell` is *strengthened* — the destructive-Git guards CLAUDE.md
+  §3 always claimed (`git reset --hard`, force-push, `clean`, …) now exist — and
+  `run_git` is **not** an agent tool (only `git_ops`/`github_connector` call it).
+- **`git_ops`** — sandboxed local ops: idempotent `ensure_repo` (lazy `git init` +
+  safe `.gitignore` + identity), an **out-of-branch tagged checkpoint** (via
+  `write-tree`/`commit-tree` on a throwaway index, so the working branch is never
+  polluted and a dirty tree is captured intact), redacted+bounded `capture_diff`
+  (includes new files), secret-refusing `commit`, and a clean-/dirty-tree-safe
+  `rollback`.
+- **Checkpoint + diff in the run lifecycle.** `background.dispatch` captures a
+  pre-run checkpoint (recovery children inherit the parent's anchor);
+  `runner._finalize` captures the post-run diff to a `diff.patch` artifact — both
+  best-effort, **never auto-commit/push**, never fail finalization. `RunRecord`
+  gains scalar linkage fields (`pre_run_checkpoint`/`base_commit`/`commit_sha`/
+  `branch`/`pushed`/`pr_url`/… + transient `git_state`).
+- **Credentials foundation.** `credentials.py` — the single secret reader: global
+  env (`GITHUB_TOKEN`) + per-project gitignored store (project overrides global),
+  `status` presence-only, `redact()` for egress. The token reaches git only via a
+  generated `GIT_ASKPASS` env at push time (tokenless remote) — never argv,
+  `.git/config`, commits, logs, events, memory, prompts, or UI.
+- **GitHub connector** (`github_connector.py`) — REST over `urllib` (no `gh` CLI,
+  no new deps): token validation (`GET /user`), tokenless `ensure_remote`,
+  `push_branch`, `create_pull_request`. All output redacted.
+- **Explicit two-phase action endpoints.** `…/git/commit|git/push|github/pr|
+  git/rollback` each return an **External Action Contract** on `confirm:false` and
+  execute only on `confirm:true`; `…/runs/{id}/diff` + `…/git/status` +
+  `…/credentials/github` + `…/github/connector` round out the surface. No
+  inferred-intent Git path; no Git auto-dispatch.
+- **Frontend.** A reusable `GitOpsPanel` (run chat card + detail modal) drives the
+  contracts (review-diff / commit / push / PR / rollback with confirm gates);
+  `ConnectorModal` (Runs panel) enters the token; a project-level git/connector
+  strip shows branch/dirty/connection. `ConfirmDialog` gained a `confirmLabel`.
+- **Brain awareness.** `orchestrator._latest_git_state_context` folds a compact
+  branch/commit/PR/diff-stat summary into `@review`/`@debug` — never the raw diff.
+- **Validated end-to-end (live).** A brand-new project ran the full lifecycle on a
+  real Coding Agent build + real git + real GitHub: task → build → pytest verify →
+  checkpoint → diff review → commit → branch → push (`main` + feature) → **PR #1** →
+  full run↔PR traceability → rollback to the checkpoint. The E2E caught one real
+  bug — `validate_git` rejected newlines, breaking multi-line (LLM-generated) commit
+  messages; now only NUL is rejected (`shell=False` makes newlines safe), with
+  regression tests. Secret-leak audit clean: no token in events/run.json/result.md
+  and a tokenless `.git/config` remote.
+
 ## Current Constraints
 
 - **Explicit dispatch only.** `@code <task>` runs immediately; inferred coding
@@ -315,7 +369,15 @@ needed), and are each runnable standalone (`python tests/<file>.py`).
 | `test_recovery.py`                |     8 | Phase 6 assess_run: non-green/green/cancelled/idempotent/visual-failed, never-raises |
 | `test_context_loader.py`          |     8 | 6.1 `_compact_memory`: below-threshold identity, STATUS/PROJECT untrimmed, archive tail-trim |
 | `test_recovery_budget.py`         |     9 | 6.1 `_maybe_auto_recover` gating: budget/green/idempotent/cap/no-card; budget decrement |
-| **Total**                         | **412** |                                                        |
+| `test_sandbox_git.py`             |    12 | 7.1 run_shell destructive-git block, validate_git allow/deny + gating, run_git e2e |
+| `test_git_ops.py`                 |    12 | 7.2 ensure_repo/checkpoint/diff+redact/commit-refusal/branch/rollback (real git) |
+| `test_git_store.py`               |     7 | 7.3 RunRecord/ResultSummary git round-trip, diff.patch artifact, result.md section |
+| `test_checkpoint_diff.py`         |     4 | 7.4 dispatch checkpoint + inherit, finalize diff capture (idempotent/no-op) |
+| `test_credentials.py`             |     8 | 7.5 resolution order, presence-only status, set/update/delete, redact, traversal |
+| `test_github_connector.py`        |    11 | 7.6 remote parse/tokenless, status validate, push token-only-in-env, PR REST |
+| `test_git_endpoints.py`           |    10 | 7.7 status/diff/commit/push (incl. real local-bare push)/PR/rollback/credentials |
+| `test_git_context.py`             |     5 | 7.9 `_latest_git_state_context` summary-only + mode folding (review/debug) |
+| **Total**                         | **481** |                                                        |
 
 Frontend: `npm run build` (tsc + vite) green.
 

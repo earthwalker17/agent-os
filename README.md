@@ -163,6 +163,15 @@ auto-recovery budget** (none / 1 / 2) so a non-green run can fix itself once or
 twice — capped, linked, and fully audited — without giving up explicit-dispatch
 safety.
 
+**Phase 7 — Project Ops & GitHub Lifecycle** makes a finished run a traceable,
+user-approved delivery: a pre-run **checkpoint** and a redacted post-run **diff**
+are captured automatically, then you **review the diff, commit, push a branch, and
+open a GitHub PR** — each external/destructive step shown as a contract you confirm
+before it runs, and roll back to the checkpoint anytime. Git is an audited delivery
+outlet routed through one sandboxed executor, never raw shell; GitHub tokens live in
+a gitignored store and reach git only at push time — never in commits, logs, memory,
+prompts, or the UI.
+
 Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
 
 ## Architecture

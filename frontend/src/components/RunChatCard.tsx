@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RunRecord } from '../types'
+import GitOpsPanel from './GitOpsPanel'
 
 interface Props {
   projectId: string
@@ -124,7 +125,11 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
     record?.status !== 'cancelled' &&
     record?.memory_reconciliation == null &&
     settleTicks < 15
-  const shouldPoll = isRunning || commandVerifyingState || isVerifyingState || verifying || needsSettle
+  // Phase 7 — a Git action (commit/push/PR/rollback) sets a transient git_state;
+  // keep polling so the card reflects the settled delivery state.
+  const gitInFlight = record?.git_state != null
+  const shouldPoll =
+    isRunning || commandVerifyingState || isVerifyingState || verifying || needsSettle || gitInFlight
   useEffect(() => {
     if (!shouldPoll) return
     const id = window.setInterval(() => {
@@ -592,6 +597,20 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
             <> · {record.recovery_budget} recovery pass{record.recovery_budget === 1 ? '' : 'es'} left</>
           )}
         </p>
+      )}
+
+      {/* --- Phase 7: Project Ops (commit / push / PR / rollback) --- */}
+      {isTerminal && status !== 'cancelled' && (
+        <GitOpsPanel
+          projectId={projectId}
+          runId={runId}
+          record={record}
+          compact
+          onRecordChange={(rec) => {
+            if (mounted.current) setRecord(rec)
+            onRunsChanged?.()
+          }}
+        />
       )}
 
       {verifyError && <div className="run-chat-error">{verifyError}</div>}

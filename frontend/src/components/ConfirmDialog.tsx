@@ -7,9 +7,12 @@ interface Props {
   /** When provided, renders a checkbox above the actions. Its checked value
    *  is passed back through onConfirm. */
   checkboxLabel?: string
+  /** Label for the confirm button (default "Delete"). Phase 7 reuses this dialog
+   *  for push/PR/rollback gates, which read wrong as "Delete". */
+  confirmLabel?: string
 }
 
-function ConfirmDialog({ message, onConfirm, onCancel, checkboxLabel }: Props) {
+function ConfirmDialog({ message, onConfirm, onCancel, checkboxLabel, confirmLabel }: Props) {
   const [checked, setChecked] = useState(false)
 
   useEffect(() => {
@@ -36,7 +39,7 @@ function ConfirmDialog({ message, onConfirm, onCancel, checkboxLabel }: Props) {
           </label>
         )}
         <div className="modal-actions">
-          <button className="btn-danger" onClick={() => onConfirm(checked)}>Delete</button>
+          <button className="btn-danger" onClick={() => onConfirm(checked)}>{confirmLabel || 'Delete'}</button>
           <button className="btn-cancel" onClick={onCancel}>Cancel</button>
         </div>
       </div>

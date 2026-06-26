@@ -146,6 +146,14 @@ and execute project work.
   confirm endpoint). This is the ONLY auto-dispatch path and is authorized by the
   user's explicit prior approval — inferred intent still never runs code, and a
   crashed run never auto-recovers.
+- **Phase 7 — Project Ops (Git/GitHub).** Git is audited delivery, not raw shell:
+  all Git routes through the one executor `ToolRuntime.run_git` (not an agent tool;
+  `run_shell` still blocks `git push` + destructive Git). Pre-run checkpoint + post-run
+  diff are best-effort, never auto-commit/push. Commit / push / PR / rollback are
+  explicit preview→confirm contracts — no inferred-intent Git, no Git auto-dispatch.
+  GitHub tokens (`credentials.py`) reach git only via the push-time `env`
+  (`GIT_ASKPASS`, tokenless remote) — never argv/`.git/config`/logs/memory/UI.
+  (Details: `ARCHITECTURE.md §7.H`.)
 
 ## 6. Context Hygiene
 

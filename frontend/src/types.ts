@@ -271,6 +271,23 @@ export interface RunRecord {
   recovery_budget?: number
   /** Recovery chain depth (0 = original). */
   orchestration_round?: number
+  /**
+   * Phase 7 — Project Ops (Git/GitHub) linkage. Scalar refs only; the full diff
+   * lives in the per-run diff.patch artifact (fetched on demand via /diff), never
+   * inline. All optional so older runs render unchanged. Never carries a secret.
+   */
+  pre_run_checkpoint?: string | null
+  checkpoint_tag?: string | null
+  base_commit?: string | null
+  head_commit?: string | null
+  branch?: string | null
+  commit_sha?: string | null
+  pushed?: boolean
+  pr_url?: string | null
+  pr_number?: number | null
+  diff_stat?: string | null
+  /** Transient sub-status while a Git action runs; null at rest. UI treats as in-progress. */
+  git_state?: 'checkpointing' | 'committing' | 'pushing' | 'opening_pr' | 'rolling_back' | null
 }
 
 /** Task 06.2D — managed preview dev-server status. */
@@ -286,4 +303,74 @@ export interface PreviewStatus {
    * preview-ready regardless of whether browser verification was run.
    */
   deps_installed?: boolean
+}
+
+/** Phase 7 — live Git working-tree status for a project. */
+export interface GitStatus {
+  is_repo: boolean
+  branch?: string | null
+  dirty?: boolean
+  untracked?: number
+  modified?: number
+  staged?: number
+  head?: string | null
+  error?: string | null
+}
+
+/** Phase 7 — GitHub connector presence + connectivity (never the token value). */
+export interface GitHubConnectorStatus {
+  provider: 'github'
+  configured: boolean
+  connected: boolean
+  scope: 'project' | 'global' | 'none'
+  source: 'project' | 'global_file' | 'env' | 'none'
+  login?: string | null
+  default_remote?: string | null
+  error?: string | null
+}
+
+/** Phase 7 — credential presence/metadata for a provider (never the value). */
+export interface CredentialStatus {
+  provider: string
+  configured: boolean
+  source: 'project' | 'global_file' | 'env' | 'none'
+  scope: 'project' | 'global' | 'none'
+  login?: string | null
+  default_remote?: string | null
+}
+
+/**
+ * Phase 7 — an External Action Contract returned by a Git/GitHub endpoint in
+ * preview (confirm:false) mode: what would happen, shown to the user before they
+ * confirm. The same endpoint executes when called again with confirm:true.
+ */
+export interface GitActionContract {
+  action: 'commit' | 'push' | 'pr' | 'rollback'
+  title: string
+  external?: boolean
+  destructive?: boolean
+  requires_confirmation?: boolean
+  branch?: string | null
+  remote?: string | null
+  target?: string | null
+  files?: string[]
+  refused?: string[]
+  diff_stat?: string | null
+  message?: string
+  pr_title?: string
+  base?: string
+  head?: string | null
+  checkpoint?: string
+  summary?: string
+  token_configured?: boolean
+  pushed?: boolean
+}
+
+/** Phase 7 — wrapper response from a two-phase Git/GitHub action endpoint. */
+export interface GitActionResponse {
+  contract: GitActionContract
+  applied: boolean
+  run: RunRecord
+  commit_sha?: string | null
+  refused?: string[]
 }

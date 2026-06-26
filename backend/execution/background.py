@@ -76,6 +76,7 @@ class BackgroundRunManager:
         recovery_of: str | None = None,
         recovery_budget: int = 0,
         orchestration_round: int = 0,
+        inherit_checkpoint: dict | None = None,
     ) -> RunRecord:
         """Create the run record + artifacts immediately, then run in the background.
 
@@ -108,6 +109,22 @@ class BackgroundRunManager:
             recovery_budget=max(0, recovery_budget),
             orchestration_round=orchestration_round,
         )
+
+        # Phase 7 — pre-run checkpoint. Best-effort and synchronous (a handful of
+        # fast git commands); a failure here NEVER blocks dispatch. A recovery
+        # child inherits its parent's checkpoint so the whole chain shares ONE
+        # rollback anchor; a fresh run captures a new out-of-branch snapshot.
+        try:
+            if inherit_checkpoint is not None:
+                record.pre_run_checkpoint = inherit_checkpoint.get("ref")
+                record.base_commit = inherit_checkpoint.get("base")
+                record.checkpoint_tag = inherit_checkpoint.get("tag")
+                record.branch = inherit_checkpoint.get("branch")
+            else:
+                self._create_pre_run_checkpoint(project_id, run_id, record)
+        except Exception:  # noqa: BLE001
+            log.exception("Pre-run checkpoint wiring failed for run %s", run_id)
+
         run_store.write_run_json(project_id, run_id, record)
         run_store.append_event(
             project_id,
@@ -153,6 +170,39 @@ class BackgroundRunManager:
         self._executor.shutdown(wait=wait)
 
     # ---------- internals ----------
+
+    def _create_pre_run_checkpoint(
+        self, project_id: str, run_id: str, record: RunRecord
+    ) -> None:
+        """Capture an out-of-branch checkpoint of the repo before the run and
+        stamp the linkage fields onto ``record`` (persisted by the caller's
+        ``write_run_json``). Lazy-imports git_ops to keep the cost off the
+        import path. Records an audit event either way."""
+        from . import git_ops  # lazy: avoids paying git_ops import on every import
+
+        ck = git_ops.create_checkpoint(project_id, run_id)
+        if ck.created:
+            record.pre_run_checkpoint = ck.ref
+            record.base_commit = ck.base_commit
+            record.checkpoint_tag = ck.tag
+            record.branch = git_ops.current_branch(project_id)
+            run_store.append_event(
+                project_id,
+                run_id,
+                {
+                    "type": "checkpoint_created",
+                    "ref": (ck.ref or "")[:12],
+                    "base": (ck.base_commit or "")[:12],
+                    "tag": ck.tag,
+                    "branch": record.branch,
+                },
+            )
+        else:
+            run_store.append_event(
+                project_id,
+                run_id,
+                {"type": "checkpoint_skipped", "error": (ck.error or "")[:200]},
+            )
 
     def _execute(
         self, project_id: str, run_id: str, task: TaskSpec, cancel_event: Event
@@ -218,6 +268,14 @@ class BackgroundRunManager:
             recovery_of=run_id,
             recovery_budget=rec.recovery_budget - 1,
             orchestration_round=rec.orchestration_round + 1,
+            # Phase 7 — the recovery chain shares the parent's checkpoint as a
+            # single rollback anchor (don't re-anchor mid-chain).
+            inherit_checkpoint={
+                "ref": rec.pre_run_checkpoint,
+                "base": rec.base_commit,
+                "tag": rec.checkpoint_tag,
+                "branch": rec.branch,
+            },
         )
 
         # Claim the parent (re-read to avoid clobbering a concurrent write).

@@ -73,6 +73,7 @@ from execution.browser_verification import (
 )
 from execution.visual_judge import run_visual_review
 from execution import preview
+from execution import git_ops, github_connector
 from execution.inspect import (
     list_repo_files,
     read_repo_file,
@@ -85,6 +86,7 @@ from uploads import (
     ALLOWED_EXTENSIONS,
 )
 import providers
+import credentials
 
 app = FastAPI(title="Agent OS Backend")
 
@@ -1636,6 +1638,418 @@ def api_preview_start(project_id: str, req: StartPreviewRequest):
 def api_preview_stop(project_id: str):
     _require_workspace(project_id)
     return preview.stop_preview(project_id)
+
+
+# --- Project Ops endpoints (Phase 7 — Git / GitHub lifecycle) ---
+# Every Git operation routes through git_ops -> ToolRuntime.run_git (the single
+# Git executor); GitHub push/PR go through the leak-proof connector. Repo-scoped
+# endpoints reject the GENERAL workspace (no repo). Credential endpoints work
+# everywhere (global-scope tokens are project-independent). EXTERNAL/DESTRUCTIVE
+# actions (push / PR / rollback) and local commit are explicit, two-phase
+# preview/confirm contracts — they execute only when the request carries
+# ``confirm: true`` (the user's click). Nothing here auto-runs.
+
+
+def _reject_general_repo_op(project_id: str) -> None:
+    if project_id == GENERAL_PROJECT_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="Git operations are not available in the General workspace.",
+        )
+
+
+def _require_project_or_general(project_id: str) -> None:
+    # Credential/connector endpoints are about tokens, not the repo, so they work
+    # in GENERAL (global-scope) too.
+    if project_id != GENERAL_PROJECT_ID:
+        _require_project(project_id)
+
+
+def _load_run_record(project_id: str, run_id: str) -> RunRecord:
+    raw = run_store.read_run_json(project_id, run_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        return RunRecord(**raw)
+    except Exception:
+        raise HTTPException(status_code=500, detail="run record is corrupt")
+
+
+def _generate_commit_message(project_id: str, record: RunRecord, files: list[str]) -> str:
+    """Generate a concise commit message from compact, redacted run metadata
+    (never the raw diff, never a secret). Mirrors ``revise_pending_plan``: an
+    LLM call with a deterministic heuristic fallback; never raises."""
+    base = (record.summary or record.task_title or "").strip().splitlines()
+    fallback = (base[0][:72] if base else (f"Update {len(files)} file(s)" if files else "Update"))
+    try:
+        from llm import chat as llm_chat
+
+        sys_prompt = (
+            "You write ONE concise git commit message for a set of code changes. "
+            "Output only the message: a <=72-char imperative subject line, optionally "
+            "followed by a blank line and 1-3 short bullet points. No code fences, no preamble."
+        )
+        ctx = credentials.redact(
+            f"Task: {record.task_title}\n"
+            f"Summary: {record.summary}\n"
+            f"Diff stat: {record.diff_stat or '(unknown)'}\n"
+            f"Files: {', '.join(files[:30])}\n",
+            project_id,
+        )
+        out = (llm_chat(sys_prompt, [{"role": "user", "content": ctx}]) or "").strip()
+        if out.startswith("```"):
+            out = out.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        return out or fallback
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _generate_pr_body(record: RunRecord) -> str:
+    parts: list[str] = []
+    if record.summary:
+        parts.append(record.summary.strip())
+    if record.diff_stat:
+        parts.append(f"**Changes:** {record.diff_stat}")
+    parts.append(f"_Delivered via Agent OS (run `{record.run_id}`)._")
+    return "\n\n".join(parts).strip()
+
+
+# ----- live git + connector status -----
+
+
+@app.get("/api/projects/{project_id}/git/status")
+def api_git_status(project_id: str):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    return git_ops.git_status(project_id).to_dict()
+
+
+@app.get("/api/projects/{project_id}/github/connector")
+def api_github_connector_status(project_id: str):
+    _require_project_or_general(project_id)
+    return github_connector.status(project_id).to_dict()
+
+
+# ----- credentials (presence only; values never echoed) -----
+
+
+class SetGithubCredentialRequest(BaseModel):
+    token: str
+    scope: str = "project"  # "project" | "global"
+    default_remote: str | None = None  # optional "owner/repo"
+
+
+@app.get("/api/projects/{project_id}/credentials/github")
+def api_get_github_credential(project_id: str):
+    _require_project_or_general(project_id)
+    return credentials.status(project_id)
+
+
+@app.post("/api/projects/{project_id}/credentials/github")
+def api_set_github_credential(project_id: str, req: SetGithubCredentialRequest):
+    _require_project_or_general(project_id)
+    token = (req.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+    scope = req.scope if req.scope in ("project", "global") else "project"
+    try:
+        credentials.set_github_credential(
+            None if scope == "global" else project_id,
+            token=token,
+            scope=scope,
+            default_remote=req.default_remote,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Validate + capture the login (the response is presence-only, never the token).
+    return github_connector.status(project_id).to_dict()
+
+
+@app.delete("/api/projects/{project_id}/credentials/github")
+def api_delete_github_credential(project_id: str, scope: str = "project"):
+    _require_project_or_general(project_id)
+    scope = scope if scope in ("project", "global") else "project"
+    return credentials.delete_github_credential(
+        None if scope == "global" else project_id, scope=scope
+    )
+
+
+# ----- per-run diff (lazy, bounded, redacted at capture time) -----
+
+
+@app.get("/api/projects/{project_id}/execution/runs/{run_id}/diff")
+def api_get_run_diff(project_id: str, run_id: str):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+    patch = run_store.read_diff_patch(project_id, run_id)
+    return {
+        "run_id": run_id,
+        "available": patch is not None,
+        "diff_stat": record.diff_stat,
+        "diff": patch or "",
+    }
+
+
+# ----- commit (local, explicit, secret-refusing) -----
+
+
+class GitCommitRequest(BaseModel):
+    message: str | None = None
+    branch: str | None = None
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/git/commit")
+def api_git_commit(project_id: str, run_id: str, req: GitCommitRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+
+    status = git_ops.git_status(project_id)
+    safe, refused = git_ops.partition_changes(project_id)
+    message = (req.message or "").strip() or _generate_commit_message(project_id, record, safe)
+    contract = {
+        "action": "commit",
+        "title": "Create commit",
+        "external": False,
+        "destructive": False,
+        "branch": req.branch or status.branch,
+        "files": safe,
+        "refused": refused,
+        "diff_stat": record.diff_stat,
+        "message": message,
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+
+    record.git_state = "committing"
+    run_store.write_run_json(project_id, run_id, record)
+    try:
+        if req.branch and req.branch != status.branch:
+            ok, err = git_ops.create_branch(project_id, req.branch)
+            if not ok:
+                raise HTTPException(status_code=409, detail=f"could not create branch: {err}")
+        result = git_ops.commit(project_id, message)
+        if not result.committed:
+            raise HTTPException(status_code=409, detail=result.error or "nothing to commit")
+    finally:
+        record.git_state = None
+        run_store.write_run_json(project_id, run_id, record)
+
+    record.commit_sha = result.sha
+    record.branch = result.branch
+    record.head_commit = result.sha
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.rerender_result_md(project_id, run_id, record)
+    run_store.append_event(
+        project_id,
+        run_id,
+        {
+            "type": "git_commit",
+            "sha": (result.sha or "")[:12],
+            "branch": result.branch,
+            "files": len(result.files),
+            "refused": len(result.refused),
+        },
+    )
+    return {
+        "contract": {**contract, "branch": result.branch},
+        "applied": True,
+        "commit_sha": result.sha,
+        "refused": result.refused,
+        "run": record.model_dump(),
+    }
+
+
+# ----- push (external — requires confirm) -----
+
+
+class GitPushRequest(BaseModel):
+    branch: str | None = None
+    remote: str = "origin"
+    owner: str | None = None
+    repo: str | None = None
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/git/push")
+def api_git_push(project_id: str, run_id: str, req: GitPushRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+
+    status = git_ops.git_status(project_id)
+    branch = req.branch or record.branch or status.branch
+    remote_info = github_connector.get_remote(project_id, remote=req.remote)
+    target = (
+        f"{remote_info[0]}/{remote_info[1]}"
+        if remote_info
+        else (f"{req.owner}/{req.repo}" if req.owner and req.repo else None)
+    )
+    cred = credentials.status(project_id)
+    contract = {
+        "action": "push",
+        "title": "Push branch to GitHub",
+        "external": True,
+        "destructive": False,
+        "branch": branch,
+        "remote": req.remote,
+        "target": target,
+        "token_configured": cred["configured"],
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+
+    if not branch:
+        raise HTTPException(status_code=400, detail="no branch to push")
+    if not cred["configured"]:
+        raise HTTPException(
+            status_code=400, detail="no GitHub token configured — connect GitHub first"
+        )
+    if not remote_info:
+        if not (req.owner and req.repo):
+            raise HTTPException(
+                status_code=400,
+                detail="no git remote configured; provide owner+repo or set a remote first",
+            )
+        ok, info = github_connector.ensure_remote(project_id, req.owner, req.repo, remote=req.remote)
+        if not ok:
+            raise HTTPException(status_code=409, detail=f"could not set remote: {info}")
+        target = f"{req.owner}/{req.repo}"
+
+    record.git_state = "pushing"
+    run_store.write_run_json(project_id, run_id, record)
+    push = github_connector.push_branch(project_id, branch, remote=req.remote)
+    record.git_state = None
+    if not push.ok:
+        run_store.write_run_json(project_id, run_id, record)
+        raise HTTPException(status_code=502, detail=push.error or "push failed")
+
+    record.pushed = True
+    record.branch = branch
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.rerender_result_md(project_id, run_id, record)
+    run_store.append_event(
+        project_id,
+        run_id,
+        {"type": "git_push", "branch": branch, "remote": req.remote, "target": target},
+    )
+    return {"contract": {**contract, "target": target}, "applied": True, "run": record.model_dump()}
+
+
+# ----- pull request (external — requires confirm) -----
+
+
+class GitPrRequest(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    base: str = "main"
+    head: str | None = None
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/github/pr")
+def api_github_pr(project_id: str, run_id: str, req: GitPrRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+
+    remote_info = github_connector.get_remote(project_id)
+    owner, repo = (remote_info or (None, None))
+    head = req.head or record.branch or git_ops.current_branch(project_id)
+    base_line = (record.summary or record.task_title or "Agent OS changes").strip().splitlines()
+    title = (req.title or "").strip() or (base_line[0][:72] if base_line else "Agent OS changes")
+    body_text = (req.body or "").strip() or _generate_pr_body(record)
+    contract = {
+        "action": "pr",
+        "title": "Open pull request",
+        "external": True,
+        "destructive": False,
+        "pr_title": title,
+        "base": req.base,
+        "head": head,
+        "target": f"{owner}/{repo}" if owner else None,
+        "pushed": record.pushed,
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+
+    if not record.pushed:
+        raise HTTPException(status_code=409, detail="push the branch before opening a PR")
+    if not (owner and repo):
+        raise HTTPException(status_code=400, detail="no GitHub remote configured")
+    if not head:
+        raise HTTPException(status_code=400, detail="no head branch for the PR")
+
+    record.git_state = "opening_pr"
+    run_store.write_run_json(project_id, run_id, record)
+    pr = github_connector.create_pull_request(
+        project_id, owner=owner, repo=repo, head=head, base=req.base, title=title, body=body_text
+    )
+    record.git_state = None
+    if not pr.ok:
+        run_store.write_run_json(project_id, run_id, record)
+        raise HTTPException(status_code=502, detail=pr.error or "pull request creation failed")
+
+    record.pr_url = pr.url
+    record.pr_number = pr.number
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.rerender_result_md(project_id, run_id, record)
+    run_store.append_event(
+        project_id,
+        run_id,
+        {"type": "github_pr", "url": pr.url, "number": pr.number},
+    )
+    return {"contract": contract, "applied": True, "run": record.model_dump()}
+
+
+# ----- rollback (destructive — requires confirm) -----
+
+
+class GitRollbackRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/git/rollback")
+def api_git_rollback(project_id: str, run_id: str, req: GitRollbackRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+    if not record.base_commit:
+        raise HTTPException(status_code=409, detail="no pre-run checkpoint to roll back to")
+
+    contract = {
+        "action": "rollback",
+        "title": "Roll back to pre-run checkpoint",
+        "external": False,
+        "destructive": True,
+        "target": record.base_commit[:12],
+        "checkpoint": (record.pre_run_checkpoint or "")[:12],
+        "summary": "Discards this run's changes and restores the repo to its pre-run state.",
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+
+    record.git_state = "rolling_back"
+    run_store.write_run_json(project_id, run_id, record)
+    result = git_ops.rollback(
+        project_id, base_commit=record.base_commit, checkpoint_ref=record.pre_run_checkpoint
+    )
+    record.git_state = None
+    run_store.write_run_json(project_id, run_id, record)
+    if not result.rolled_back:
+        raise HTTPException(status_code=409, detail=result.error or "rollback failed")
+    run_store.append_event(
+        project_id,
+        run_id,
+        {"type": "git_rollback", "target": (record.base_commit or "")[:12]},
+    )
+    return {"contract": contract, "applied": True, "run": record.model_dump()}
 
 
 # --- Main-agent file inspection endpoints (Task 06.1) ---

@@ -41,6 +41,31 @@ _BLOCKED_COMMAND_PATTERNS = (
     "scp",
     "ssh",
     "git push",
+    # Destructive Git operations that discard work or rewrite refs. The Coding
+    # Agent's free-form `run_shell` must never run these (CLAUDE.md §3). Project
+    # Ops performs *confirmed* destructive Git through the separate typed
+    # `run_git` surface (`validate_git` + `allow_destructive`), which does NOT
+    # consult this block-list — so a user-approved rollback still works while the
+    # agent loop stays fenced.
+    "git reset --hard",
+    "git clean -f",
+    "git checkout -- ",
+    "git checkout .",
+    "git restore .",
+    "git branch -d",
+)
+
+# Git subcommands the typed `run_git` surface (Project Ops) may invoke. This is
+# an allow-list for our own controlled callers (git_ops / the GitHub connector);
+# the Coding Agent never reaches run_git. Anything outside this set is rejected.
+_GIT_ALLOWED_SUBCOMMANDS = frozenset(
+    {
+        "init", "status", "diff", "add", "rm", "commit", "branch", "checkout",
+        "switch", "restore", "reset", "clean", "stash", "tag", "rev-parse",
+        "rev-list", "log", "show", "remote", "fetch", "push", "config",
+        "ls-files", "symbolic-ref", "update-ref", "cat-file", "merge-base",
+        "show-ref", "write-tree", "commit-tree",
+    }
 )
 
 # The literal "curl | bash" / "wget | bash" substrings above only match if no
@@ -51,6 +76,39 @@ _PIPE_TO_SHELL_REGEX = re.compile(
     r"\b(curl|wget|iwr|invoke-webrequest)\b[^|]*\|\s*(bash|sh|zsh|powershell|pwsh)\b",
     re.IGNORECASE,
 )
+
+
+def _is_destructive_git(sub: str, rest: list[str]) -> bool:
+    """Whether a typed `git <sub> <rest...>` invocation discards work / rewrites
+    refs and therefore needs explicit user confirmation (``allow_destructive``).
+
+    Conservative: when in doubt for a known-dangerous subcommand, return True.
+    """
+    tokens = [t.lower() for t in rest]
+    if sub == "reset":
+        return "--hard" in tokens
+    if sub == "clean":
+        # clean removes untracked files; only a dry-run is non-destructive.
+        return not any(t in ("-n", "--dry-run") for t in tokens)
+    if sub == "push":
+        return any(
+            t in ("-f", "--force") or t.startswith("--force-with-lease")
+            for t in tokens
+        )
+    if sub == "checkout":
+        # `checkout -- <path>` / `checkout .` / `-f` discard working-tree edits.
+        return "--" in tokens or "." in tokens or "-f" in tokens or "--force" in tokens
+    if sub == "restore":
+        # `restore --staged <path>` only unstages (safe); anything touching the
+        # worktree discards changes.
+        return not ("--staged" in tokens and "--worktree" not in tokens)
+    if sub == "switch":
+        return "-f" in tokens or "--force" in tokens or "--discard-changes" in tokens
+    if sub == "branch":
+        return any(t in ("-d", "-D", "--delete") for t in tokens)
+    if sub == "update-ref":
+        return "-d" in tokens
+    return False
 
 
 class ProjectSandbox:
@@ -126,4 +184,45 @@ class ProjectSandbox:
         if _PIPE_TO_SHELL_REGEX.search(command):
             raise SandboxViolation(
                 "command rejected by sandbox policy (piping a fetcher into a shell)"
+            )
+
+    def validate_git(self, args, *, allow_destructive: bool = False) -> None:
+        """Validate a typed Git argv (without the leading ``git``).
+
+        Used only by the Project Ops layer (`ToolRuntime.run_git` → git_ops /
+        GitHub connector); the Coding Agent never reaches this path. Enforces:
+
+        - a non-empty list of plain strings, no embedded control characters
+          (the argv is executed with ``shell=False`` so there is no shell
+          interpolation, but we still reject newlines/NULs defensively);
+        - an allow-listed subcommand (`_GIT_ALLOWED_SUBCOMMANDS`);
+        - destructive subcommands (`reset --hard`, force-push, `clean`,
+          worktree-discarding `checkout`/`restore`, branch deletes, …) only when
+          ``allow_destructive`` is True — which a caller passes solely from a
+          user-confirmed action endpoint (e.g. rollback).
+
+        Note: a non-force ``push`` is allowed here (it is not *locally*
+        destructive); its *external* nature is gated separately, at the
+        confirm endpoint, never in the sandbox.
+        """
+        if not isinstance(args, (list, tuple)) or not args:
+            raise SandboxViolation("git args must be a non-empty list")
+        cleaned: list[str] = []
+        for a in args:
+            if not isinstance(a, str):
+                raise SandboxViolation("git args must all be strings")
+            # Only NUL is rejected. Newlines are legitimate in a commit message
+            # (subject + body) and, since run_git uses shell=False with an argv
+            # list, they carry NO injection risk — each arg reaches git verbatim.
+            if "\x00" in a:
+                raise SandboxViolation("git args must not contain NUL bytes")
+            cleaned.append(a)
+
+        sub = cleaned[0].lower()
+        if sub not in _GIT_ALLOWED_SUBCOMMANDS:
+            raise SandboxViolation(f"git subcommand not allowed: {sub!r}")
+        if _is_destructive_git(sub, cleaned[1:]) and not allow_destructive:
+            raise SandboxViolation(
+                f"destructive git operation requires explicit confirmation: "
+                f"git {sub} ..."
             )

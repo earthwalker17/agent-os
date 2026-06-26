@@ -61,6 +61,11 @@ execution_workspaces/aegis-launch-control/logs/
 # Private local state, same as memory and workspaces.
 chat_uploads/
 
+# Phase 7 — Project Ops credential store (GitHub tokens, project + global).
+# Secrets must never be committed; the central accessor (backend/credentials.py)
+# is the only reader, and tokens never reach prompts/logs/memory/Git.
+credentials/
+
 # Runtime logs
 logs/
 *.log

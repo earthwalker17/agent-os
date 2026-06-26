@@ -285,6 +285,10 @@ def _mode_guidance_section(ctx: MemoryContext, mode: Optional[str]) -> str:
         run_ctx = _latest_nongreen_run_context(ctx.project_id)
         if run_ctx:
             block += "\n\n### Latest non-green run\n" + run_ctx
+    if mode in ("review", "debug"):
+        git_ctx = _latest_git_state_context(ctx.project_id)
+        if git_ctx:
+            block += "\n\n### Project Ops (Git/GitHub) state\n" + git_ctx
     return "---\n\n# Mode\n\n" + block
 
 
@@ -314,6 +318,47 @@ def _latest_nongreen_run_context(project_id: str) -> str:
             lines.append(f"  - summary: {summary[:400]}")
         for b in blockers[:5]:
             lines.append(f"  - blocker: {str(b)[:200]}")
+        return "\n".join(lines)
+    return ""
+
+
+def _latest_git_state_context(project_id: str) -> str:
+    """Phase 7 — compact Git/GitHub delivery state for the most recent run that
+    has any (branch / commit / PR / diff-stat), or ''.
+
+    Metadata only (§6 context hygiene): branch, short commit sha, PR url, and a
+    one-line diff-stat — NEVER the raw diff. The full diff is reachable only via
+    the bounded ``/diff`` endpoint on a concrete reason. Lazily imports the
+    execution layer; swallows all errors.
+    """
+    if project_id == GENERAL_PROJECT_ID:
+        return ""
+    try:
+        from execution import run_store
+
+        runs = run_store.list_runs(project_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    for rec in runs or []:  # newest-first
+        commit = rec.get("commit_sha")
+        pr_url = rec.get("pr_url")
+        diff_stat = rec.get("diff_stat")
+        branch = rec.get("branch")
+        if not any((commit, pr_url, diff_stat, rec.get("pushed"))):
+            continue
+        title = str(rec.get("task_title", "") or "(untitled)")
+        lines = [f"- **{title}**"]
+        if branch:
+            lines.append(f"  - branch: `{branch}`")
+        if diff_stat:
+            lines.append(f"  - diff: {str(diff_stat)[:200]}")
+        if commit:
+            lines.append(f"  - commit: `{str(commit)[:12]}`")
+        if rec.get("pushed"):
+            lines.append("  - pushed: yes")
+        if pr_url:
+            num = rec.get("pr_number")
+            lines.append(f"  - PR{f' #{num}' if num else ''}: {pr_url}")
         return "\n".join(lines)
     return ""
 

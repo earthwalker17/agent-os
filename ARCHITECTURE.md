@@ -106,6 +106,7 @@ conversations, messages, and pending executions.
 | `providers.py`    | **Provider Registry 2.0** — capability-aware model providers (Claude / GPT / Gemini / DeepSeek / Kimi / GLM). Key-presence availability (+ accepted env aliases, e.g. `ZAI_API_KEY` for GLM), default-provider preference (Claude first), a per-provider **model registry** with per-model `vision` flags, env-overridable default model + base URL, model validation (`is_known_model`), a `complete()` dispatcher, and a `complete_vision()` text+image dispatcher gated on the **selected model's** vision flag (`is_vision_capable`/`model_is_vision`/`default_vision_model`/`vision_available`/`default_vision_provider`). Anthropic via SDK; GPT/DeepSeek/Kimi/GLM via OpenAI-compatible `urllib` HTTPS; Gemini via `generateContent` (no new deps). |
 | `database.py`     | SQLite persistence: conversations, messages, `pending_executions`. |
 | `uploads.py`      | Task 07.0 — chat attachment storage: filename sanitization + allow-list, per-dir dedup, chat-only storage under `chat_uploads/{conv}/`, optional workspace copy via `ProjectSandbox`. HTTP-agnostic (takes bytes). |
+| `credentials.py`  | **Phase 7** — central credential accessor (the only reader of secret values). Global token from env (`GITHUB_TOKEN`/aliases) + per-project gitignored `credentials/projects/{id}.json` (project overrides global). `get_github_token` (connector-only), `status` (presence/login only — never the value), `set/delete/update_github_*`, and `redact()` (strips known stored tokens + common token shapes). Store lives under `credentials/` (gitignored), outside `projects/`/`memory/`. |
 
 ### Execution layer (`backend/execution/`)
 | File                       | Purpose                                                                |
@@ -132,6 +133,9 @@ conversations, messages, and pending executions.
 | `browser_verification.py`  | Browser verification lifecycle (dev server → HTTP readiness → **render-readiness-gated, multi-page** Playwright capture → teardown) + UI flow. Captures the entry URL plus a few discovered views (`BrowserPageCapture[]`); a legacy single-capture adapter keeps the `screenshots/browser.png` contract. |
 | `visual_judge.py`          | AI visual judgment over the captured screenshots (`run_visual_review`): vision-model verdict (`passed`/`warning`/`failed`/`inconclusive`) + concise rationale/evidence, persisted as `visual_review.json`. Resolves a vision-capable `(provider, model)` — preferring the user's **selected** one, else any available vision model — and **skips gracefully** when none is configured. **Diagnostic-only**, best-effort. |
 | `preview.py`               | Managed long-lived preview dev servers (one per project).               |
+| `git_ops.py`               | **Phase 7** — sandboxed local Git ops, all via `ToolRuntime.run_git`: `ensure_repo` (lazy `git init` + safe `.gitignore` + identity + initial commit), `git_status`, `current_branch`, `create_checkpoint` (out-of-branch snapshot via `write-tree`/`commit-tree` on a throwaway index → tagged), `capture_diff` (redacted + bounded, includes new files), `commit` (secret-refusing stage), `partition_changes`, `create_branch`, `rollback` (gated). Never raises into the run loop. |
+| `github_connector.py`      | **Phase 7** — GitHub via REST/`urllib` (no `gh` CLI, no new deps): `status` (validate token via `GET /user`), `ensure_remote` (tokenless URL), `push_branch` (token injected ONLY via `GIT_ASKPASS` env — never argv/`.git/config`), `create_pull_request` (`POST /pulls`). Output is redacted; the token never enters a logged surface. |
+| `_git_askpass.sh`          | Runtime-generated (gitignored, under `credentials/`) `GIT_ASKPASS` helper — echoes the token from an env var the connector sets per-push. Contains no secret; keeps the token out of argv and `.git/config`. |
 
 `tests/` mirrors these per feature; all stub `llm.chat` so no API key is needed.
 
@@ -297,6 +301,28 @@ is **cooperative**: an in-flight LLM call or shell command finishes first.
 `task_card.md` and dispatches a fresh linked run (`retry_of` on the new record,
 `retried_by` on the original) — explicit user action, no auto-rerun.
 
+### H. Project Ops — Git/GitHub delivery (Phase 7) — `git_ops` + `github_connector`
+Turns a finished run into an audited, user-approved Git/GitHub delivery. **One
+Git executor:** every command goes through `ToolRuntime.run_git` (`shell=False`
+argv, `ProjectSandbox.validate_git` allow-list + destructive gating); the agent's
+`run_shell` still blocks `git push` + destructive Git and never reaches `run_git`.
+**Checkpoint (dispatch):** `background.dispatch` best-effort `git_ops.ensure_repo`
++ `create_checkpoint` stamps `pre_run_checkpoint`/`base_commit`/`checkpoint_tag`/
+`branch` on the record before the first `write_run_json`; a recovery child inherits
+the parent's anchor. **Diff (finalize):** `runner._finalize` best-effort
+`capture_diff` against the checkpoint → redacted, bounded `diff.patch` artifact +
+`diff_stat`/`head_commit` on the record (never auto-commits). **Delivery
+(explicit, two-phase):** `POST …/runs/{id}/git/commit|git/push|github/pr|git/rollback`
+each return an **External Action Contract** on `confirm:false` and execute only on
+`confirm:true`; `GET …/runs/{id}/diff` serves the patch on demand,
+`GET …/projects/{id}/git/status` the live tree, `…/credentials/github` +
+`…/github/connector` the (presence-only) token/connection state. Push/PR are
+external, rollback destructive — all gated; commit refuses secret-looking files;
+the token reaches git only via `GIT_ASKPASS` env. Frontend: `GitOpsPanel` (in the
+run chat card + detail modal) drives the contracts; `ConnectorModal` (from the Runs
+panel) enters the token; the brain sees only a compact `_latest_git_state_context`
+in `@review`/`@debug` (never the raw diff).
+
 ---
 
 ## 8. Core data model — `RunRecord` (serialized as `run.json`)
@@ -323,6 +349,14 @@ follow_up_task_card) — populated by `recovery.assess_run` for non-green runs,
 recovery per parent). `VerificationResult` carries `mode`
 (`manual`/`inferred`/`skipped`), a `commands[]` breakdown, and `repair_attempts`;
 its legacy top-level `command`/`exit_code`/`output_preview` mirror the aggregate.
+**Phase 7** adds the Project Ops linkage (all `Optional`, defaulted so old records
+round-trip): `pre_run_checkpoint` / `checkpoint_tag` / `base_commit` (the rollback
+anchor), `head_commit`, `branch`, `commit_sha`, `pushed`, `pr_url` / `pr_number`,
+`diff_stat` (compact — the raw diff stays in `diff.patch`), and the transient
+`git_state` sub-status (`checkpointing`/`committing`/`pushing`/`opening_pr`/
+`rolling_back`; mirrors `verification_state`, never a `RunStatus` value).
+`ResultSummary` gains compact `commit_sha`/`branch`/`pr_url`/`diff_stat` (metadata
+only). **No secret ever appears on either model.**
 
 Status semantics: **`completed` only after verification passes (or safe skip);**
 files-written-but-verification-failed is `partial`; `skipped` is acceptable only
@@ -351,9 +385,18 @@ values.
   gated on the user's explicit prior approval (clamped at the confirm endpoint),
   capped, idempotent (`recovered_by`, one recovery per parent), and never fires
   from inferred intent or from a crash path.
-- **Best-effort post-run steps.** Verification / browser / reconciliation never
-  crash finalization and never get a run stuck in `running`.
+- **Best-effort post-run steps.** Verification / browser / reconciliation /
+  checkpoint / diff capture never crash finalization and never get a run stuck in
+  `running`.
 - **No auto-injection of repo contents** into the main agent's context.
+- **Git is audited delivery, not shell (Phase 7).** All Git routes through the
+  single executor `ToolRuntime.run_git` (`validate_git` + destructive gating); no
+  raw `subprocess`/`os`/GitPython on repo paths, and `run_git` is not an agent
+  tool. Commit/push/PR/rollback are explicit two-phase confirm contracts — **no
+  inferred-intent Git, no Git auto-dispatch.** Credentials reach git only via the
+  `GIT_ASKPASS` subprocess env (tokenless remote) and never touch argv,
+  `.git/config`, commits, logs, events, memory, prompts, or the UI; `credentials.py`
+  is the sole secret reader and `status` is presence-only.
 
 ---
 

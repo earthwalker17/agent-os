@@ -2804,3 +2804,238 @@ html, body, #root {
   color: var(--text-muted);
   font-style: italic;
 }
+
+/* ===================== Phase 7 — Project Ops (Git / GitHub) ===================== */
+
+.gitops-panel {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+.gitops-panel.gitops-compact {
+  margin-top: 8px;
+  padding: 8px;
+}
+.gitops-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.gitops-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.gitops-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.gitops-stat {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.gitops-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--bg-input);
+  color: var(--text);
+}
+.gitops-prlink {
+  font-size: 11px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.gitops-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.gitops-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.gitops-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.gitops-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.gitops-btn.gitops-danger {
+  color: var(--accent);
+}
+.gitops-diff {
+  margin-top: 8px;
+  max-height: 320px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+}
+.gitops-contract {
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg-surface);
+}
+.gitops-contract.destructive {
+  border-left-color: #e0a800;
+}
+.gitops-contract-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.gitops-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+.gitops-tag.external {
+  background: rgba(99, 102, 241, 0.18);
+  color: #818cf8;
+}
+.gitops-tag.danger {
+  background: rgba(224, 168, 0, 0.18);
+  color: #e0a800;
+}
+.gitops-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 6px 0 3px;
+}
+.gitops-message {
+  width: 100%;
+  resize: vertical;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text);
+}
+.gitops-prtitle {
+  font-weight: 600;
+  font-size: 13px;
+}
+.gitops-refused {
+  color: #e0a800;
+}
+.gitops-contract-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.gitops-confirm {
+  font-size: 12px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+.gitops-confirm.gitops-danger {
+  background: #e0a800;
+  color: #1a1a2e;
+}
+.gitops-confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.gitops-cancel {
+  font-size: 12px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+/* project-level git strip in the Runs panel */
+.git-control {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.git-control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.git-branch-badge {
+  font-size: 11px;
+  color: var(--text);
+}
+.git-dirty {
+  color: #e0a800;
+}
+.git-clean {
+  color: var(--text-muted);
+}
+.git-connect-btn {
+  font-size: 11px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.git-connect-btn.connected {
+  border-color: #2ea043;
+  color: #2ea043;
+}
+
+/* connector modal */
+.connector-modal {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  width: min(460px, 92vw);
+  max-height: 90vh;
+  overflow: auto;
+}
+.connector-modal h3 {
+  margin-bottom: 8px;
+}
+.connector-input,
+.connector-select {
+  width: 100%;
+  padding: 7px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text);
+}

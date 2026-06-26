@@ -9,6 +9,7 @@ import type {
   VisualReviewResult,
 } from '../types'
 import RunTimeline from './RunTimeline'
+import GitOpsPanel from './GitOpsPanel'
 
 interface Props {
   projectId: string
@@ -28,7 +29,8 @@ function isActive(r: RunRecord | null): boolean {
     r.status === 'running' ||
     r.verification_state === 'verifying' ||
     r.verification_state === 'repairing' ||
-    r.browser_verification_state === 'running'
+    r.browser_verification_state === 'running' ||
+    r.git_state != null
   )
 }
 
@@ -606,6 +608,27 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
                   does not change the run status.
                 </p>
               </section>
+
+              {/* Phase 7 — Project Ops (Git/GitHub): diff, commit, push, PR, rollback. */}
+              {record.status !== 'running' && record.status !== 'cancelled' && (
+                <section className="run-detail-result">
+                  <h4>Project Ops (Git / GitHub)</h4>
+                  <GitOpsPanel
+                    projectId={projectId}
+                    runId={runId}
+                    record={record}
+                    onRecordChange={(rec) => {
+                      setRecord(rec)
+                      onRunsChanged?.()
+                    }}
+                  />
+                  <p className="run-detail-hint">
+                    Commit, push, and open a PR — each external/destructive action is
+                    shown as a contract you confirm before it runs. Roll back restores
+                    the pre-run checkpoint.
+                  </p>
+                </section>
+              )}
 
               {/* Phase 6.1 — Main-Agent recovery assessment (non-green runs). */}
               {record.recovery_assessment && (

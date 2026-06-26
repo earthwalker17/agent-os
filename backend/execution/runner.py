@@ -1323,6 +1323,13 @@ class CodingAgentRunner:
             except Exception:  # noqa: BLE001 — visual review never fails the run
                 log.exception("Visual review wiring failed for run %s", run_id)
 
+        # Phase 7 — capture the post-run diff against the pre-run checkpoint.
+        # Best-effort + read-only: it NEVER auto-commits or pushes (those are
+        # explicit, user-confirmed actions) and never fails finalization. The
+        # diff text is redacted + bounded and stored as a per-run artifact; only
+        # compact metadata (diff_stat / head_commit) lands on the record.
+        self._capture_post_run_diff(run_id, record)
+
         run_store.write_run_json(self.project_id, run_id, record)
         # Re-write plan.json with the settled per-task statuses (Phase 5). For a
         # single-task plan, sync the lone task's status to the run's terminal
@@ -1383,7 +1390,66 @@ class CodingAgentRunner:
             browser_verification=browser_verification,
             visual_review=record.visual_review,
             plan=record.plan,
+            commit_sha=record.commit_sha,
+            branch=record.branch,
+            pr_url=record.pr_url,
+            diff_stat=record.diff_stat,
         )
+
+    # ---------- post-run diff capture (Phase 7) ----------
+
+    def _capture_post_run_diff(self, run_id: str, record: RunRecord) -> None:
+        """Capture the run's diff against its pre-run checkpoint, redacted and
+        bounded, into the ``diff.patch`` artifact; stamp ``head_commit`` +
+        ``diff_stat`` onto the record. No-op when no checkpoint was created (e.g.
+        git unavailable) or already captured. Best-effort — never raises."""
+        if not record.pre_run_checkpoint or record.diff_stat is not None:
+            return
+        try:
+            from . import git_ops  # lazy import
+
+            # Strongest egress guard: strip exact stored token values (project +
+            # global + env) AND common token shapes from the diff at capture time.
+            try:
+                import credentials as _credentials
+
+                redactor = lambda t: _credentials.redact(t, self.project_id)  # noqa: E731
+            except Exception:  # noqa: BLE001 — fall back to git_ops' pattern scrub
+                redactor = None
+
+            record.head_commit = git_ops._head_sha(self.runtime)
+            diff = git_ops.capture_diff(
+                self.project_id,
+                record.pre_run_checkpoint,
+                runtime=self.runtime,
+                redactor=redactor,
+            )
+            if not diff.captured:
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {"type": "diff_skipped", "error": (diff.error or "")[:200]},
+                )
+                return
+            run_store.write_diff_patch(self.project_id, run_id, diff.diff_text)
+            if diff.stat:
+                record.diff_stat = diff.stat.splitlines()[-1].strip()[:300]
+            elif diff.files:
+                record.diff_stat = f"{len(diff.files)} file(s) changed"
+            else:
+                record.diff_stat = "no changes"
+            run_store.append_event(
+                self.project_id,
+                run_id,
+                {
+                    "type": "diff_captured",
+                    "files": len(diff.files),
+                    "truncated": diff.truncated,
+                    "stat": record.diff_stat,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Post-run diff capture failed for run %s", run_id)
 
     # ---------- verification + repair (Task 06.2E) ----------
 

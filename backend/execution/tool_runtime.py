@@ -394,3 +394,119 @@ class ToolRuntime:
                 "stderr_truncated": stderr_truncated,
             },
         )
+
+    # --- typed git tool (Project Ops only) ---
+
+    def run_git(
+        self,
+        args,
+        *,
+        allow_destructive: bool = False,
+        env_extra: dict | None = None,
+        timeout_seconds: int = 60,
+    ) -> ToolResult:
+        """Run a single ``git`` invocation inside the project repo.
+
+        The single Git executor for the whole system (Phase 7). Unlike
+        ``run_shell`` this uses ``shell=False`` with an explicit argv list, so a
+        branch name or commit message can never break out into shell
+        interpretation. The Coding Agent does NOT have this tool — only the
+        Project Ops layer (git_ops / the GitHub connector) calls it.
+
+        Credential handling (constitutional): a token is passed ONLY through
+        ``env_extra`` (e.g. ``GIT_ASKPASS`` + the helper's value var). It must
+        never appear in ``args`` — the argv is copied verbatim into
+        ``metadata["command"]`` which flows to ``events.jsonl`` / ``run.json``.
+        Remotes are tokenless URLs; the token reaches git only via the askpass
+        env at push time and is never logged.
+        """
+        if not isinstance(args, (list, tuple)) or not args:
+            return _err("run_git", ValueError("git args must be a non-empty list"))
+        argv = [str(a) for a in args]
+
+        try:
+            self.sandbox.validate_git(argv, allow_destructive=allow_destructive)
+        except SandboxViolation as e:
+            return _err("run_git", e)
+
+        repo = self.sandbox.repo_dir
+        # `git init` needs the dir to exist; the repo dir is inside our own
+        # workspace, so creating it is safe and keeps init idempotent.
+        try:
+            repo.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return _err("run_git", e)
+
+        effective_timeout = max(
+            1, min(int(timeout_seconds), _MAX_SHELL_TIMEOUT_SECONDS)
+        )
+
+        # Hardened, non-interactive environment: GIT_TERMINAL_PROMPT=0 makes any
+        # credential/host prompt fail fast instead of hanging a worker thread;
+        # GIT_EDITOR=true neutralizes commands that would otherwise open an
+        # editor (we always pass -m for commits regardless). env_extra (e.g. the
+        # connector's GIT_ASKPASS + token var) is merged last.
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_EDITOR"] = "true"
+        if env_extra:
+            env.update({str(k): str(v) for k, v in env_extra.items()})
+
+        full = ["git", *argv]
+        try:
+            proc = subprocess.Popen(
+                full,
+                shell=False,
+                cwd=str(repo),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+        except Exception as e:
+            return _err("run_git", e)
+
+        try:
+            out, err = proc.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            return ToolResult(
+                success=False,
+                tool_name="run_git",
+                error=f"git command timed out after {effective_timeout}s",
+                metadata={
+                    "command": "git " + " ".join(argv),
+                    "args": argv,
+                    "cwd": str(repo),
+                    "timeout": True,
+                    "timeout_seconds": effective_timeout,
+                },
+            )
+        except Exception as e:
+            _kill_process_tree(proc)
+            return _err("run_git", e)
+
+        stdout, stdout_truncated = _truncate(out or "", _MAX_SHELL_OUTPUT_CHARS)
+        stderr, stderr_truncated = _truncate(err or "", _MAX_SHELL_OUTPUT_CHARS)
+        return ToolResult(
+            success=proc.returncode == 0,
+            tool_name="run_git",
+            output=stdout,
+            error=stderr,
+            metadata={
+                # argv only — never any secret (tokens live in env_extra).
+                "command": "git " + " ".join(argv),
+                "args": argv,
+                "cwd": str(repo),
+                "exit_code": proc.returncode,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            },
+        )
