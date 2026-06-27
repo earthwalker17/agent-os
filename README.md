@@ -1,233 +1,199 @@
+<div align="center">
+
 # Agent OS
 
-A lightweight **local-first project cockpit** — manage multiple
-long-term projects through a single web chat surface, with structured
-markdown memory and a bounded execution layer that can delegate code
-work to a sandboxed Coding Agent.
+### A local-first AI Project Operating System — the *harness* that turns a coding model into a reliable software agent.
 
-> Detailed implementation status, task history, and the roadmap live in
-> [`ROADMAP.md`](./ROADMAP.md); the system's shape (files, pipelines,
-> invariants) is in [`ARCHITECTURE.md`](./ARCHITECTURE.md). The stable
-> operating guide for any agent working on this repo is
-> [`CLAUDE.md`](./CLAUDE.md).
+![Agent OS — local-first AI Project Operating System](./README_image.png)
+
+**`Model + Harness = Agent`**
+
+Once a foundation model can write code, the hard part is everything *around* the model: project memory, context engineering, sandboxed tools, verification, observability, recovery, and audited delivery. **Agent OS is that harness** — and its sandboxed agent has already planned and built a full-stack app from an empty repository, gated by a real production build ([see the showcase](#showcase-a-full-stack-app-agent-os-built-by-itself)).
+
+![Local-first](https://img.shields.io/badge/local--first-filesystem%20%2B%20SQLite-2f6f4e)
+![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20Python%203.10%2B-3776ab)
+![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite%20%2B%20TypeScript-61dafb)
+![Providers](https://img.shields.io/badge/providers-Claude%2C%20GPT%2C%20Gemini%2C%20DeepSeek%2C%20Kimi%2C%20GLM-7b5cff)
+![Tests](https://img.shields.io/badge/backend%20tests-480%2B%20passing-2f855a)
+![Status](https://img.shields.io/badge/status-Phase%207%20complete-555)
+
+</div>
+
+> **Docs map.** This README is the public landing page. The system's shape (files,
+> pipelines, invariants) lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md); the status,
+> task log, and roadmap in [`ROADMAP.md`](./ROADMAP.md); the long-term direction in
+> [`BLUEPRINT.md`](./BLUEPRINT.md); the operating guide for any coding agent working
+> on the repo in [`CLAUDE.md`](./CLAUDE.md).
+
+---
 
 ## What is Agent OS?
 
-Agent OS is a small **Agent Operating System** built for one builder
-running multiple projects. It combines:
+**Agent OS is a local-first cockpit for running multiple long-term software projects through a single web chat surface** — and the *harness* that wraps a coding model with everything it needs to finish real work reliably.
 
-- **Project-scoped conversations** — each project has its own chat
-  history, isolated from other projects.
-- **Structured markdown memory** — durable project state lives in
-  readable, editable `.md` files, not buried in chat scrollback.
-- **A thin orchestration layer** — the main agent assembles context
-  from memory, produces planning / explanation replies, and decides via
-  a separate semantic-judge call whether memory files should be updated.
-- **A bounded execution layer** — a sandboxed Coding Agent runs inside
-  a per-project workspace under `execution_workspaces/{project_id}/repo/`,
-  dispatched explicitly by the user via `@code …` or by confirming a
-  model-proposed plan. Complex tasks are first **planned and broken into a
-  tracked task graph**, then executed task-by-task with per-task status.
-- **A verification surface** — a Runs panel and per-run detail modal
-  show status, files changed, commands run, blockers, `result.md`, and a
-  settled execution timeline, with **Cancel** and **Retry** controls for
-  long-running or failed runs. Metrics update **live** as the agent works,
-  and a dedicated **Live Trace** shows a real-time chronological thread of
-  every file edit, command, and verification step.
+It runs entirely on your machine — **filesystem + SQLite + FastAPI + React**, no cloud queues, no hidden infrastructure — and combines:
+
+- **Project-scoped conversations** — each project has its own chat history, memory, and execution workspace, isolated from the others.
+- **Structured markdown memory** — durable project state lives in readable, editable `.md` files, not buried in chat scrollback.
+- **A two-agent split** — a **Main Agent** (the brain: planner, memory steward, orchestrator) and a sandboxed **Coding Agent** (the hands: a bounded executor inside one project's workspace).
+- **A capability-aware provider registry** — six model providers (**Claude, GPT, Gemini, DeepSeek, Kimi, Zhipu GLM**), each with a selectable model list and vision metadata.
+- **A full build → verify → preview → deliver loop** — plan into a task graph, execute task-by-task, verify with a real build, screenshot the running app, review it with a vision model, and deliver through audited Git/GitHub contracts — every external or destructive step behind an explicit human approval gate.
+
+It is deliberately *not* a general-purpose assistant or a heavyweight agent platform. It's a clear, controllable place for one builder to plan, decide, and execute project work — with the model on a leash that makes its output trustworthy.
+
+---
+
+## Why an Agent Harness matters
+
+A foundation model that can generate code is necessary but not sufficient. The gap between *"the model produced a diff"* and *"the task is reliably done"* is filled by the harness:
+
+| The model gives you… | …but reliable execution also needs |
+|----------------------|------------------------------------|
+| A plausible diff | **Verification** that the change actually builds and renders — ground truth, not the model's say-so |
+| A single-shot answer | **Memory** that persists project state across turns and runs |
+| Raw tool-call intent | A **sandbox chokepoint** so every file write and shell command is validated and bounded |
+| An opaque "done" | **Observable artifacts** — task card, plan, event log, result, screenshots, diff — you can replay |
+| Confident hallucination | **Bounded repair loops** and a **recovery** assessor that catch and correct failure |
+| Eagerness to act | **Permission gates** so nothing pushes code, mutates external systems, or runs destructive commands without explicit approval |
+| A code change | **Delivery** — checkpoint, reviewed diff, commit, branch, push, and PR, with full run↔commit↔PR traceability |
+
+Agent OS is an attempt to build that harness end-to-end, with the boundaries and audit trail treated as constitutional rather than optional.
+
+---
+
+## Architecture overview
+
+```
+┌────────────┐   /api   ┌──────────────────┐        ┌─────────────────────────────┐
+│  Frontend  │ ←──────→ │  FastAPI backend │ ←────→ │  Provider Registry          │
+│  React/TS  │          │   (main.py)      │        │  Claude · GPT · Gemini ·    │
+└────────────┘          └────────┬─────────┘        │  DeepSeek · Kimi · GLM      │
+                                 │                  └─────────────────────────────┘
+        ┌────────────────────────┼────────────────────────────┐
+        ▼                        ▼                            ▼
+   memory/                projects/{id}/          execution_workspaces/{id}/
+   (global .md)           (project .md)           ├─ repo/    ← Coding Agent's sandbox
+        │                       │                 ├─ runs/    ← per-run artifacts
+        └─── Main Agent ────────┘                 ├─ logs/  AGENT.md  TASK.md
+             (chat brain)                         └─ (runner + verify + preview + git)
+```
+
+The hero image at the top is the full system map. The moving parts — each covered in depth in [Core modules](#core-modules--capabilities) below — are:
+
+- **Project-scoped conversations** — isolated chat, memory, and workspace per project.
+- **Structured markdown memory** — durable state in editable `.md` files, policy-filtered on write.
+- **Provider registry** — six selectable model providers, each with vision metadata.
+- **Sandboxed execution** — the Coding Agent's planning → task-graph → execute loop.
+- **Verification & browser preview** — real build/test gating, a headless render capture, and a vision-model review.
+- **Run artifacts & traces** — every run replayable from committed evidence.
+- **Git/GitHub delivery** — audited checkpoint → diff → commit → push → PR, each behind a confirmation gate.
+
+The two boundaries below are the load-bearing ones.
+
+### Brain vs. hands — the central rule
+
+- **Main Agent = brain.** Holds the conversation, loads `SOUL.md` + global + project memory, assembles context, produces planning / explanation / review replies, decides delegation, and reconciles memory. **It never edits `repo/` code and never runs a shell command.** It can read specific repo files *on demand* through a bounded, read-only inspection channel (max 3 reads per turn) — but repo contents are **never auto-injected** into its context.
+- **Coding Agent = hands.** A bounded JSON tool loop inside exactly one project's `execution_workspaces/{id}/repo/`. It edits code through six sandboxed tools and produces run artifacts. **It never edits memory or touches another project's workspace.**
+
+They communicate through **summaries, not shared context** — a boundary that is load-bearing for the whole design.
+
+### The sandbox chokepoint
+
+Every repo path and every shell command routes through **one** boundary: `ProjectSandbox` → `ToolRuntime`. There is no raw `os` / `pathlib` / `subprocess` access to repo paths anywhere else. The Coding Agent gets exactly six tools — `list_files`, `read_file`, `write_file`, `append_file`, `search_files`, `run_shell` — each with bounded output. Git is a separate audited executor (`ToolRuntime.run_git`), **not** an agent tool, and `run_shell` blocks `git push` and destructive Git.
+
+---
+
+## Core modules & capabilities
+
+Everything in this table is **implemented and tested** today.
+
+| Module | What it does |
+|--------|--------------|
+| **Project cockpit** | Three-column React UI (projects / chat / context + runs). Project- and conversation-scoped chat, editable memory files, a live Runs panel, and a multi-modal composer (multiline input, voice dictation, file attachments). |
+| **Main Agent orchestration** | Context assembly from memory, an **intent router** (`@plan` / `@design` / `@debug` / `@review` / `@inspect` / `@memory` modes), a model-judged **delegation** classifier, and an on-demand bounded file-inspection loop. |
+| **Memory engine** | A single atomic, policy-filtered markdown write path. After each turn a structured **memory-intake** judge proposes updates; the backend validates them against a writable-file set before touching disk. `SOUL.md` is read-only and never written. |
+| **Provider Registry 2.0** | Capability-aware registry of six providers, each with a selectable model list, per-model `vision` flags, env-overridable defaults, and key-presence availability. Anthropic via SDK; the rest via OpenAI-compatible / REST `urllib` calls — **no extra SDK dependencies**. |
+| **Coding Agent runner** | A phased run: **plan** (read-only inspection → task graph) → **execute** (task-by-task in topological order) → **finalize**. Records per-task status / files / commands / blockers; metrics climb **live** during the run. |
+| **ToolRuntime / Sandbox** | The six sandboxed file/shell tools + `ProjectSandbox` path and command validation — the one boundary all execution passes through. |
+| **Command verification** | Infers the right checks from the repo (`npm run build`, `pytest` *iff* importable, else a `compileall` syntax check) or honors a manual `## Verification` block, runs them, and on failure gives the agent a **bounded iterative repair loop** (up to 5 passes) that re-reads the erroring files and re-verifies. A run is `completed` only after verification passes. |
+| **Browser verification + visual review** | Spins up the dev server, **waits for a genuine render** (not a loading spinner), captures the entry page plus a few discovered views via headless Playwright, then has a **vision model review** the screenshots (`passed` / `warning` / `failed` / `inconclusive`). Diagnostic-only — it never gates run status — and skips gracefully without a vision-capable model. |
+| **Run trace / observability** | Every run emits `task_card.md`, `plan.json`, `events.jsonl`, `run.json`, `result.md`, `diff.patch`, and screenshots. The UI shows a **live phase badge + task checklist**, a settled **timeline**, and a granular **Live Trace** (every file op and command, polled; chain-of-thought dropped). |
+| **Recovery / retry / cancel** | Runs can be **cancelled** cooperatively and **retried** as a fresh linked run. A non-green run gets a best-effort **recovery assessment** → one bounded, confirmable next step. With explicit user approval, a bounded **auto-recovery budget** (≤ 2) lets a run self-heal — capped, linked, and fully audited. |
+| **Project Ops & GitHub delivery** | Automatic pre-run **checkpoint** + redacted post-run **diff**, then explicit two-phase **commit / push / PR / rollback** contracts. GitHub tokens reach git only via a push-time `GIT_ASKPASS` env — never in argv, `.git/config`, commits, logs, memory, or the UI. |
+
+---
+
+## The run lifecycle: build → verify → preview → deliver
+
+A single natural-language task card flows through a phased, auditable pipeline. Each stage leaves a durable artifact, and each external/destructive stage is gated behind explicit approval.
+
+```mermaid
+flowchart LR
+    A([Task card]) --> B[Plan<br/>task graph]
+    B --> C[Execute<br/>task-by-task]
+    C --> D[Command verify<br/>+ iterative repair]
+    D --> E[Browser verify<br/>multi-page capture]
+    E --> F[AI visual review<br/>diagnostic]
+    F --> G[Memory<br/>reconcile]
+    G --> H[Recovery<br/>assess]
+    H --> I{{Git delivery<br/>checkpoint, diff, commit, push, PR}}
+    style I fill:#2f6f4e,color:#fff
+```
+
+- **Best-effort tail.** Verification, browser checks, reconciliation, checkpoint, and diff capture **never crash finalization** and never leave a run stuck in `running`.
+- **Explicit dispatch only.** Only `@code <task>` or confirming a model-proposed plan starts a run. Inferred intent never auto-runs code; the one scoped exception is a bounded auto-recovery the user pre-authorized at confirm time.
+- **Verification is the ground truth for "done."** A run is `completed` only after a real build/test passes — not because the model claimed success.
+
+---
 
 ## Showcase: a full-stack app Agent OS built by itself
 
-[**Aegis Launch Control**](./execution_workspaces/aegis-launch-control/SHOWCASE.md)
-is a mission-control planning dashboard (**React + TypeScript + Vite + Tailwind**
-front end + a lightweight **Express** API) that the Agent OS Coding Agent built
-**autonomously, from an empty repository**, in response to a single
-natural-language task card. No human wrote any of the app code or fixed its
-build. Agent OS planned the work into an **8-task dependency graph**, executed it
-task-by-task, and verified the result with a real `npm install` + `npm run build`
-(passed). All 8 tasks completed with zero blockers.
+[**Aegis Launch Control**](./execution_workspaces/aegis-launch-control/SHOWCASE.md) is a mission-control planning dashboard — **React + TypeScript + Vite + Tailwind** front end plus a lightweight **Express** API — that the Agent OS Coding Agent built **autonomously, from an empty repository**, in response to a single natural-language task card. No human wrote any of the app code or fixed its build.
 
-[![Aegis Launch Control dashboard](./execution_workspaces/aegis-launch-control/runs/20260619-044436-e65d2e61/screenshots/browser.png)](./execution_workspaces/aegis-launch-control/SHOWCASE.md)
+[![Aegis Launch Control dashboard, captured by Agent OS browser verification](./execution_workspaces/aegis-launch-control/runs/20260619-044436-e65d2e61/screenshots/browser.png)](./execution_workspaces/aegis-launch-control/SHOWCASE.md)
 
-Notably, this run was driven by **Claude Sonnet 4.5** — a mid-tier model, not
-the strongest available — so it's a useful *lower bound* on what the system can
-produce.
+Agent OS **planned** the card into an **8-task dependency graph**, **executed** it task-by-task, **verified** it with a real `npm install` + `npm run build` (passed, after a bounded iterative repair loop), and **browser-verified** the running app — waiting for a genuine render, walking its main views, then having a **diagnostic-only** vision-model review rate the captures `passed`. Outcome: **8 / 8 tasks completed, 0 blockers, production build green.**
 
-The screenshot above is **Agent OS's own automated browser-verification capture**
-of the running app — the upgraded verification waits for the app to actually
-render, walks its tabs, and an AI visual judgment confirmed the result looks
-correct. The full generated source plus the complete run evidence — the task
-card, the plan, a chronological log of every tool call, the build log, and the
-multi-page browser-verification captures + visual-review verdict — are committed
-under
-[`execution_workspaces/aegis-launch-control/`](./execution_workspaces/aegis-launch-control/)
-as a public, replayable example. See its
-[SHOWCASE.md](./execution_workspaces/aegis-launch-control/SHOWCASE.md) for the
-details. Every other project and workspace stays private.
+The screenshot above is **Agent OS's own automated browser-verification capture** of the running app. This run used **Claude Sonnet 4.5** — a mid-tier model rather than the strongest available — as one concrete example, not a best case. The full generated source plus the complete, replayable run evidence (task card, plan, every tool call, the build log, the multi-page captures, and the visual-review verdict) are committed under [`execution_workspaces/aegis-launch-control/`](./execution_workspaces/aegis-launch-control/). Every other project and workspace stays private.
 
-## Why this exists
+---
 
-Existing tools each solve a piece of the workflow but not the whole loop:
+## Key technical decisions
 
-- **ChatGPT** is great for discussion and planning but can't operate
-  local code or persist project-shaped memory.
-- **Claude Code** is great at executing inside a repo but isn't ideal
-  as the long-term *conversation surface* for a project.
-- **General agent platforms** are too broad and not optimized for a
-  multi-project workflow.
+| Decision | Why |
+|----------|-----|
+| **Local-first over cloud-first** | Filesystem + SQLite + FastAPI + React. ThreadPoolExecutor over Celery, SQLite over Postgres, polling over SSE — until a concrete need justifies heavier infra. Everything is inspectable on disk. |
+| **Markdown memory over hidden chat history** | Knowledge worth keeping lives in named `.md` files with stable sections — human-readable and editable — not in an opaque conversation buffer. Writes are model-proposed but **policy-filtered** before they touch disk. |
+| **Explicit delegation over auto-run** | Only `@code` or confirming a proposed plan dispatches a run; inferred coding intent is surfaced as a *confirmable* plan. The sole exception is a per-run auto-recovery budget the user approves in advance. |
+| **One sandbox chokepoint for tools** | A single `ProjectSandbox` → `ToolRuntime` boundary validates every path and command. No parallel raw-shell escape hatch anywhere in the codebase. |
+| **Human approval gates for external/destructive actions** | Push, PR, and rollback are **External Action Contracts**: a dry-run preview you confirm before anything leaves the machine or mutates history. |
+| **Traceable artifacts over black-box execution** | Every run is replayable from its committed artifacts. The Main Agent sees compact summaries; full repo contents are read only on demand. |
+| **Verification as the ground truth for completion** | A run reaches `completed` only after a real build/test passes — the model cannot mark its own homework. |
 
-Agent OS combines the parts that matter for project work:
-ChatGPT-like conversation per project + Claude Code-like execution
-power on demand + readable local memory files. It stays lightweight
-on purpose.
+---
 
-## Current status
+## Verification & safety
 
-**Phase 1 & 2** (workspace + memory + orchestration + semantic
-writeback) are complete. **Phase 3 — Execution Layer** is complete
-through **Task 06.2E** (automatic command verification + bounded repair).
-The Coding Agent runs sandboxed jobs in the background, the runs panel
-auto-refreshes, inferred coding intent is surfaced as a confirmable
-plan, terminal runs reconcile back into project memory, the main
-agent can inspect specific repo files on demand through a bounded
-sandboxed channel, and post-run verification now covers both a
-project-defined verify command (06.2A) and an opt-in headless-browser
-screenshot of a project-managed dev server (06.2B). The whole
-build-and-preview loop now lives in the chat thread (06.2D): a run
-posts a natural "running" note, then a completion summary with a
-**Run browser verification** button; clicking it installs dependencies,
-starts the dev server on port 5174, **waits for the app to actually
-render** (not just a loading spinner), captures screenshots of the entry
-page **plus a few discovered views/tabs**, and — when a vision-capable
-model key is set — runs an **AI visual judgment** that returns a
-`passed`/`warning`/`failed`/`inconclusive` verdict over the screenshots
-(diagnostic-only; it never changes the run status, and skips gracefully
-with no key). It returns a live preview URL + a multi-page thumbnail
-gallery inline, and keeps the dev server alive so the URL stays usable. The Runs panel gained **Start / Stop preview**
-controls; the run detail modal is now a detailed inspection view.
-Command verification is now **automatic** (06.2E): Agent OS infers the
-right checks from the repo (`npm run build`, `pytest`, or a syntax
-check), gives the Coding Agent one bounded repair pass if they fail, and
-marks a run `completed` only after they pass — then offers browser
-verification in chat.
+Reliability and safety are enforced by the harness, not requested of the model:
 
-**Phase 5 — Execution Orchestration** adds a planning stage and a
-structured task graph. A complex task is first inspected (read-only) and
-broken into an ordered set of task units with dependencies, persisted as a
-`plan.json` artifact; the runner then executes them task-by-task, recording
-per-task status / files / commands / blockers and richer run events. Simple
-tasks still take the original single-loop path, and verification, browser
-verification, preview, and memory reconciliation are unchanged. That structured
-data is now **visible and controllable**: the chat run card shows a live phase
-badge and task checklist, files/commands counts climb **live** during a run, a
-dedicated **Live Trace** modal streams the full chronological activity thread
-(opened from the chat card, the Runs panel, or the detail modal), the detail
-modal renders a polled timeline that **settles** completed steps (no stale
-"running" rows), and runs can be **cancelled** (cooperatively, ending in a clean
-`cancelled` state) or **retried** as a new linked run.
+- **Command verification + bounded repair.** Inferred or manually-declared checks gate completion; failures trigger a capped, **iterative repair loop** (up to 5 passes) that pre-reads the erroring files and re-verifies until green or the cap is hit.
+- **Browser verification.** A render-readiness-gated, multi-page headless Playwright capture of the actually-running app — never a loading spinner.
+- **AI visual review.** A vision-model verdict over the screenshots, **diagnostic-only** (it never changes a run's status) and skipped gracefully when no vision-capable model is configured.
+- **Bounded tool loops.** Step caps on planning, execution, and repair; `run_shell` is blocked during repair so the agent fixes code instead of re-running the build.
+- **Sandbox rules.** All repo access and shell commands flow through one validated boundary; destructive shell commands and destructive Git are blocked unless explicitly gated.
+- **Credential redaction.** A single credential reader; tokens reach git only via a generated `GIT_ASKPASS` env at push time, and never appear in argv, `.git/config`, commits, logs, events, memory, prompts, or the UI.
+- **Git gating + human-in-the-loop delivery.** Commit refuses secret-looking files; push, PR, and rollback are explicit two-phase contracts. There is no inferred-intent Git path and no Git auto-dispatch.
 
-**Phase 4 — Interface & UX** has begun with **Task 07.0**: a modern
-multi-modal chat composer — auto-growing multiline input (`Enter` for a
-newline, `Ctrl`/`Cmd`+`Enter` to send), voice dictation via the Web Speech
-API, and file attachments (images, `.txt`/`.md`/`.pdf`/`.doc`/`.docx`) that
-can be attached to the chat message and optionally copied into the project's
-sandboxed workspace. **Task 07.1** added pluggable **model providers**, since upgraded to a
-capability-aware **provider/model registry**: six providers — Claude, GPT,
-Gemini, DeepSeek, **Kimi (Moonshot)**, and **Zhipu GLM** — each exposing a
-selectable list of current models. The provider is chosen from the chat header
-and the specific model from a compact upward-opening picker next to the
-composer; a provider is available when its API key is set (missing-key ones show
-disabled), and Claude stays the default. Each model carries **capability
-metadata** (notably image input), so chat image upload is offered only for
-vision-capable models and the AI browser visual judgment runs only when a
-vision-capable model is available — skipping gracefully otherwise.
-**Task 07.2** added a light color theme alongside the original dark one,
-switchable from a dropdown top-right in the chat header and remembered
-across reloads.
+**Test coverage:** **480+ backend tests** across 35 files, each runnable standalone. Every test **stubs the LLM caller**, so the full suite runs with no API key. Frontend `npm run build` (tsc + vite) is green.
 
-**Phase 6 — Main Agent Orchestration & Memory v2** strengthens the main agent
-itself. Memory writes now flow through one atomic, policy-filtered engine, and
-each chat turn makes a single **structured memory-intake decision** that carries
-a reason (surfaced as a "🧠 Memory updated" chip). Routing is richer: an
-`intent` label plus new explicit commands — `@plan`, `@design`, `@debug`,
-`@review`, `@inspect`, `@memory` — shape the response (only `@code` and
-confirming a plan ever dispatch a run). And when a run comes back partial,
-failed, blocked, or fails verification, the main agent **assesses it and proposes
-a bounded next step** ("Run suggested fix") that you confirm with one click —
-never auto-run. Run cards now also show whether project memory was reconciled.
+---
 
-**Phase 6.1** polishes this: the recovery assessment now shows in the run detail
-modal too; the "Memory updated" chip expands to show exactly which file ›
-section changed; long project memory is compacted for the agent's context as it
-grows; and when you confirm a plan you can optionally approve a **bounded
-auto-recovery budget** (none / 1 / 2) so a non-green run can fix itself once or
-twice — capped, linked, and fully audited — without giving up explicit-dispatch
-safety.
-
-**Phase 7 — Project Ops & GitHub Lifecycle** makes a finished run a traceable,
-user-approved delivery: a pre-run **checkpoint** and a redacted post-run **diff**
-are captured automatically, then you **review the diff, commit, push a branch, and
-open a GitHub PR** — each external/destructive step shown as a contract you confirm
-before it runs, and roll back to the checkpoint anytime. Git is an audited delivery
-outlet routed through one sandboxed executor, never raw shell; GitHub tokens live in
-a gitignored store and reach git only at push time — never in commits, logs, memory,
-prompts, or the UI.
-
-Full task log and the next-step plan are in [`ROADMAP.md`](./ROADMAP.md).
-
-## Architecture
-
-```
-┌────────────┐    ┌────────────────┐    ┌────────────────┐
-│  Frontend  │ ←→ │  FastAPI       │ ←→ │  Anthropic API │
-│  (React)   │    │  /api/*        │    │  (Claude)      │
-└────────────┘    └────────────────┘    └────────────────┘
-                         │
-        ┌────────────────┼────────────────────────┐
-        │                │                        │
-        ▼                ▼                        ▼
-   memory/         projects/{id}/        execution_workspaces/{id}/
-   (global .md)    (project .md)         ├─ repo/    ← Coding Agent
-                                         ├─ runs/    ← per-run artifacts
-                                         ├─ logs/
-                                         ├─ AGENT.md
-                                         └─ TASK.md
-```
-
-- **Frontend** — React + Vite + TypeScript. Three-column layout
-  (project list / chat / context + runs).
-- **Backend orchestrator** — Python + FastAPI. `orchestrator.py`
-  assembles context from memory; `llm.py` wraps the Anthropic SDK;
-  memory writeback is a second LLM call gated by a policy filter.
-- **Memory layer** — pure markdown files on disk. Global memory in
-  `memory/`; project memory in `projects/{id}/`.
-- **Execution layer** — `backend/execution/` contains the sandbox,
-  tool runtime, runner, background dispatch manager, run store,
-  delegation judge, pending-execution flow, memory reconciliation,
-  on-demand file inspection, and the confirmable **recovery** assessor.
-
-## Design philosophy
-
-- **Brain vs. hands.** The main agent plans and remembers; the Coding
-  Agent executes. They communicate through summaries, not by sharing
-  context. This is the single most important architectural rule.
-- **Memory as a structured context layer.** Knowledge worth remembering
-  belongs in named markdown files with stable sections, not in hidden
-  conversation buffers. Memory writes are model-proposed but
-  policy-filtered before they touch disk.
-- **Local-first trusted execution.** Everything that runs runs on the
-  user's machine, in a project-scoped sandbox, surfaced through a UI
-  the user can read and refresh. No cloud queues, no opaque background
-  workers, no implicit cross-project access.
-- **Explicit trust boundary before automation.** `@code` and explicit
-  user confirmation of a model-proposed plan are the only two paths
-  that dispatch a run.
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 - Python 3.10+
 - Node.js 18+
-- An Anthropic API key
+- At least one provider API key
 
 ### Backend
 ```bash
@@ -250,7 +216,20 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:5173>.
+Open <http://localhost:5173>. (Verified preview apps use port **5174** so they never collide with Agent OS itself.)
+
+### Running the tests
+```bash
+cd backend
+# Each test file is runnable standalone; all stub the LLM, so no API key is needed:
+python tests/test_runner_planning.py
+python tests/test_verification.py
+python tests/test_browser_verification.py
+python tests/test_git_endpoints.py
+# …and the rest under backend/tests/ (full coverage table in ROADMAP.md)
+```
+
+---
 
 ## Repository layout
 
@@ -260,42 +239,74 @@ agent-os/
 ├── backend/               # Python + FastAPI
 │   ├── main.py            # API endpoints
 │   ├── orchestrator.py    # context assembly + memory judge + inspect loop
-│   ├── llm.py             # Anthropic SDK wrapper
+│   ├── llm.py             # LLM entry point (chat + vision) → providers.py
+│   ├── providers.py       # Provider Registry 2.0 (six providers, model + vision metadata)
+│   ├── memory_engine.py   # the single atomic markdown memory write path
+│   ├── credentials.py     # the only secret reader (GitHub tokens)
 │   ├── database.py        # SQLite (conversations + messages + pending exec)
-│   ├── execution/         # sandbox, runner, judges, reconciliation, inspect
-│   └── tests/             # backend test suite (stubbed LLM, no API key needed)
-├── memory/                # global markdown memory  (private; ships SOUL.md + *.example.md templates + README)
-├── projects/              # per-project markdown memory  (private; ships *.example.md templates + README)
-├── execution_workspaces/  # Coding Agent workspaces  (private; ships *.example.md templates + README)
-├── README.md              # this file (public landing page)
-├── ROADMAP.md             # detailed status + task log + next steps
+│   ├── execution/         # sandbox, runner, planner, verification, browser, git, recovery
+│   └── tests/             # 480+ backend tests (LLM stubbed, no API key needed)
+├── memory/                # global markdown memory  (private; ships SOUL.md + *.example.md + README)
+├── projects/              # per-project markdown memory  (private; ships *.example.md + README)
+├── execution_workspaces/  # Coding Agent workspaces  (private; ships the Aegis showcase + templates)
+├── README.md              # this file
 ├── ARCHITECTURE.md        # system shape: files, pipelines, invariants
+├── ROADMAP.md             # detailed status + task log + next steps
+├── BLUEPRINT.md           # long-term product & architecture direction
 └── CLAUDE.md              # stable operating guide for coding agents
 ```
 
-## Running the tests
+---
 
-```bash
-cd backend
-python tests/test_delegation_judge.py
-python tests/test_pending_execution.py
-python tests/test_pending_execution_db.py
-python tests/test_memory_reconciliation.py
-python tests/test_inspect.py
-python tests/test_verification.py
-python tests/test_verification_inference.py
-python tests/test_browser_verification.py
-python tests/test_runner_diagnostics.py
-python tests/test_uploads.py
-python tests/test_providers.py
-python tests/test_planner.py
-python tests/test_runner_planning.py
-python tests/test_run_control.py
-python tests/test_memory_engine.py
-python tests/test_memory_intake.py
-python tests/test_intent_router.py
-python tests/test_recovery.py
-```
+## Roadmap
 
-All tests stub the LLM caller, so no Anthropic API key is needed to
-run them.
+**Delivered — Phases 1 → 7:**
+
+| Phase | Theme | Status |
+|------:|-------|:------:|
+| 1–2 | Workspace, markdown memory, LLM orchestration + semantic writeback | ✅ |
+| 3 | Execution layer — sandbox, runner, delegation, command + browser verification | ✅ |
+| 4 | Interface & UX — multi-modal composer, Provider Registry 2.0, themes | ✅ |
+| 5 | Execution orchestration — plan → task graph → execute, live trace, run control | ✅ |
+| 6 / 6.1 | Main Agent v2 — memory engine, intent router, confirmable recovery + budget | ✅ |
+| 7 | Project Ops — Git/GitHub lifecycle (checkpoint, diff, commit, push, PR, rollback) | ✅ |
+
+**Planned — the long-term blueprint** (direction, not yet built; see [`BLUEPRINT.md`](./BLUEPRINT.md)):
+
+| Phase | Direction |
+|------:|-----------|
+| 8 | **Deployment & real backend connectors** — Vercel / Supabase / Stripe test-mode golden path, env/secret registry, deployment contracts |
+| 9 | **Agent Teams** — role registry, parallel read-only agents, isolated patch workspaces, an integration/merge agent, a global verification gate |
+| 10 | **Research / RAG / Skills** — bounded local project + repo + run indexes, user-approved URL/web reading, a reusable skills registry |
+| 11 | **Evaluation & reliability loops** — a typed recovery matrix, visual-repair loop, failure-pattern memory, run-health dashboard |
+| 12 | **Launch / Growth Studio** — architecture diagrams, demo scripts, release notes, and launch-kit generation from run artifacts |
+
+The ordering is deliberate: Project Ops before Agent Teams (parallel agents need branches and merge review) and before deployment (production changes need traceable commits).
+
+---
+
+## Why this is relevant to the Agent Harness direction
+
+A widely-discussed framing for agent harnesses — and, as I understand it, the direction DeepSeek's Agent Harness work emphasizes — is simply **`Model + Harness = Agent`**: once a foundation model can generate code, what runtime, memory, tool, verification, orchestration, and delivery system turns that capability into *reliably completed* software tasks?
+
+Agent OS is my attempt to answer that question by building the harness, end-to-end:
+
+- a **runtime** that plans, executes, and finalizes bounded tool loops;
+- a **memory** layer that gives the model durable, structured project context;
+- a **tool + sandbox** layer that makes every action validated and bounded;
+- a **verification** layer that treats a real build and a rendered screenshot as the ground truth for "done";
+- an **observability** layer that makes every run replayable from artifacts;
+- a **recovery** layer that catches and bounds failure; and
+- a **delivery** layer that ships work through audited, human-approved Git/GitHub contracts.
+
+The harness is also **provider-selectable at the chat layer**: any registered provider can drive the main conversation, and **DeepSeek is already a selectable provider** in the registry alongside Claude, GPT, Gemini, Kimi, and GLM (Claude remains the default for internal subsystems). The harness is exactly the layer that sits between a model's raw capability and dependable real-world execution.
+
+*This section positions Agent OS against a publicly-discussed industry direction; it is not affiliated with or endorsed by DeepSeek.*
+
+---
+
+<div align="center">
+
+**Agent OS** · local-first · auditable · multi-provider · `Model + Harness = Agent`
+
+</div>
