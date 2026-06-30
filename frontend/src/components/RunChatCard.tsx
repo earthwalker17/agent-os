@@ -3,6 +3,7 @@ import type { RunRecord } from '../types'
 import GitOpsPanel from './GitOpsPanel'
 import DeployOpsPanel from './DeployOpsPanel'
 import MigrationPanel from './MigrationPanel'
+import StripePanel from './StripePanel'
 
 interface Props {
   projectId: string
@@ -650,6 +651,11 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
             onRunsChanged?.()
           }}
         />
+      )}
+
+      {/* --- Phase 8: Stripe test-mode payments --- */}
+      {isTerminal && status !== 'cancelled' && (
+        <StripePanel projectId={projectId} record={record} compact />
       )}
 
       {verifyError && <div className="run-chat-error">{verifyError}</div>}

@@ -140,6 +140,7 @@ conversations, messages, and pending executions.
 | `vercel_connector.py`      | **Phase 8** — Vercel REST-over-`urllib` (no CLI for deploy/redeploy/rollback/env): `status` (whoami), `create_deployment` (gitSource), `get_deployment` (poll `readyState`), `list_deployments`, `promote_deployment` (rollback), `set_env_var`. Token in the `Authorization` header ONLY; every returned string `credentials.redact`-ed with `project_id`; `normalize_url` strips a protection-bypass query; never auto-creates a project. |
 | `ops_ledger.py`            | **Phase 8** — the ONE writer of `projects/{id}/OPS.md` (`append_ops_entry`): deterministic, ids/URLs/key-NAMES only, redacted at the call site, idempotent on a `dedup_key`; also appends a redacted line to `execution_workspaces/{id}/ops/events.jsonl`. OPS.md is scaffolded but excluded from every LLM-judge writable set. |
 | `supabase_connector.py`    | **Phase 8** — Supabase: Management REST (`status`, Bearer `sbp_`) + sandboxed CLI (`link` / `migration_preview` = `db push --dry-run`, Docker-optional / `migration_diff` = best-effort Docker-gated / `migration_apply` = `db push --linked`, `allow_destructive`). Secrets ride `run_supabase` `env_extra` only; the connector **redacts CLI stdout/stderr before any artifact** (H7); Docker-not-running → a clear blocker. |
+| `stripe_connector.py`      | **Phase 8** — Stripe test-mode: REST over urllib but **form-encoded** (`x-www-form-urlencoded` + bracket notation; NOT JSON) with an `Idempotency-Key` on creates. **Per-request test gate** (non-`*_test_` key / `livemode:true` response refused). `provision_price` (Product+Price → `price_id`), `register_webhook` (GET-then-create; the returned `whsec_` is stored via `credentials` + **never** echoed), `delete_webhook`, `status`, `local_webhook_command`. The built app's checkout-session-create + signature-verify are app-runtime (reads its own `process.env`). |
 
 `tests/` mirrors these per feature; all stub `llm.chat` so no API key is needed.
 
@@ -167,6 +168,7 @@ conversations, messages, and pending executions.
 | `components/ExternalActionPanel.tsx` (08) | Generic two-phase External-Action contract preview block (external/destructive/TEST tags + confirm gate); shared driver for the deploy panel. |
 | `components/DeployOpsPanel.tsx` (08) | Production Path controls in the run chat card — deploy / redeploy / rollback contracts (preview→confirm), last-deploy URL/state badges, polls while a deploy is in flight. |
 | `components/MigrationPanel.tsx` (08) | Supabase controls in the run chat card — link + apply-migrations contracts (preview shows the `db push --dry-run` pending list + best-effort SQL diff; confirm applies to the linked DB). |
+| `components/StripePanel.tsx` (08) | Stripe TEST-mode controls in the run chat card — provision a test Product+Price (→ `price_id`), register the deployed webhook endpoint (signing secret stored, never shown), and the `stripe listen` local-test command. |
 
 ---
 
@@ -348,8 +350,15 @@ off-thread (`BackgroundRunManager.submit` polls Vercel to `READY`) → stamps
 `deployment_url`/`id`/`target`, writes `deployment.json` + redacted `deploy.log`,
 re-renders `result.md`, and appends a redacted `OPS.md` ledger entry. Secrets
 reach Vercel only via the `Authorization` header / an env push value read once at
-action time — never a contract / event / log / artifact / the UI. (Stripe +
-Supabase connectors are designed but land in later increments.)
+action time — never a contract / event / log / artifact / the UI. **Supabase**
+(`supabase_connector` + `run_supabase`) adds migration/link contracts (the apply
+is `db push --linked`, destructive, confirmed); **Stripe** (`stripe_connector`,
+form-encoded + test-gated) adds checkout-provision + webhook-register contracts.
+The minimal golden path — connect → build → verify → commit → push → deploy →
+migrate → test checkout/webhook — is code-complete. **Startup reconciliation
+(8.7):** `reconcile_stuck_external_actions` clears a transient `deploy_state`/
+`external_state` left by a crash, querying the provider for the true state and
+recording a "verify remote state" blocker rather than auto-retrying.
 
 ## 8. Core data model — `RunRecord` (serialized as `run.json`)
 

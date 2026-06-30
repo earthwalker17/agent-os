@@ -76,7 +76,7 @@ from execution.visual_judge import run_visual_review
 from execution import preview
 from execution import git_ops, github_connector
 from execution import app_env
-from execution import vercel_connector, ops_ledger, supabase_connector
+from execution import vercel_connector, ops_ledger, supabase_connector, stripe_connector
 from execution.inspect import (
     list_repo_files,
     read_repo_file,
@@ -117,6 +117,17 @@ def startup():
             print(f"[startup] marked {len(swept)} stuck run(s) as failed: {swept}")
     except Exception as exc:  # noqa: BLE001
         print(f"[startup] sweep_stuck_runs failed: {type(exc).__name__}: {exc}")
+
+    # Phase 8 — reconcile runs left mid external action (deploy/migration) by a
+    # prior process: query the provider for the true state, then clear the transient
+    # sub-status. NEVER auto-retries an external action that may have partially
+    # applied — it records a "verify remote state" blocker instead. Best-effort.
+    try:
+        recon = reconcile_stuck_external_actions()
+        if recon:
+            print(f"[startup] reconciled {len(recon)} stuck external action(s): {recon}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] reconcile_stuck_external_actions failed: {type(exc).__name__}: {exc}")
 
     # Phase 6 — one-time additive migration: backfill the canonical memory
     # sections for projects created before the structured-memory upgrade so the
@@ -2288,6 +2299,60 @@ def _finalize_vercel_deploy(
         )
 
 
+def reconcile_stuck_external_actions() -> list[str]:
+    """At startup, fix runs left with a transient external sub-status
+    (``deploy_state`` / ``external_state``) by a process that died mid-action.
+
+    For a stuck DEPLOY with a known deployment id we query Vercel for the true
+    state and stamp the URL if it actually reached READY. Otherwise we clear the
+    transient and record a "verify remote state" blocker — we NEVER auto-retry an
+    external action that may have partially applied (consistent with "a crashed
+    run never auto-recovers"). Best-effort: a failure here never blocks startup.
+    """
+    fixed: list[str] = []
+    try:
+        projects = [d.name for d in PROJECTS_DIR.iterdir() if d.is_dir()] if PROJECTS_DIR.exists() else []
+    except Exception:  # noqa: BLE001
+        return fixed
+    for pid in projects:
+        try:
+            runs = run_store.list_runs(pid)
+        except Exception:  # noqa: BLE001
+            continue
+        for raw in runs:
+            if not (raw.get("deploy_state") or raw.get("external_state")):
+                continue
+            rid = raw.get("run_id")
+            rec = _read_record_safe(pid, rid) if rid else None
+            if rec is None:
+                continue
+            note: str | None = None
+            if rec.deploy_state and rec.deployment_id:
+                g = vercel_connector.get_deployment(pid, rec.deployment_id)
+                if g.ok and g.ready_state == "READY":
+                    rec.deployment_url = g.url or rec.deployment_url
+                    rec.deployment_target = rec.deployment_target or g.target
+                else:
+                    note = "deploy did not confirm READY before a restart — verify in the Vercel dashboard"
+            elif rec.deploy_state:
+                note = "a deploy was interrupted by a restart — verify in the Vercel dashboard before retrying"
+            elif rec.external_state:
+                note = (
+                    f"an external action ({rec.external_state}) was interrupted by a restart — it may have "
+                    "partially applied; verify the remote state before retrying"
+                )
+            rec.deploy_state = None
+            rec.external_state = None
+            if note and note not in rec.blockers:
+                rec.blockers = list(rec.blockers) + [note]
+            try:
+                run_store.write_run_json(pid, rid, rec)
+                fixed.append(rid)
+            except Exception:  # noqa: BLE001
+                pass
+    return fixed
+
+
 @app.get("/api/projects/{project_id}/vercel/status")
 def api_vercel_status(project_id: str):
     _require_project_or_general(project_id)
@@ -2602,6 +2667,134 @@ def api_supabase_migration(project_id: str, run_id: str, req: SupabaseMigrationR
         timestamp=_utc_stamp(),
     )
     return {"contract": contract, "applied": True, "run": record.model_dump()}
+
+
+# --- Production Path endpoints (Phase 8 — Stripe test-mode checkout + webhooks) ---
+# Provisioning (test Product/Price, deployed webhook endpoint) is contract-first;
+# the per-purchase checkout session + signature verification are app-runtime code
+# inside the BUILT app (which reads its own process.env, never credentials.py).
+# The test-mode gate lives at the connector per request (a live key / livemode
+# response is refused) — routes are always mounted (no import-time theater). The
+# returned whsec_ is stored + never echoed. GENERAL rejected for mutations.
+
+
+@app.get("/api/projects/{project_id}/stripe/status")
+def api_stripe_status(project_id: str):
+    _require_project_or_general(project_id)
+    return stripe_connector.status(project_id).to_dict()
+
+
+@app.get("/api/projects/{project_id}/stripe/webhook/local-command")
+def api_stripe_local_command(project_id: str):
+    _require_project_or_general(project_id)
+    port = 5174
+    try:
+        pv = preview.get_preview_status(project_id)
+        if isinstance(pv, dict) and pv.get("url"):
+            m = re.search(r":(\d+)", str(pv.get("url")))
+            if m:
+                port = int(m.group(1))
+    except Exception:  # noqa: BLE001
+        pass
+    return stripe_connector.local_webhook_command(port=port)
+
+
+class StripeCheckoutTestRequest(BaseModel):
+    name: str = "Phase 8 Test Product"
+    amount: int = 1000  # smallest currency unit (cents)
+    currency: str = "usd"
+    mode: str = "payment"  # payment | subscription
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/stripe/checkout-test")
+def api_stripe_checkout_test(project_id: str, req: StripeCheckoutTestRequest):
+    _require_project(project_id)
+    cred = credentials.status(project_id, "stripe")
+    contract = {
+        "action": "checkout_test",
+        "title": "Provision a Stripe test product + price",
+        "external": True,
+        "destructive": False,
+        "mode": "test",
+        "live_gate_passed": True,
+        "name": req.name,
+        "amount": req.amount,
+        "currency": req.currency,
+        "checkout_mode": req.mode,
+        "token_configured": cred["configured"],
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False}
+    if not cred["configured"]:
+        raise HTTPException(status_code=400, detail="no Stripe test key configured")
+    res = stripe_connector.provision_price(
+        project_id,
+        name=req.name,
+        unit_amount=req.amount,
+        currency=req.currency,
+        recurring_interval=("month" if req.mode == "subscription" else None),
+    )
+    if not res.ok:
+        raise HTTPException(status_code=502, detail=res.error or "provisioning failed")
+    ops_ledger.append_ops_entry(
+        project_id, "stripe", f"Stripe test price provisioned ({req.mode})",
+        {"product_id": res.product_id, "price_id": res.price_id, "mode": "test"},
+        timestamp=_utc_stamp(), dedup_key=res.price_id,
+    )
+    return {"contract": {**contract, "price_id": res.price_id, "product_id": res.product_id}, "applied": True}
+
+
+class StripeWebhookRegisterRequest(BaseModel):
+    url: str
+    enabled_events: list[str] | None = None
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/stripe/webhook/register")
+def api_stripe_webhook_register(project_id: str, req: StripeWebhookRegisterRequest):
+    _require_project(project_id)
+    cred = credentials.status(project_id, "stripe")
+    events = req.enabled_events or ["checkout.session.completed"]
+    contract = {
+        "action": "webhook_register",
+        "title": "Register a Stripe webhook endpoint",
+        "external": True,
+        "destructive": False,
+        "mode": "test",
+        "url": req.url,
+        "enabled_events": events,
+        "livemode": False,
+        "token_configured": cred["configured"],
+        "summary": "Registers the deployed endpoint; the returned signing secret is stored, never shown.",
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False}
+    if not cred["configured"]:
+        raise HTTPException(status_code=400, detail="no Stripe test key configured")
+    if not (req.url or "").startswith("http"):
+        raise HTTPException(status_code=400, detail="a public https endpoint URL is required")
+    res = stripe_connector.register_webhook(project_id, req.url, events)
+    if not res.ok:
+        raise HTTPException(status_code=502, detail=res.error or "webhook registration failed")
+    ops_ledger.append_ops_entry(
+        project_id, "webhook", "Stripe webhook registered (test)",
+        {"endpoint_id": res.endpoint_id, "url": res.url, "events": ",".join(res.events or [])},
+        timestamp=_utc_stamp(), dedup_key=res.endpoint_id,
+    )
+    # endpoint id + secret_stored only — whsec_ is never returned
+    return {"contract": {**contract, "endpoint_id": res.endpoint_id, "secret_stored": res.secret_stored}, "applied": True}
+
+
+@app.delete("/api/projects/{project_id}/stripe/webhook/{endpoint_id}")
+def api_stripe_webhook_delete(project_id: str, endpoint_id: str):
+    _require_project(project_id)
+    res = stripe_connector.delete_webhook(project_id, endpoint_id)
+    if not res.ok:
+        raise HTTPException(status_code=502, detail=res.error or "delete failed")
+    return {"deleted": True, "endpoint_id": endpoint_id}
 
 
 # --- Main-agent file inspection endpoints (Task 06.1) ---

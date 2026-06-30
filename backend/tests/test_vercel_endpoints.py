@@ -243,6 +243,48 @@ def test_env_set_contract_hides_value():
     _run(body)
 
 
+# ---------- 8.7 startup reconciliation of crashed external actions ----------
+
+
+def test_reconcile_stuck_deploy_confirms_ready():
+    def body(env):
+        env.make_project("p")
+        rec = RunRecord(
+            run_id="run-1", project_id="p", task_title="t", status=RunStatus.COMPLETED,
+            deploy_state="deploying", external_state="deploying", deployment_id="dpl_x",
+        )
+        run_store.init_run_dir("p", "run-1")
+        run_store.write_run_json("p", "run-1", rec)
+        env.patch_vc(get_deployment=lambda *a, **k: vc.DeploymentResult(
+            ok=True, deployment_id="dpl_x", url="https://app.vercel.app", ready_state="READY"))
+        fixed = main.reconcile_stuck_external_actions()
+        assert "run-1" in fixed
+        raw = run_store.read_run_json("p", "run-1")
+        assert raw["deploy_state"] is None and raw["external_state"] is None
+        assert raw["deployment_url"] == "https://app.vercel.app"
+        assert not raw["blockers"]  # confirmed READY, no blocker
+
+    _run(body)
+
+
+def test_reconcile_stuck_migration_adds_verify_blocker():
+    def body(env):
+        env.make_project("p")
+        rec = RunRecord(
+            run_id="run-2", project_id="p", task_title="t", status=RunStatus.COMPLETED,
+            external_state="migrating",
+        )
+        run_store.init_run_dir("p", "run-2")
+        run_store.write_run_json("p", "run-2", rec)
+        fixed = main.reconcile_stuck_external_actions()
+        assert "run-2" in fixed
+        raw = run_store.read_run_json("p", "run-2")
+        assert raw["external_state"] is None
+        assert any("partially applied" in b for b in raw["blockers"])
+
+    _run(body)
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

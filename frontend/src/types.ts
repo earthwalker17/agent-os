@@ -480,6 +480,17 @@ export interface ExternalActionContract {
   diff_available?: boolean
   docker_note?: string | null
   include_seed?: boolean
+  // stripe
+  name?: string
+  amount?: number
+  currency?: string
+  checkout_mode?: string
+  enabled_events?: string[]
+  price_id?: string
+  product_id?: string
+  endpoint_id?: string
+  secret_stored?: boolean
+  livemode?: boolean
 }
 
 /** Phase 8 — wrapper response from a two-phase external-action endpoint. */

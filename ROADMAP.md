@@ -400,11 +400,39 @@ toggles it off in the Vercel dashboard.
   `supabase/config.toml` / `supabase/.temp` / `.branches` and seeds them into the
   default `.gitignore`.
 
-**Designed, not yet built (subsequent increments):** Stripe connector
-(form-encoded REST + `Idempotency-Key`, per-request test-mode gate) +
-checkout-test/webhook contracts; crashed-external-action reconciliation at
-startup; the end-to-end "ships a minimal SaaS" harness. See `BLUEPRINT.md`
-Pillar 2 + the approved Phase 8 plan.
+**Third increment landed — "Stripe + reconciliation" (8.6–8.7):**
+- **Stripe connector** (`stripe_connector.py`): REST over urllib but
+  **form-encoded** (`application/x-www-form-urlencoded` + bracket notation —
+  Stripe is NOT JSON) with an **`Idempotency-Key`** on every create. **Test-mode
+  gate per request** at the executor boundary (a non-`sk_test_`/`rk_test_` key
+  and any `livemode:true` response are refused — no import-time route theater).
+  Provisions a test Product+Price (returns a `price_id`), registers a deployed
+  webhook endpoint (GET-then-create idempotent; the returned `whsec_` is **stored
+  via credentials and never echoed** into a contract/event/log), deletes a
+  webhook (rollback), and surfaces the `stripe listen` local-test command.
+  Routes: `stripe/status`, `stripe/checkout-test`, `stripe/webhook/register`,
+  `stripe/webhook/{id}` (delete), `stripe/webhook/local-command`.
+  `StripePanel.tsx` drives it (mandatory TEST badge). The per-purchase checkout
+  session + signature verification are app-runtime code in the BUILT app (reads
+  its own `process.env`, never `credentials.py`).
+- **Startup reconciliation (8.7):** `reconcile_stuck_external_actions()` runs in
+  `startup()` beside `sweep_stuck_runs` — for a run left mid-deploy it queries
+  Vercel for the true state and stamps the URL if it actually reached READY,
+  otherwise clears the transient `deploy_state`/`external_state` and records a
+  "verify remote state" blocker. It **never auto-retries** an external action
+  that may have partially applied (consistent with "a crashed run never
+  auto-recovers").
+
+**The minimal golden path is now code-complete** (connect → build → verify →
+commit → push → Vercel deploy → Supabase migrate → Stripe test checkout/webhook,
+every external step a preview→confirm contract, every secret leak-audited).
+
+**Next session — 8.8 ("ships a minimal SaaS" E2E + pressure-test).** Drive the
+full golden path live against real full-stack SaaS apps: DB-backed state +
+Supabase Auth/RLS + Stripe test checkout + a Vercel preview URL, webhook tested
+locally (`stripe listen`) AND against the deployed endpoint, deployment recorded
+in `OPS.md`, safe redeploy/rollback — then stress it on more apps to surface
+gaps. See `BLUEPRINT.md` Pillar 2 + the approved Phase 8 plan §7.
 
 ## Current Constraints
 
@@ -473,12 +501,13 @@ needed), and are each runnable standalone (`python tests/<file>.py`).
 | `test_git_context.py`             |     5 | 7.9 `_latest_git_state_context` summary-only + mode folding (review/debug) |
 | `test_app_env.py`                 |     5 | 8.2 app-env set/list/delete presence-only, single value reader, redaction |
 | `test_vercel_connector.py`        |    11 | 8.4 token-in-header-only, redacted errors, deploy(gitSource repoId)/get/list/promote/env, url normalize, unlinked-error |
-| `test_vercel_endpoints.py`        |     6 | 8.4 generic credential/connector/env routes, deploy preview→confirm→ledger, value-hidden |
+| `test_vercel_endpoints.py`        |     8 | 8.4 credential/connector/env routes, deploy preview→confirm→ledger; 8.7 stuck-action reconciliation |
 | `test_ops_ledger.py`              |     5 | 8.4 OPS.md ledger write + no-leak + idempotency + judge-write rejection |
 | `test_phase8_invariants.py`       |     2 | 8.x orchestrator imports no connector; OPS.md excluded from judge sets |
 | `test_sandbox_supabase.py`        |     4 | 8.5 validate_supabase allow-list + destructive-by-subcommand + scrubbed env |
 | `test_supabase_connector.py`      |     5 | 8.5 migration apply secrets-in-env/destructive, redaction, Docker-missing, status |
-| **Total**                         | **532** | (8.1 lifted `test_credentials` 8→16; 8.3 lifted `test_git_store` 7→12) |
+| `test_stripe_connector.py`        |     7 | 8.6 form-encoding+Idempotency-Key, test-mode/livemode gate, provision, webhook-secret-never-returned |
+| **Total**                         | **541** | (8.1 lifted `test_credentials` 8→16; 8.3 lifted `test_git_store` 7→12; 8.7 lifted `test_vercel_endpoints` 6→8) |
 
 Frontend: `npm run build` (tsc + vite) green.
 
