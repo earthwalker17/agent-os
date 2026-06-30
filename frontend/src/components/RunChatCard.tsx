@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RunRecord } from '../types'
 import GitOpsPanel from './GitOpsPanel'
 import DeployOpsPanel from './DeployOpsPanel'
+import MigrationPanel from './MigrationPanel'
 
 interface Props {
   projectId: string
@@ -626,6 +627,20 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
       {/* --- Phase 8: Production Path (deploy / redeploy / rollback) --- */}
       {isTerminal && status !== 'cancelled' && (
         <DeployOpsPanel
+          projectId={projectId}
+          runId={runId}
+          record={record}
+          compact
+          onRecordChange={(rec) => {
+            if (mounted.current) setRecord(rec)
+            onRunsChanged?.()
+          }}
+        />
+      )}
+
+      {/* --- Phase 8: Supabase migrations --- */}
+      {isTerminal && status !== 'cancelled' && (
+        <MigrationPanel
           projectId={projectId}
           runId={runId}
           record={record}

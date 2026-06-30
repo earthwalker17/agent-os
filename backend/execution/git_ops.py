@@ -190,6 +190,13 @@ def _looks_secret(path: str) -> bool:
         return True
     if low == ".env" or (low.startswith(".env") and not low.endswith(".example")):
         return True
+    # Phase 8 — the Supabase CLI persists linked-project state (and can persist
+    # secrets) under repo/supabase/{.temp,.branches,config.toml}; never stage them.
+    norm = path.replace("\\", "/").lower()
+    if "supabase/.temp/" in norm or "supabase/.branches/" in norm:
+        return True
+    if norm.endswith("supabase/config.toml"):
+        return True
     return False
 
 
@@ -235,6 +242,9 @@ __pycache__/
 *.p12
 id_rsa
 .netrc
+# Supabase CLI local state (may hold linked-project secrets)
+supabase/.temp/
+supabase/.branches/
 """
 
 

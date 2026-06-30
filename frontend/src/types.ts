@@ -440,7 +440,13 @@ export interface EnvVarEntry {
 export type EnvRegistry = EnvVarEntry[]
 
 /** Phase 8 — external-action kinds the generic contract panel drives. */
-export type ExternalActionKind = 'deploy' | 'redeploy' | 'rollback' | 'env_set'
+export type ExternalActionKind =
+  | 'deploy'
+  | 'redeploy'
+  | 'rollback'
+  | 'env_set'
+  | 'migration_apply'
+  | 'link_project'
 
 /** Phase 8 — an External Action Contract (preview on confirm:false). Superset of
  * the per-action fields; the panel reads only what each kind populates. */
@@ -468,6 +474,12 @@ export interface ExternalActionContract {
   type?: 'sensitive' | 'encrypted' | 'plain'
   value_configured?: boolean
   env_id?: string | null
+  // supabase migration / link
+  pending?: string
+  diff?: string | null
+  diff_available?: boolean
+  docker_note?: string | null
+  include_seed?: boolean
 }
 
 /** Phase 8 — wrapper response from a two-phase external-action endpoint. */

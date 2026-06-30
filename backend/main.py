@@ -76,7 +76,7 @@ from execution.visual_judge import run_visual_review
 from execution import preview
 from execution import git_ops, github_connector
 from execution import app_env
-from execution import vercel_connector, ops_ledger
+from execution import vercel_connector, ops_ledger, supabase_connector
 from execution.inspect import (
     list_repo_files,
     read_repo_file,
@@ -2488,6 +2488,120 @@ def api_vercel_env_set(project_id: str, req: VercelEnvSetRequest):
         timestamp=_utc_stamp(),
     )
     return {"contract": {**contract, "env_id": res.env_id}, "applied": True}
+
+
+# --- Production Path endpoints (Phase 8 — Supabase migrations / link / Auth) ---
+# Migrations route through the sandboxed ``run_supabase`` executor (never raw
+# subprocess); the access token + DB password reach it via env only. ``db push``
+# (apply) is the one destructive/external mutation — a two-phase contract whose
+# preview runs ``db push --dry-run`` (Docker-optional) + a best-effort ``db diff``
+# (Docker-gated). GENERAL is rejected; Auth provider config stays a manual
+# dashboard step for this pass (RLS ships as migration SQL).
+
+
+@app.get("/api/projects/{project_id}/supabase/status")
+def api_supabase_status(project_id: str):
+    _require_project_or_general(project_id)
+    return supabase_connector.status(project_id).to_dict()
+
+
+class SupabaseLinkRequest(BaseModel):
+    project_ref: str
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/supabase/link")
+def api_supabase_link(project_id: str, req: SupabaseLinkRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    ref = (req.project_ref or "").strip()
+    cred = credentials.status(project_id, "supabase")
+    contract = {
+        "action": "link_project",
+        "title": "Link Supabase project",
+        "external": True,
+        "destructive": False,
+        "target": ref,
+        "token_configured": cred["configured"],
+        "summary": "Binds this repo to the hosted Supabase project; the DB password is used via env (never shown).",
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False}
+    if not ref:
+        raise HTTPException(status_code=400, detail="project_ref is required")
+    if not cred["configured"]:
+        raise HTTPException(status_code=400, detail="no Supabase access token configured")
+    res = supabase_connector.link(project_id, ref)
+    if not res.ok:
+        if res.not_installed:
+            raise HTTPException(status_code=400, detail="supabase CLI not installed (npm i -g supabase)")
+        detail = "Docker is required but not running" if res.docker_missing else (res.error or "link failed")
+        raise HTTPException(status_code=502, detail=detail)
+    credentials.update_metadata("supabase", project_id, {"project_ref": ref})
+    ops_ledger.append_ops_entry(
+        project_id, "link", "Supabase project linked", {"project_ref": ref}, timestamp=_utc_stamp()
+    )
+    return {"contract": contract, "applied": True}
+
+
+class SupabaseMigrationRequest(BaseModel):
+    include_seed: bool = False
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/supabase/migration")
+def api_supabase_migration(project_id: str, run_id: str, req: SupabaseMigrationRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+    cred = credentials.status(project_id, "supabase")
+    ref = credentials.get_metadata("supabase", "project_ref", project_id)
+    # Preview: dry-run lists the pending migrations (Docker-optional); diff adds
+    # the exact SQL when Docker is available (best-effort).
+    preview = supabase_connector.migration_preview(project_id)
+    diff = supabase_connector.migration_diff(project_id)
+    contract = {
+        "action": "migration_apply",
+        "title": "Apply Supabase migrations (linked DB)",
+        "external": True,
+        "destructive": True,
+        "target": ref,
+        "token_configured": cred["configured"],
+        "pending": (preview.output[:4000] if preview.ok else (preview.error or "")[:1000]),
+        "diff_available": diff.ok,
+        "diff": (diff.output[:4000] if diff.ok else None),
+        "docker_note": (
+            "exact SQL diff unavailable: Docker not running"
+            if (diff.docker_missing and not diff.ok) else None
+        ),
+        "include_seed": req.include_seed,
+        "summary": "Applies pending repo/supabase/migrations to the LINKED remote database (forward-only).",
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+    if not cred["configured"]:
+        raise HTTPException(status_code=400, detail="no Supabase access token configured")
+    if not ref:
+        raise HTTPException(status_code=400, detail="no Supabase project linked (run supabase/link first)")
+    record.external_state = "migrating"
+    run_store.write_run_json(project_id, run_id, record)
+    res = supabase_connector.migration_apply(project_id, include_seed=req.include_seed)
+    record.external_state = None
+    run_store.write_run_json(project_id, run_id, record)
+    if not res.ok:
+        if res.not_installed:
+            raise HTTPException(status_code=400, detail="supabase CLI not installed (npm i -g supabase)")
+        detail = "Docker is required but not running" if res.docker_missing else (res.error or "migration failed")
+        raise HTTPException(status_code=502, detail=detail)
+    run_store.append_event(project_id, run_id, {"type": "supabase_migration", "target": ref})
+    ops_ledger.append_ops_entry(
+        project_id, "migration", "Supabase migration applied",
+        {"project_ref": ref, "include_seed": req.include_seed},
+        timestamp=_utc_stamp(),
+    )
+    return {"contract": contract, "applied": True, "run": record.model_dump()}
 
 
 # --- Main-agent file inspection endpoints (Task 06.1) ---

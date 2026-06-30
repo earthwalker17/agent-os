@@ -376,13 +376,35 @@ Vercel's own production deploy (native git integration). Only manual/privacy ste
 the preview URL sits behind **Vercel Deployment Protection** (302→SSO) until the user
 toggles it off in the Vercel dashboard.
 
-**Designed, not yet built (subsequent increments):** Supabase CLI executor
-(`run_supabase` with a scrubbed allow-listed env + hand-written destructive
-gating, `db push` is destructive-by-default) + migration/link/auth-config
-contracts; Stripe connector (form-encoded REST + `Idempotency-Key`, per-request
-test-mode gate) + checkout-test/webhook contracts; crashed-external-action
-reconciliation at startup; the end-to-end "ships a minimal SaaS" harness. See
-`BLUEPRINT.md` Pillar 2 + the approved Phase 8 plan.
+**Second increment landed — "Supabase" (8.5):**
+- **Sandboxed CLI executor.** New `ToolRuntime.run_supabase` joins `run_git` as a
+  typed executor (`shell=False` argv, not an agent tool) — but with a **scrubbed
+  allow-listed env** (`_scrubbed_cli_env`: only PATH/HOME/Docker-ish keys +
+  `env_extra`, NOT `os.environ.copy()`), so Agent OS's own provider keys are never
+  exposed to the third-party CLI (C5). `sandbox.validate_supabase` +
+  **hand-written `_is_destructive_supabase`** gate by SUBCOMMAND, not a flag: a
+  bare `db push` (remote DB), `db reset`, `migration up --linked`, `db remote
+  commit`, `branches delete` are destructive-by-default; `db push --dry-run` /
+  `db diff` / `migration new` / `status` are safe (C1/H1).
+- **Connector + contracts.** New `supabase_connector.py`: Management REST for
+  `status` (validates the `sbp_` token) + sandboxed CLI for `link` / migration.
+  The migration **preview** runs `db push --dry-run --linked` (Docker-optional,
+  required) + best-effort `db diff` (Docker-gated enrichment, soft note if Docker
+  is down); **apply** runs `db push --linked` with `allow_destructive` + the
+  access-token/DB-password via env only. The connector **redacts CLI stdout/stderr
+  before any artifact** (H7); Docker-not-running surfaces as a clear blocker.
+  Routes: `supabase/status`, `supabase/link`, `runs/{id}/supabase/migration`
+  (GENERAL-rejected). RLS ships as migration SQL; Auth provider config is a
+  documented manual dashboard step this pass. `MigrationPanel.tsx` drives it.
+- **Secret-in-repo guard (H8):** `git_ops` now refuses to commit
+  `supabase/config.toml` / `supabase/.temp` / `.branches` and seeds them into the
+  default `.gitignore`.
+
+**Designed, not yet built (subsequent increments):** Stripe connector
+(form-encoded REST + `Idempotency-Key`, per-request test-mode gate) +
+checkout-test/webhook contracts; crashed-external-action reconciliation at
+startup; the end-to-end "ships a minimal SaaS" harness. See `BLUEPRINT.md`
+Pillar 2 + the approved Phase 8 plan.
 
 ## Current Constraints
 
@@ -454,7 +476,9 @@ needed), and are each runnable standalone (`python tests/<file>.py`).
 | `test_vercel_endpoints.py`        |     6 | 8.4 generic credential/connector/env routes, deploy preview→confirm→ledger, value-hidden |
 | `test_ops_ledger.py`              |     5 | 8.4 OPS.md ledger write + no-leak + idempotency + judge-write rejection |
 | `test_phase8_invariants.py`       |     2 | 8.x orchestrator imports no connector; OPS.md excluded from judge sets |
-| **Total**                         | **523** | (8.1 lifted `test_credentials` 8→16; 8.3 lifted `test_git_store` 7→12) |
+| `test_sandbox_supabase.py`        |     4 | 8.5 validate_supabase allow-list + destructive-by-subcommand + scrubbed env |
+| `test_supabase_connector.py`      |     5 | 8.5 migration apply secrets-in-env/destructive, redaction, Docker-missing, status |
+| **Total**                         | **532** | (8.1 lifted `test_credentials` 8→16; 8.3 lifted `test_git_store` 7→12) |
 
 Frontend: `npm run build` (tsc + vite) green.
 

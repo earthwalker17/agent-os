@@ -68,6 +68,18 @@ _GIT_ALLOWED_SUBCOMMANDS = frozenset(
     }
 )
 
+# Supabase CLI subcommands the typed `run_supabase` surface (Phase 8 Production
+# Path) may invoke. Like `_GIT_ALLOWED_SUBCOMMANDS`, this is an allow-list for our
+# own controlled callers (supabase_connector); the Coding Agent never reaches
+# run_supabase. The "subcommand" is the FIRST token (`db`, `migration`, `link`,
+# `start`, …); destructiveness keys off the first token + its action word.
+_SUPABASE_ALLOWED_SUBCOMMANDS = frozenset(
+    {
+        "init", "login", "link", "start", "stop", "status",
+        "db", "migration", "gen", "projects",
+    }
+)
+
 # The literal "curl | bash" / "wget | bash" substrings above only match if no
 # URL sits between the fetcher and the pipe, which is rarely how the attack
 # is actually written. This regex catches the real pattern: any fetcher
@@ -109,6 +121,53 @@ def _is_destructive_git(sub: str, rest: list[str]) -> bool:
     if sub == "update-ref":
         return "-d" in tokens
     return False
+
+
+def _is_destructive_supabase(sub: str, rest: list[str]) -> bool:
+    """Whether a typed `supabase <sub> <rest...>` invocation mutates a REMOTE
+    database / discards data and therefore needs explicit user confirmation.
+
+    Unlike git, Supabase's danger is keyed off the SUBCOMMAND, not a flag: a bare
+    ``db push`` applies migrations to the linked production DB — the single most
+    destructive op in the phase. So this is **default-deny by action**, not a
+    git-style "bare verb is safe" clone:
+
+    - ``db push`` (without ``--dry-run``)  → applies migrations to the remote DB
+    - ``db reset``                         → drops + recreates a DB (local data loss)
+    - ``db remote commit``                 → writes remote migration history
+    - ``migration up`` with ``--linked``   → applies to the remote DB
+    - ``branches delete``                  → deletes a remote branch
+    - any op carrying ``--linked``/``--db-url`` that is NOT a ``--dry-run``
+      → treated as remote-targeting, destructive by default
+    """
+    tokens = [t.lower() for t in rest]
+    action = tokens[0] if tokens else ""
+    dry_run = "--dry-run" in tokens
+    remote_targeted = ("--linked" in tokens) or any(t == "--db-url" or t.startswith("--db-url=") for t in tokens)
+
+    if sub == "db":
+        if action in ("diff", "lint", "dump", "test"):
+            return False  # read-only inspection (diff needs Docker but mutates nothing)
+        if action in ("push", "reset", "pull"):
+            # push/pull touch the remote; reset wipes a DB. dry-run push is safe.
+            if action == "push" and dry_run:
+                return False
+            return True
+        if action == "remote":
+            return True  # `db remote commit` writes remote migration history
+        # any other db action that targets a remote is gated by default
+        return remote_targeted and not dry_run
+    if sub == "migration":
+        if action == "up":
+            return remote_targeted  # local `migration up` is recoverable via reset
+        if action in ("repair", "squash"):
+            return remote_targeted
+        return False  # `migration new` / `migration list` are safe
+    if sub == "branches":
+        return action in ("delete", "disable")
+    # link/start/stop/status/init/login/gen are not data-destructive; but any
+    # other subcommand explicitly targeting a remote is gated by default.
+    return remote_targeted and not dry_run
 
 
 class ProjectSandbox:
@@ -225,4 +284,36 @@ class ProjectSandbox:
             raise SandboxViolation(
                 f"destructive git operation requires explicit confirmation: "
                 f"git {sub} ..."
+            )
+
+    def validate_supabase(self, args, *, allow_destructive: bool = False) -> None:
+        """Validate a typed Supabase CLI argv (without the leading ``supabase``).
+
+        Used only by the Production Path layer (`ToolRuntime.run_supabase` →
+        supabase_connector); the Coding Agent never reaches this path. Mirrors
+        `validate_git`: a non-empty list of plain strings (no NUL — shell=False
+        makes newlines safe), an allow-listed subcommand
+        (`_SUPABASE_ALLOWED_SUBCOMMANDS`), and remote-mutating / data-discarding
+        actions (`db push`, `db reset`, `migration up --linked`, …) only when
+        ``allow_destructive`` is True (passed solely from a user-confirmed action
+        endpoint). See `_is_destructive_supabase` — destructiveness is keyed off
+        the subcommand, not a flag, because a bare ``db push`` hits the remote DB.
+        """
+        if not isinstance(args, (list, tuple)) or not args:
+            raise SandboxViolation("supabase args must be a non-empty list")
+        cleaned: list[str] = []
+        for a in args:
+            if not isinstance(a, str):
+                raise SandboxViolation("supabase args must all be strings")
+            if "\x00" in a:
+                raise SandboxViolation("supabase args must not contain NUL bytes")
+            cleaned.append(a)
+
+        sub = cleaned[0].lower()
+        if sub not in _SUPABASE_ALLOWED_SUBCOMMANDS:
+            raise SandboxViolation(f"supabase subcommand not allowed: {sub!r}")
+        if _is_destructive_supabase(sub, cleaned[1:]) and not allow_destructive:
+            raise SandboxViolation(
+                f"destructive supabase operation requires explicit confirmation: "
+                f"supabase {sub} {' '.join(cleaned[1:2])} ..."
             )

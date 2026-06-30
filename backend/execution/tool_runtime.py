@@ -35,6 +35,30 @@ _MAX_SHELL_TIMEOUT_SECONDS = 600
 
 _SKIP_DIR_NAMES = {".git", "node_modules", ".venv", "__pycache__"}
 
+# Phase 8 — env keys a third-party CLI (supabase) legitimately needs to run, used
+# to build a SCRUBBED environment instead of copying the whole parent env. This
+# keeps Agent OS's OWN secrets (ANTHROPIC_API_KEY, GITHUB_TOKEN, every provider
+# token) OUT of a third-party binary's environment (which it may dump in
+# verbose/crash output). Only these + the caller's explicit env_extra are passed.
+_CLI_ENV_ALLOWLIST = (
+    "PATH", "PATHEXT", "ComSpec", "SystemRoot", "windir", "SystemDrive",
+    "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles", "ProgramFiles(x86)",
+    "ProgramW6432", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "USERNAME", "LOGNAME",
+    "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME",
+)
+
+
+def _scrubbed_cli_env(env_extra: dict | None) -> dict:
+    """A minimal environment for a third-party CLI: only the OS keys it needs
+    plus the caller's explicit ``env_extra`` (e.g. SUPABASE_ACCESS_TOKEN). NOT a
+    copy of the parent env, so Agent OS's own provider keys never leak to it."""
+    env = {k: os.environ[k] for k in _CLI_ENV_ALLOWLIST if k in os.environ}
+    if env_extra:
+        env.update({str(k): str(v) for k, v in env_extra.items()})
+    return env
+
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     """Best-effort kill of a child process AND its descendants. Never raises.
@@ -503,6 +527,114 @@ class ToolRuntime:
             metadata={
                 # argv only — never any secret (tokens live in env_extra).
                 "command": "git " + " ".join(argv),
+                "args": argv,
+                "cwd": str(repo),
+                "exit_code": proc.returncode,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            },
+        )
+
+    def run_supabase(
+        self,
+        args,
+        *,
+        allow_destructive: bool = False,
+        env_extra: dict | None = None,
+        timeout_seconds: int = 180,
+    ) -> ToolResult:
+        """Run a single ``supabase`` CLI invocation inside the project repo.
+
+        The Phase 8 Production Path executor for Supabase migrations / local
+        stack — the sandboxed analogue of ``run_git``. Like run_git it uses
+        ``shell=False`` with an explicit argv (no shell interpolation) and is NOT
+        an agent tool (only supabase_connector calls it). Two deliberate
+        differences from run_git:
+
+        - **Scrubbed env (constitutional):** the child gets only
+          ``_CLI_ENV_ALLOWLIST`` + ``env_extra`` (e.g. SUPABASE_ACCESS_TOKEN /
+          SUPABASE_DB_PASSWORD), NOT a copy of the parent env — so Agent OS's own
+          provider keys are never exposed to the third-party CLI.
+        - Secrets ride ONLY in ``env_extra`` and never in ``args`` (the argv is
+          copied verbatim into ``metadata["command"]`` → events/run.json).
+        """
+        if not isinstance(args, (list, tuple)) or not args:
+            return _err("run_supabase", ValueError("supabase args must be a non-empty list"))
+        argv = [str(a) for a in args]
+
+        try:
+            self.sandbox.validate_supabase(argv, allow_destructive=allow_destructive)
+        except SandboxViolation as e:
+            return _err("run_supabase", e)
+
+        repo = self.sandbox.repo_dir
+        try:
+            repo.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return _err("run_supabase", e)
+
+        effective_timeout = max(1, min(int(timeout_seconds), _MAX_SHELL_TIMEOUT_SECONDS))
+        env = _scrubbed_cli_env(env_extra)
+
+        full = ["supabase", *argv]
+        try:
+            proc = subprocess.Popen(
+                full,
+                shell=False,
+                cwd=str(repo),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+        except FileNotFoundError:
+            # The CLI isn't installed — a clear, actionable error, not a crash.
+            return ToolResult(
+                success=False,
+                tool_name="run_supabase",
+                error="supabase CLI not found on PATH (install it: npm i -g supabase, or see supabase.com/docs)",
+                metadata={"command": "supabase " + " ".join(argv), "args": argv, "not_installed": True},
+            )
+        except Exception as e:
+            return _err("run_supabase", e)
+
+        try:
+            out, err = proc.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            return ToolResult(
+                success=False,
+                tool_name="run_supabase",
+                error=f"supabase command timed out after {effective_timeout}s",
+                metadata={
+                    "command": "supabase " + " ".join(argv),
+                    "args": argv,
+                    "cwd": str(repo),
+                    "timeout": True,
+                    "timeout_seconds": effective_timeout,
+                },
+            )
+        except Exception as e:
+            _kill_process_tree(proc)
+            return _err("run_supabase", e)
+
+        stdout, stdout_truncated = _truncate(out or "", _MAX_SHELL_OUTPUT_CHARS)
+        stderr, stderr_truncated = _truncate(err or "", _MAX_SHELL_OUTPUT_CHARS)
+        return ToolResult(
+            success=proc.returncode == 0,
+            tool_name="run_supabase",
+            output=stdout,
+            error=stderr,
+            metadata={
+                # argv only — never any secret (tokens live in env_extra).
+                "command": "supabase " + " ".join(argv),
                 "args": argv,
                 "cwd": str(repo),
                 "exit_code": proc.returncode,

@@ -114,9 +114,9 @@ conversations, messages, and pending executions.
 | `manager.py`               | Workspace filesystem layout + idempotent init; `read/update_task_state`. |
 | `models.py`                | Pydantic models: `RunRecord`, `RunStatus`, `TaskSpec`, `ResultSummary`, `VerificationResult` (+ `VerificationCommandResult`), `BrowserVerificationResult`; **Phase 5** `ExecutionPlan` / `ExecutionTask` / `TaskStatus`. |
 | `templates.py`             | Default `AGENT.md` / `TASK.md` seeds (incl. the verification block docs). |
-| `sandbox.py`               | `ProjectSandbox`: path + command validation. **The boundary.**          |
+| `sandbox.py`               | `ProjectSandbox`: path + command validation. **The boundary.** Phase 7 `validate_git` + **Phase 8** `validate_supabase` (allow-list + `_is_destructive_supabase`, destructive-by-subcommand). |
 | `tool_models.py`           | `ToolResult` + per-tool request models.                                 |
-| `tool_runtime.py`          | `ToolRuntime`: the six sandboxed file/shell tools with output caps.     |
+| `tool_runtime.py`          | `ToolRuntime`: the six sandboxed file/shell tools with output caps; Phase 7 `run_git` + **Phase 8** `run_supabase` (typed CLI executor with a **scrubbed allow-listed env** — Agent OS's own keys are withheld from the third-party CLI). |
 | `prompts.py`               | Coding Agent system prompt + per-step / correction / **repair** prompts; **Phase 5** planning + per-task-unit prompts. |
 | `planner.py`               | **Phase 5** — pure planning layer: `looks_complex` heuristic gate, tolerant `parse_plan`, `fallback_plan`, task-graph helpers (`topological_order` cycle-safe, `dependency_failed`, `aggregate_run_status`). |
 | `run_store.py`             | Per-run artifact reader/writer; `render_result_md`; `sweep_stuck_runs`; **Phase 5** `write/read_plan_json` + result.md task section; **run control** `read_events` (timeline) + `read_task_card` (retry source). |
@@ -139,6 +139,7 @@ conversations, messages, and pending executions.
 | `app_env.py`               | **Phase 8** — project-scoped app-env registry (`credentials/env/{id}.json`): the BUILT app's env vars (DATABASE_URL / NEXT_PUBLIC_* / STRIPE_*), DISTINCT from connector tokens. Presence-only `set/delete/list_env` (never a value); the single value reader is `credentials.get_env_value`; secret values register into the redactor. |
 | `vercel_connector.py`      | **Phase 8** — Vercel REST-over-`urllib` (no CLI for deploy/redeploy/rollback/env): `status` (whoami), `create_deployment` (gitSource), `get_deployment` (poll `readyState`), `list_deployments`, `promote_deployment` (rollback), `set_env_var`. Token in the `Authorization` header ONLY; every returned string `credentials.redact`-ed with `project_id`; `normalize_url` strips a protection-bypass query; never auto-creates a project. |
 | `ops_ledger.py`            | **Phase 8** — the ONE writer of `projects/{id}/OPS.md` (`append_ops_entry`): deterministic, ids/URLs/key-NAMES only, redacted at the call site, idempotent on a `dedup_key`; also appends a redacted line to `execution_workspaces/{id}/ops/events.jsonl`. OPS.md is scaffolded but excluded from every LLM-judge writable set. |
+| `supabase_connector.py`    | **Phase 8** — Supabase: Management REST (`status`, Bearer `sbp_`) + sandboxed CLI (`link` / `migration_preview` = `db push --dry-run`, Docker-optional / `migration_diff` = best-effort Docker-gated / `migration_apply` = `db push --linked`, `allow_destructive`). Secrets ride `run_supabase` `env_extra` only; the connector **redacts CLI stdout/stderr before any artifact** (H7); Docker-not-running → a clear blocker. |
 
 `tests/` mirrors these per feature; all stub `llm.chat` so no API key is needed.
 
@@ -165,6 +166,7 @@ conversations, messages, and pending executions.
 | `components/EnvRegistryPanel.tsx` (08) | Project app-env registry in `ContextPanel` — write-only values, presence list, per-key "Push to Vercel" (the env-set contract). |
 | `components/ExternalActionPanel.tsx` (08) | Generic two-phase External-Action contract preview block (external/destructive/TEST tags + confirm gate); shared driver for the deploy panel. |
 | `components/DeployOpsPanel.tsx` (08) | Production Path controls in the run chat card — deploy / redeploy / rollback contracts (preview→confirm), last-deploy URL/state badges, polls while a deploy is in flight. |
+| `components/MigrationPanel.tsx` (08) | Supabase controls in the run chat card — link + apply-migrations contracts (preview shows the `db push --dry-run` pending list + best-effort SQL diff; confirm applies to the linked DB). |
 
 ---
 
