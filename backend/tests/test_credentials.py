@@ -29,7 +29,10 @@ import credentials  # noqa: E402
 class _Sandbox:
     """Redirect the credential store to a temp dir + clear env tokens."""
 
-    ENV_VARS = credentials._GITHUB_ENV_VARS
+    # Clear every provider's env fallbacks so the temp store is authoritative.
+    ENV_VARS = tuple(
+        dict.fromkeys(v for cfg in credentials._PROVIDERS.values() for v in cfg["env_vars"])
+    )
 
     def __init__(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -188,6 +191,180 @@ def test_safe_project_id_rejects_traversal():
         # traversal chars are sanitized to underscores, not allowed through
         assert "/" not in credentials._safe_project_id("a/b/c")
         assert "\\" not in credentials._safe_project_id("a\\b")
+
+    _run(body)
+
+
+# ---------- Phase 8: multi-provider registry ----------
+
+
+def test_provider_round_trip_vercel():
+    def body(sb):
+        credentials.set_credential("vercel", "proj", fields={"token": "vrc_opaque_24charstoken"})
+        assert credentials.get_token("vercel", "proj") == "vrc_opaque_24charstoken"
+        st = credentials.status("proj", "vercel")
+        assert st["provider"] == "vercel" and st["configured"] is True
+        assert st["secret_fields"]["token"] is True
+        assert "vrc_opaque_24charstoken" not in json.dumps(st)
+        # github is independent + still unset for this project
+        assert credentials.status("proj", "github")["configured"] is False
+        credentials.delete_credential("vercel", "proj")
+        assert credentials.get_token("vercel", "proj") is None
+
+    _run(body)
+
+
+def test_vercel_env_fallback_and_metadata():
+    def body(sb):
+        sb.set_env("VERCEL_TOKEN", "env-vrc-tok")
+        assert credentials.get_token("vercel", "proj") == "env-vrc-tok"
+        assert credentials.status("proj", "vercel")["source"] == "env"
+        # metadata is non-secret and round-trips via update_metadata (needs a stored token)
+        credentials.set_credential("vercel", "proj", fields={"token": "stored-vrc"})
+        credentials.update_metadata("vercel", "proj", {"org_id": "team_123", "project_id": "prj_abc"})
+        st = credentials.status("proj", "vercel")
+        assert st["org_id"] == "team_123" and st["project_id"] == "prj_abc"
+        assert credentials.get_metadata("vercel", "project_id", "proj") == "prj_abc"
+
+    _run(body)
+
+
+def test_supabase_multi_secret_and_public_anon():
+    def body(sb):
+        credentials.set_credential(
+            "supabase",
+            "proj",
+            fields={
+                "access_token": "sbp_pat_0123456789abcdef0123",
+                "db_password": "sup3r-secret-pw",
+                "service_role": "eyJhbG.service.role.secret",
+                "project_ref": "abcdefabcdef",
+                "anon_key": "eyJhbG.anon.public",
+                "url": "https://abcdefabcdef.supabase.co",
+            },
+        )
+        # every secret field resolves through get_secret
+        assert credentials.get_secret("supabase", "db_password", "proj") == "sup3r-secret-pw"
+        assert credentials.get_secret("supabase", "service_role", "proj") == "eyJhbG.service.role.secret"
+        assert credentials.get_token("supabase", "proj") == "sbp_pat_0123456789abcdef0123"
+        # public anon + url are metadata, not secrets
+        assert credentials.get_metadata("supabase", "anon_key", "proj") == "eyJhbG.anon.public"
+        # status never leaks any secret value but shows presence + public metadata
+        st = credentials.status("proj", "supabase")
+        blob = json.dumps(st)
+        for secret in ("sbp_pat_0123456789abcdef0123", "sup3r-secret-pw", "eyJhbG.service.role.secret"):
+            assert secret not in blob
+        assert st["secret_fields"] == {"access_token": True, "db_password": True, "service_role": True}
+        assert st["project_ref"] == "abcdefabcdef"
+        assert st["anon_key"] == "eyJhbG.anon.public"
+
+    _run(body)
+
+
+def test_stripe_live_key_refused_test_key_ok():
+    def body(sb):
+        # a live key is refused at the store boundary (default-deny)
+        try:
+            credentials.set_credential("stripe", "proj", fields={"secret_key": "sk_live_abc123abc123"})
+            assert False, "expected live-key refusal"
+        except ValueError:
+            pass
+        # an explicit override stores it
+        credentials.set_credential(
+            "stripe", "proj", fields={"secret_key": "sk_live_abc123abc123"}, allow_live=True
+        )
+        assert credentials.get_token("stripe", "proj") == "sk_live_abc123abc123"
+        # a test key is accepted normally; webhook secret stored alongside
+        credentials.set_credential(
+            "stripe",
+            "proj",
+            fields={"secret_key": "sk_test_xyz789xyz789", "webhook_secret": "whsec_localabc123abc"},
+        )
+        assert credentials.get_secret("stripe", "webhook_secret", "proj") == "whsec_localabc123abc"
+        st = credentials.status("proj", "stripe")
+        assert st["secret_fields"] == {"secret_key": True, "webhook_secret": True}
+        assert "sk_test_xyz789xyz789" not in json.dumps(st)
+
+    _run(body)
+
+
+def test_status_all_lists_every_provider():
+    def body(sb):
+        credentials.set_credential("vercel", "proj", fields={"token": "vrc-tok"})
+        allst = credentials.status_all("proj")
+        assert set(allst) == set(credentials._PROVIDERS)
+        assert allst["vercel"]["configured"] is True
+        assert allst["github"]["configured"] is False
+
+    _run(body)
+
+
+def test_unknown_provider_rejected():
+    def body(sb):
+        for fn in (
+            lambda: credentials.get_token("bogus", "proj"),
+            lambda: credentials.status("proj", "bogus"),
+            lambda: credentials.set_credential("bogus", "proj", fields={"token": "x"}),
+        ):
+            try:
+                fn()
+                assert False, "expected unknown-provider rejection"
+            except ValueError:
+                pass
+
+    _run(body)
+
+
+# ---------- Phase 8: redaction of new shapes ----------
+
+
+def test_redact_phase8_shapes():
+    def body(sb):
+        # an opaque Vercel token (no shape) is caught by exact stored-value match
+        credentials.set_credential("vercel", "proj", fields={"token": "OpaqueVercelTokenNoShape24"})
+        # a secret service_role JWT is caught by exact value; the public anon JWT is NOT
+        credentials.set_credential(
+            "supabase",
+            "proj",
+            fields={"service_role": "eyJsecretSERVICErolejwtvalue", "anon_key": "eyJpublicANONjwtvalue"},
+        )
+        text = (
+            "deploy: token=OpaqueVercelTokenNoShape24 used\n"
+            "STRIPE_SECRET_KEY=sk_test_abcdefghijklmnop\n"
+            "sig whsec_aabbccddeeff00112233\n"
+            "supabase login sbp_aabbccddeeff0011223344\n"
+            "DATABASE_URL=postgresql://postgres:My-DB-Pass99@db.abc.supabase.co:5432/postgres\n"
+            "service eyJsecretSERVICErolejwtvalue here\n"
+            "anon key eyJpublicANONjwtvalue stays\n"
+            "publishable pk_test_visiblepublishable keeps\n"
+        )
+        out = credentials.redact(text, "proj")
+        assert "OpaqueVercelTokenNoShape24" not in out
+        assert "sk_test_abcdefghijklmnop" not in out
+        assert "whsec_aabbccddeeff00112233" not in out
+        assert "sbp_aabbccddeeff0011223344" not in out
+        assert "My-DB-Pass99" not in out and "@db.abc.supabase.co" in out  # password gone, host kept
+        assert "eyJsecretSERVICErolejwtvalue" not in out  # secret service_role redacted
+        # public values survive (they ship to clients; redacting them hides nothing + breaks debugging)
+        assert "eyJpublicANONjwtvalue" in out
+        assert "pk_test_visiblepublishable" in out
+
+    _run(body)
+
+
+def test_redact_extra_secret_source():
+    def body(sb):
+        snapshot = list(credentials._EXTRA_SECRET_SOURCES)
+        captured = {"v": "AppEnvSecretValue123"}
+        credentials.register_secret_source(lambda pid: [captured["v"]] if pid == "proj" else [])
+        try:
+            out = credentials.redact("env DATABASE_URL was AppEnvSecretValue123 here", "proj")
+            assert "AppEnvSecretValue123" not in out
+            # a different project does not see it
+            out2 = credentials.redact("AppEnvSecretValue123", "other")
+            assert "AppEnvSecretValue123" in out2
+        finally:
+            credentials._EXTRA_SECRET_SOURCES[:] = snapshot
 
     _run(body)
 

@@ -242,7 +242,7 @@ agent-os/
 │   ├── llm.py             # LLM entry point (chat + vision) → providers.py
 │   ├── providers.py       # Provider Registry 2.0 (six providers, model + vision metadata)
 │   ├── memory_engine.py   # the single atomic markdown memory write path
-│   ├── credentials.py     # the only secret reader (GitHub tokens)
+│   ├── credentials.py     # the only secret reader (GitHub + Vercel/Supabase/Stripe)
 │   ├── database.py        # SQLite (conversations + messages + pending exec)
 │   ├── execution/         # sandbox, runner, planner, verification, browser, git, recovery
 │   └── tests/             # 480+ backend tests (LLM stubbed, no API key needed)
@@ -270,12 +270,13 @@ agent-os/
 | 5 | Execution orchestration — plan → task graph → execute, live trace, run control | ✅ |
 | 6 / 6.1 | Main Agent v2 — memory engine, intent router, confirmable recovery + budget | ✅ |
 | 7 | Project Ops — Git/GitHub lifecycle (checkpoint, diff, commit, push, PR, rollback) | ✅ |
+| 8 | **Production Path** — multi-provider connectors + env/secret registry + Vercel deploy/redeploy/rollback contracts (Vercel spine landed; Supabase/Stripe next) | 🚧 |
 
 **Planned — the long-term blueprint** (direction, not yet built; see [`BLUEPRINT.md`](./BLUEPRINT.md)):
 
 | Phase | Direction |
 |------:|-----------|
-| 8 | **Deployment & real backend connectors** — Vercel / Supabase / Stripe test-mode golden path, env/secret registry, deployment contracts |
+| 8 (cont.) | **Real backend connectors** — Supabase migrations/Auth/RLS + Stripe test-mode checkout/webhooks completing the golden path, deployed smoke tests |
 | 9 | **Agent Teams** — role registry, parallel read-only agents, isolated patch workspaces, an integration/merge agent, a global verification gate |
 | 10 | **Research / RAG / Skills** — bounded local project + repo + run indexes, user-approved URL/web reading, a reusable skills registry |
 | 11 | **Evaluation & reliability loops** — a typed recovery matrix, visual-repair loop, failure-pattern memory, run-health dashboard |

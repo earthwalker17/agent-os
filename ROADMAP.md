@@ -312,6 +312,78 @@ gate. Additive; every constitutional invariant preserved. (BLUEPRINT Pillar 1.)
   regression tests. Secret-leak audit clean: no token in events/run.json/result.md
   and a tokenless `.git/config` remote.
 
+## Phase 8 — Production Path Foundation (in progress)
+
+Moves what Agent OS can deliver from local preview-only demos toward shipping a
+minimal real SaaS through one golden path: **Vercel (deploy) + Supabase
+(Postgres/Auth/migrations) + Stripe (test-mode checkout/webhooks)**. Built on the
+Phase 7 rails — two-phase External Action Contracts, `credentials.py` as the sole
+secret reader, the single sandboxed-executor pattern, best-effort run linkage.
+Additive; every constitutional invariant preserved. (BLUEPRINT Pillar 2.)
+
+**First increment landed — "Spine + Vercel proof" (8.1–8.4 + memory ledger):**
+
+- **8.1 — Multi-provider credential spine.** `credentials.py` generalized from
+  GitHub-only to a provider registry (`github | vercel | supabase | stripe`) with
+  typed secret + non-secret fields: generic `get_token` / `get_secret` /
+  `get_metadata` / `status` / `status_all` / `set_credential` / `update_metadata`
+  / `delete_credential` (the GitHub helpers stay as thin aliases). **Stripe
+  live-gate at the store boundary** (a non-`*_test_` key is refused unless an
+  explicit `allow_live`). **Redaction hardened**: `sk_`/`rk_`/`whsec_`/`sbp_`
+  shapes + a Postgres connection-string password regex + `_all_known_tokens`
+  iterating every provider's stored secret — but **no bare-JWT regex** (the
+  Supabase anon key is a public JWT; the secret `service_role` is caught by exact
+  value, classified by field name not shape). Generic
+  `GET|POST|DELETE /api/projects/{id}/credentials/{provider}` + `GET …/connectors`
+  routes; multi-provider `ConnectorsModal.tsx`.
+- **8.2 — App-env registry.** New `execution/app_env.py` (`credentials/env/{id}.json`,
+  presence-only `list_env` — never a value); the single value reader is
+  `credentials.get_env_value`; app-env secret values register into the redactor.
+  `…/env` routes + `EnvRegistryPanel.tsx` (write-only inputs, per-key "Push to
+  Vercel").
+- **8.3 — Contract driver + run record/artifacts.** Run-scoped deploy fields on
+  `RunRecord` (`deployment_id`/`url`/`target`, transient `deploy_state` /
+  `external_state`); `run_store` `_deployment_section` + `deployment.json` +
+  `deploy.log` artifacts; generic `ExternalActionPanel.tsx` two-phase driver.
+- **8.4 — Vercel connector + contracts + OPS ledger.** New
+  `execution/vercel_connector.py` (REST-over-urllib, gitSource deploy, token in
+  the `Authorization` header only, every returned string redacted, no project
+  auto-create). **Async deploy**: confirm returns immediately with
+  `deploy_state` set and finalizes off-thread (polls `READY`) via the background
+  manager's new `submit`. New `execution/ops_ledger.py` — the one writer of
+  `projects/{id}/OPS.md` (deterministic, redacted at the call site; OPS.md is
+  scaffolded but excluded from every LLM-judge writable set + `DEFAULT_SECTION`).
+  Routes: deploy/redeploy/rollback (run-scoped), env-set/status/deployments
+  (project-scoped), every mutating route GENERAL-rejected; `DeployOpsPanel.tsx`.
+- **Adversarial-review fixes folded in**: token never on argv (env/header only);
+  service_role a first-class secret; mandatory-`project_id` redaction; deploy URL
+  normalized to strip a protection-bypass token; orchestrator imports no connector
+  (asserted by a test); secret app-env vars forced Vercel `type:"sensitive"`.
+
+**Validated end-to-end (live).** A brand-new project (`agent-os-phase8-vercel-e2e`)
+ran the full Production Path on a real Coding Agent build + real GitHub + real
+Vercel: task → **build** a Vite/React/TS app → **verify** (`npm install && npm run
+build`) → **commit** → **push** → **Vercel deploy** (gitSource) → polled
+`INITIALIZING → BUILDING → READY` off-thread → a live preview URL, recorded in
+`OPS.md`. The E2E caught + fixed two real bugs: (1) Vercel's `gitSource` requires
+`repoId`/`org+repo` (a bare `{type,ref}` is rejected) and `target` must be omitted
+for preview — the connector now resolves the repo from the project link; (2) a
+**friction win** — the push now **auto-derives the GitHub repo from the linked
+Vercel project**, so a Vercel-connected project pushes with zero extra input. Secret
+audit clean: the Vercel + GitHub token values appear in **no** run.json / events /
+result.md / **deploy.log** / deployment.json / OPS.md. The push also auto-triggered
+Vercel's own production deploy (native git integration). Only manual/privacy step:
+the preview URL sits behind **Vercel Deployment Protection** (302→SSO) until the user
+toggles it off in the Vercel dashboard.
+
+**Designed, not yet built (subsequent increments):** Supabase CLI executor
+(`run_supabase` with a scrubbed allow-listed env + hand-written destructive
+gating, `db push` is destructive-by-default) + migration/link/auth-config
+contracts; Stripe connector (form-encoded REST + `Idempotency-Key`, per-request
+test-mode gate) + checkout-test/webhook contracts; crashed-external-action
+reconciliation at startup; the end-to-end "ships a minimal SaaS" harness. See
+`BLUEPRINT.md` Pillar 2 + the approved Phase 8 plan.
+
 ## Current Constraints
 
 - **Explicit dispatch only.** `@code <task>` runs immediately; inferred coding
@@ -371,13 +443,18 @@ needed), and are each runnable standalone (`python tests/<file>.py`).
 | `test_recovery_budget.py`         |     9 | 6.1 `_maybe_auto_recover` gating: budget/green/idempotent/cap/no-card; budget decrement |
 | `test_sandbox_git.py`             |    12 | 7.1 run_shell destructive-git block, validate_git allow/deny + gating, run_git e2e |
 | `test_git_ops.py`                 |    12 | 7.2 ensure_repo/checkpoint/diff+redact/commit-refusal/branch/rollback (real git) |
-| `test_git_store.py`               |     7 | 7.3 RunRecord/ResultSummary git round-trip, diff.patch artifact, result.md section |
+| `test_git_store.py`               |    12 | 7.3 + 8.3 git/deploy RunRecord round-trip, diff.patch + deployment.json/deploy.log artifacts, result.md sections |
 | `test_checkpoint_diff.py`         |     4 | 7.4 dispatch checkpoint + inherit, finalize diff capture (idempotent/no-op) |
-| `test_credentials.py`             |     8 | 7.5 resolution order, presence-only status, set/update/delete, redact, traversal |
+| `test_credentials.py`             |    16 | 7.5 + 8.1 multi-provider registry, redaction hardening (conn-string/`sk_`/`whsec_`/`sbp_`), Stripe live-gate |
 | `test_github_connector.py`        |    11 | 7.6 remote parse/tokenless, status validate, push token-only-in-env, PR REST |
 | `test_git_endpoints.py`           |    10 | 7.7 status/diff/commit/push (incl. real local-bare push)/PR/rollback/credentials |
 | `test_git_context.py`             |     5 | 7.9 `_latest_git_state_context` summary-only + mode folding (review/debug) |
-| **Total**                         | **481** |                                                        |
+| `test_app_env.py`                 |     5 | 8.2 app-env set/list/delete presence-only, single value reader, redaction |
+| `test_vercel_connector.py`        |    11 | 8.4 token-in-header-only, redacted errors, deploy(gitSource repoId)/get/list/promote/env, url normalize, unlinked-error |
+| `test_vercel_endpoints.py`        |     6 | 8.4 generic credential/connector/env routes, deploy preview→confirm→ledger, value-hidden |
+| `test_ops_ledger.py`              |     5 | 8.4 OPS.md ledger write + no-leak + idempotency + judge-write rejection |
+| `test_phase8_invariants.py`       |     2 | 8.x orchestrator imports no connector; OPS.md excluded from judge sets |
+| **Total**                         | **523** | (8.1 lifted `test_credentials` 8→16; 8.3 lifted `test_git_store` 7→12) |
 
 Frontend: `npm run build` (tsc + vite) green.
 

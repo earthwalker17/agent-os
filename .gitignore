@@ -36,6 +36,7 @@ projects/*
 !projects/TASK_QUEUE.example.md
 !projects/DECISIONS.example.md
 !projects/RESEARCH.example.md
+!projects/OPS.example.md
 
 # Execution workspaces - generated agent artifacts, logs, repo sandboxes.
 # Same treatment: real per-project workspaces stay private; the example

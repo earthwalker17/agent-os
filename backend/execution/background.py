@@ -67,6 +67,20 @@ class BackgroundRunManager:
         self._cancels: dict[str, Event] = {}
         self._cancel_lock = Lock()
 
+    def submit(self, fn, *args, **kwargs):
+        """Run an arbitrary callable on the shared pool (Phase 8: async
+        external-action finalize — e.g. polling a Vercel deploy to READY
+        off-thread so the confirm request returns immediately). Best-effort: an
+        exception in the task is logged, never propagated."""
+
+        def _wrapped():
+            try:
+                fn(*args, **kwargs)
+            except Exception:  # noqa: BLE001
+                log.warning("background submit task failed:\n%s", traceback.format_exc())
+
+        return self._executor.submit(_wrapped)
+
     def dispatch(
         self,
         project_id: str,

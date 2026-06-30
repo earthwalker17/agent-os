@@ -446,6 +446,28 @@ class RunRecord(BaseModel):
     pr_number: Optional[int] = None
     diff_stat: Optional[str] = None
     git_state: Optional[str] = None
+    # Phase 8 — Production Path (Vercel deploy) linkage. All default
+    # ``None``/``False`` so old run.json records round-trip unchanged (mirrors
+    # the Phase 7 convention). Scalar refs only — secrets NEVER here; the raw
+    # build log lives in the per-run ``deploy.log`` artifact. Deploy is
+    # run-scoped (it ships the commit THIS run produced), mirroring run↔commit.
+    # Only run-scoped deploy facts live here; project-level provisioning
+    # (Stripe webhook/price ids, Supabase link ref, env key names) is recorded
+    # in the project ``OPS.md`` ledger, not on the record.
+    #   - ``deployment_id``: Vercel deployment id (``dpl_…``).
+    #   - ``deployment_url``: the preview/production URL (normalized to bare
+    #     scheme://host/path — any protection-bypass query is stripped + redacted).
+    #   - ``deployment_target``: ``"preview"`` | ``"production"``.
+    #   - ``deploy_state``: transient sub-status while a deploy/redeploy/rollback
+    #     runs ("deploying"/"building"/"redeploying"/"rolling_back"); ``None`` at
+    #     rest. Mirrors ``git_state``; NOT a ``RunStatus`` value.
+    #   - ``external_state``: umbrella transient sub-status (any in-flight external
+    #     action) so the UI can gate polling without knowing the specific verb.
+    deployment_id: Optional[str] = None
+    deployment_url: Optional[str] = None
+    deployment_target: Optional[str] = None
+    deploy_state: Optional[str] = None
+    external_state: Optional[str] = None
 
 
 class ResultSummary(BaseModel):
@@ -468,3 +490,7 @@ class ResultSummary(BaseModel):
     branch: Optional[str] = None
     pr_url: Optional[str] = None
     diff_stat: Optional[str] = None
+    # Phase 8 — compact deploy metadata for the main agent (metadata only, never
+    # a secret or the raw build log). ``None`` for runs without a deployment.
+    deployment_url: Optional[str] = None
+    deployment_target: Optional[str] = None

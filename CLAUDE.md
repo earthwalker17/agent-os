@@ -154,6 +154,15 @@ and execute project work.
   GitHub tokens (`credentials.py`) reach git only via the push-time `env`
   (`GIT_ASKPASS`, tokenless remote) — never argv/`.git/config`/logs/memory/UI.
   (Details: `ARCHITECTURE.md §7.H`.)
+- **Phase 8 — Production Path (Vercel/Supabase/Stripe connectors).** External
+  delivery is **contract-first** (preview→confirm), never raw API/CLI calls and
+  never inferred-intent. Connector tokens + the built app's env vars live only in
+  `credentials.py` (sole reader, presence-only `status`); a secret reaches a
+  connector via header/exec-env only — never argv/logs/events/memory/artifacts/
+  Git/UI. Stripe stays TEST-only; a Supabase CLI joins `run_git` as a sandboxed
+  executor; `OPS.md` is written only by `ops_ledger`, never an LLM; the
+  orchestrator imports no connector. (Details: `ARCHITECTURE.md §7.I`; BLUEPRINT
+  Pillar 2.)
 
 ## 6. Context Hygiene
 

@@ -3,6 +3,7 @@ import type { GitHubConnectorStatus, GitStatus, PreviewStatus, RunRecord } from 
 import RunDetailModal from './RunDetailModal'
 import RunTrace from './RunTrace'
 import ConnectorModal from './ConnectorModal'
+import ConnectorsModal from './ConnectorsModal'
 
 interface Props {
   projectId: string
@@ -34,7 +35,9 @@ function isActive(run: RunRecord): boolean {
     run.verification_state === 'verifying' ||
     run.verification_state === 'repairing' ||
     run.browser_verification_state === 'running' ||
-    run.git_state != null
+    run.git_state != null ||
+    run.deploy_state != null ||
+    run.external_state != null
   )
 }
 
@@ -72,6 +75,7 @@ function RunsSection({ projectId, refreshSignal }: Props) {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null)
   const [connector, setConnector] = useState<GitHubConnectorStatus | null>(null)
   const [showConnector, setShowConnector] = useState(false)
+  const [showConnectors, setShowConnectors] = useState(false)
 
   const loadRuns = useCallback(async () => {
     setLoading(true)
@@ -327,6 +331,14 @@ function RunsSection({ projectId, refreshSignal }: Props) {
                   ? 'GitHub: configured'
                   : 'Connect GitHub'}
             </button>
+            <button
+              type="button"
+              className="git-connect-btn"
+              onClick={() => setShowConnectors(true)}
+              title="Connect Vercel / Supabase / Stripe (Production Path)"
+            >
+              Connectors
+            </button>
           </div>
         </div>
       )}
@@ -415,6 +427,10 @@ function RunsSection({ projectId, refreshSignal }: Props) {
             loadGit()
           }}
         />
+      )}
+
+      {showConnectors && (
+        <ConnectorsModal projectId={projectId} onClose={() => setShowConnectors(false)} />
       )}
     </details>
   )

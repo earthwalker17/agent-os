@@ -55,6 +55,15 @@ RECONCILIATION_WRITABLE: frozenset[str] = frozenset(
     {"STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RESEARCH.md"}
 )
 
+# Phase 8 — the deployment ledger. Written ONLY by the deterministic
+# ``ops_ledger`` (deploy/env/migration/webhook confirm-execute paths), never by
+# an LLM. It is deliberately absent from ``WRITABLE_PROJECT`` /
+# ``RECONCILIATION_WRITABLE`` (so the chat-judge + reconciler can never touch it)
+# and from ``DEFAULT_SECTION`` (so no judge parser can default-target it). A
+# single-edit footgun is thereby avoided: enabling LLM writes to OPS.md would
+# require adding it to a judge allow-set, which we never do.
+OPS_WRITABLE: frozenset[str] = frozenset({"OPS.md"})
+
 
 # ---------------------------------------------------------------------------
 # Canonical section headings — shared so templates / scaffold / prompts /
@@ -68,6 +77,11 @@ CANONICAL_SECTIONS: dict[str, list[str]] = {
     "TASK_QUEUE.md": ["In Progress", "Up Next", "Done"],
     "DECISIONS.md": ["Decisions"],
     "RESEARCH.md": ["Findings"],
+    # Phase 8 — the deployment ledger. One append-only section; entries are
+    # self-describing ``###`` blocks written by ``ops_ledger``. Scaffolded here
+    # (so the section anchor exists) but intentionally NOT in DEFAULT_SECTION or
+    # any judge writable set.
+    "OPS.md": ["Ledger"],
 }
 
 # Where a write with no/unknown section should land, per file. Used by the
@@ -259,6 +273,7 @@ def _title_for(filename: str, project_name: str) -> str:
         "TASK_QUEUE.md": f"# Task Queue: {project_name}",
         "DECISIONS.md": f"# Decisions: {project_name}",
         "RESEARCH.md": f"# Research: {project_name}",
+        "OPS.md": f"# Ops: {project_name}",
     }.get(filename, f"# {project_name}")
 
 

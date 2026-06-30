@@ -3039,3 +3039,9 @@ html, body, #root {
   background: var(--bg-input);
   color: var(--text);
 }
+
+/* Phase 8 — app-env registry panel */
+.env-registry { margin: 8px 0; }
+.env-registry > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+.env-add { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+.env-add .connector-input { flex: 1 1 120px; min-width: 0; }

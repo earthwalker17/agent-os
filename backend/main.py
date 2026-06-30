@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import re
+import time
 import mimetypes
 
 import memory_engine
@@ -74,6 +75,8 @@ from execution.browser_verification import (
 from execution.visual_judge import run_visual_review
 from execution import preview
 from execution import git_ops, github_connector
+from execution import app_env
+from execution import vercel_connector, ops_ledger
 from execution.inspect import (
     list_repo_files,
     read_repo_file,
@@ -1774,6 +1777,106 @@ def api_delete_github_credential(project_id: str, scope: str = "project"):
     )
 
 
+# ----- generic multi-provider connectors (Phase 8: vercel / supabase / stripe;
+# github keeps its own connector-validating routes above) -----
+#
+# Presence-only everywhere: a token VALUE is never echoed back. These are
+# declared AFTER the literal /credentials/github routes so github continues to
+# use its validating handlers; the {provider} param routes serve the rest.
+
+
+class SetConnectorCredentialRequest(BaseModel):
+    fields: dict[str, str] = {}
+    scope: str = "project"  # "project" | "global"
+    allow_live: bool = False  # explicit opt-in to store a non-test Stripe key
+
+
+def _require_known_provider(provider: str) -> None:
+    if provider not in credentials.PROVIDERS:
+        raise HTTPException(status_code=404, detail=f"unknown provider: {provider}")
+
+
+@app.get("/api/projects/{project_id}/connectors")
+def api_connectors_status(project_id: str):
+    """Presence status for every registered provider (no secret values)."""
+    _require_project_or_general(project_id)
+    return credentials.status_all(project_id)
+
+
+@app.get("/api/projects/{project_id}/credentials/{provider}")
+def api_get_connector_credential(project_id: str, provider: str):
+    _require_project_or_general(project_id)
+    _require_known_provider(provider)
+    return credentials.status(project_id, provider)
+
+
+@app.post("/api/projects/{project_id}/credentials/{provider}")
+def api_set_connector_credential(project_id: str, provider: str, req: SetConnectorCredentialRequest):
+    _require_project_or_general(project_id)
+    _require_known_provider(provider)
+    scope = req.scope if req.scope in ("project", "global") else "project"
+    fields = {k: v for k, v in (req.fields or {}).items() if isinstance(v, str) and v.strip()}
+    if not fields:
+        raise HTTPException(status_code=400, detail="at least one field value is required")
+    try:
+        credentials.set_credential(
+            provider,
+            None if scope == "global" else project_id,
+            fields=fields,
+            scope=scope,
+            allow_live=bool(req.allow_live),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return credentials.status(None if scope == "global" else project_id, provider)
+
+
+@app.delete("/api/projects/{project_id}/credentials/{provider}")
+def api_delete_connector_credential(project_id: str, provider: str, scope: str = "project"):
+    _require_project_or_general(project_id)
+    _require_known_provider(provider)
+    scope = scope if scope in ("project", "global") else "project"
+    return credentials.delete_credential(
+        provider, None if scope == "global" else project_id, scope=scope
+    )
+
+
+# ----- app-env registry (Phase 8: the BUILT app's env vars; presence-only,
+# values never echoed; pushed to Vercel via the env-set contract) -----
+
+
+class SetEnvVarRequest(BaseModel):
+    key: str
+    value: str
+    targets: list[str] | None = None
+    secret: bool = True
+
+
+@app.get("/api/projects/{project_id}/env")
+def api_list_env(project_id: str):
+    _require_project(project_id)
+    return {"vars": app_env.list_env(project_id)}
+
+
+@app.post("/api/projects/{project_id}/env")
+def api_set_env(project_id: str, req: SetEnvVarRequest):
+    _require_project(project_id)
+    try:
+        entry = app_env.set_env_var(
+            project_id, req.key, req.value, targets=req.targets, secret=req.secret
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"entry": entry, "vars": app_env.list_env(project_id)}
+
+
+@app.delete("/api/projects/{project_id}/env/{key}")
+def api_delete_env(project_id: str, key: str):
+    _require_project(project_id)
+    removed = app_env.delete_env_var(project_id, key)
+    return {"removed": removed, "vars": app_env.list_env(project_id)}
+
+
 # ----- per-run diff (lazy, bounded, redacted at capture time) -----
 
 
@@ -1883,10 +1986,19 @@ def api_git_push(project_id: str, run_id: str, req: GitPushRequest):
     status = git_ops.git_status(project_id)
     branch = req.branch or record.branch or status.branch
     remote_info = github_connector.get_remote(project_id, remote=req.remote)
+    owner, repo = req.owner, req.repo
+    if not remote_info and not (owner and repo):
+        # Lowest-friction fallback (Phase 8): a Vercel-linked project already
+        # knows its connected GitHub repo — push to that same repo instead of
+        # asking the user to re-specify it. Only consulted on the first push
+        # (once origin is set, get_remote resolves it directly).
+        link = vercel_connector.get_project_link(project_id)
+        if link and link.get("type") == "github" and link.get("org") and link.get("repo"):
+            owner, repo = link["org"], link["repo"]
     target = (
         f"{remote_info[0]}/{remote_info[1]}"
         if remote_info
-        else (f"{req.owner}/{req.repo}" if req.owner and req.repo else None)
+        else (f"{owner}/{repo}" if owner and repo else None)
     )
     cred = credentials.status(project_id)
     contract = {
@@ -1910,15 +2022,15 @@ def api_git_push(project_id: str, run_id: str, req: GitPushRequest):
             status_code=400, detail="no GitHub token configured — connect GitHub first"
         )
     if not remote_info:
-        if not (req.owner and req.repo):
+        if not (owner and repo):
             raise HTTPException(
                 status_code=400,
-                detail="no git remote configured; provide owner+repo or set a remote first",
+                detail="no git remote configured; link a Vercel project, provide owner+repo, or set a remote first",
             )
-        ok, info = github_connector.ensure_remote(project_id, req.owner, req.repo, remote=req.remote)
+        ok, info = github_connector.ensure_remote(project_id, owner, repo, remote=req.remote)
         if not ok:
             raise HTTPException(status_code=409, detail=f"could not set remote: {info}")
-        target = f"{req.owner}/{req.repo}"
+        target = f"{owner}/{repo}"
 
     record.git_state = "pushing"
     run_store.write_run_json(project_id, run_id, record)
@@ -2050,6 +2162,332 @@ def api_git_rollback(project_id: str, run_id: str, req: GitRollbackRequest):
         {"type": "git_rollback", "target": (record.base_commit or "")[:12]},
     )
     return {"contract": contract, "applied": True, "run": record.model_dump()}
+
+
+# --- Production Path endpoints (Phase 8 — Vercel deploy lifecycle) ---
+# Each external action is a two-phase External Action Contract (mirrors Phase 7
+# Git): ``confirm: false`` returns a preview, ``confirm: true`` executes. Deploy
+# / redeploy / rollback are RUN-scoped (they ship the commit a run produced —
+# the gitSource deploy needs a prior GitHub push). Env-set / status are
+# project-scoped. GENERAL is rejected for every mutating action. Secrets reach
+# Vercel only via the Authorization header inside the connector; values pushed
+# as env vars are read once via ``credentials.get_env_value`` at action time and
+# never echoed into a contract / event / log. A deploy finalizes OFF-THREAD
+# (a Vercel build is minutes) — the confirm returns immediately with
+# ``deploy_state`` set and the UI polls ``vercel/status`` / the run.
+
+_DEPLOY_POLL_INTERVAL = 5
+_DEPLOY_POLL_MAX = 300  # seconds — a stuck poll never blocks a worker forever
+
+
+def _utc_stamp() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ")
+
+
+def _read_record_safe(project_id: str, run_id: str) -> RunRecord | None:
+    raw = run_store.read_run_json(project_id, run_id)
+    if raw is None:
+        return None
+    try:
+        return RunRecord(**raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _finalize_vercel_deploy(
+    project_id: str,
+    run_id: str,
+    target: str,
+    *,
+    git_ref: str | None = None,
+    source_deployment_id: str | None = None,
+    with_latest_commit: bool = False,
+    kind: str = "deploy",
+) -> None:
+    """Create a Vercel deployment + poll to READY, then stamp the run + OPS
+    ledger. Runs on the background pool. Best-effort: never raises (the manager's
+    ``submit`` wrapper also guards). Clears the transient ``deploy_state`` in
+    every outcome so the run never sticks 'deploying'."""
+    # A valid project-name slug; the connector also sends `project` (the id),
+    # which overrides `name` on the Vercel API.
+    name = project_id
+    log_lines = [f"[{_utc_stamp()}] {kind} target={target} ref={git_ref or '-'} src={source_deployment_id or '-'}"]
+    if source_deployment_id:
+        res = vercel_connector.create_deployment(
+            project_id, name=name, target=target,
+            deployment_id=source_deployment_id, with_latest_commit=with_latest_commit,
+        )
+    else:
+        res = vercel_connector.create_deployment(project_id, name=name, target=target, git_ref=git_ref)
+    dep_id, state, url, error = res.deployment_id, res.ready_state, res.url, res.error
+    log_lines.append(f"created: id={dep_id} state={state} url={url or '-'} err={error or '-'}")
+    elapsed = 0
+    while dep_id and not error and state not in vercel_connector.TERMINAL_STATES and elapsed < _DEPLOY_POLL_MAX:
+        time.sleep(_DEPLOY_POLL_INTERVAL)
+        elapsed += _DEPLOY_POLL_INTERVAL
+        g = vercel_connector.get_deployment(project_id, dep_id)
+        if g.ok:
+            state = g.ready_state or state
+            url = g.url or url
+        else:
+            error = g.error or error
+        log_lines.append(f"poll +{elapsed}s: state={state} url={url or '-'}")
+
+    record = _read_record_safe(project_id, run_id)
+    if record is None:
+        return
+    record.deploy_state = None
+    record.external_state = None
+    blocker_msg: str | None = None
+    if dep_id and state == "READY":
+        record.deployment_id = dep_id
+        record.deployment_url = url
+        record.deployment_target = target
+    elif error or state in ("ERROR", "CANCELED", "DELETED"):
+        blocker_msg = credentials.redact(f"Vercel {kind} failed: {error or state}", project_id)
+    elif dep_id:
+        # Created but not confirmed READY before the cap — record it, flag verify.
+        record.deployment_id = dep_id
+        record.deployment_url = url
+        record.deployment_target = target
+        blocker_msg = f"Vercel {kind} did not reach READY before timeout — verify in the Vercel dashboard"
+    else:
+        blocker_msg = credentials.redact(f"Vercel {kind} failed: {error or 'no deployment id returned'}", project_id)
+    if blocker_msg and blocker_msg not in record.blockers:
+        record.blockers = list(record.blockers) + [blocker_msg]
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.write_deploy_log(project_id, run_id, credentials.redact("\n".join(log_lines), project_id))
+    run_store.write_deployment_json(
+        project_id, run_id,
+        {
+            "kind": kind, "target": target, "deployment_id": record.deployment_id,
+            "url": record.deployment_url, "ready_state": state,
+            "settled_at": _utc_stamp(), "error": blocker_msg,
+        },
+    )
+    run_store.append_event(
+        project_id, run_id,
+        {"type": "deploy_settled", "kind": kind, "ready_state": state, "deployment_id": record.deployment_id},
+    )
+    try:
+        run_store.rerender_result_md(project_id, run_id, record)
+    except Exception:  # noqa: BLE001
+        pass
+    if record.deployment_id:
+        ops_ledger.append_ops_entry(
+            project_id, kind, f"Vercel {kind} ({target})",
+            {
+                "target": f"vercel:{target}",
+                "deployment_id": record.deployment_id,
+                "preview_url": record.deployment_url,
+                "commit": (record.commit_sha or record.head_commit or None),
+                "ready_state": state,
+            },
+            timestamp=_utc_stamp(),
+            dedup_key=record.deployment_id,
+        )
+
+
+@app.get("/api/projects/{project_id}/vercel/status")
+def api_vercel_status(project_id: str):
+    _require_project_or_general(project_id)
+    return vercel_connector.status(project_id).to_dict()
+
+
+@app.get("/api/projects/{project_id}/vercel/deployments")
+def api_vercel_deployments(project_id: str):
+    _require_project(project_id)
+    deps, err = vercel_connector.list_deployments(project_id)
+    return {"deployments": deps, "error": err}
+
+
+class VercelDeployRequest(BaseModel):
+    environment: str = "preview"  # preview | production
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/vercel/deploy")
+def api_vercel_deploy(project_id: str, run_id: str, req: VercelDeployRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+    target = req.environment if req.environment in ("preview", "production") else "preview"
+    vstatus = vercel_connector.status(project_id)
+    git_ref = record.branch or "main"
+    contract = {
+        "action": "deploy",
+        "title": f"Deploy to Vercel ({target})",
+        "external": True,
+        "destructive": target == "production",
+        "target": target,
+        "token_configured": vstatus.configured,
+        "linked": bool(vstatus.project_id),
+        "git_ref": git_ref,
+        "commit": (record.commit_sha or record.head_commit or "")[:12] or None,
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+    if not vstatus.configured:
+        raise HTTPException(status_code=400, detail="no Vercel token configured (connect Vercel first)")
+    if not vstatus.project_id:
+        raise HTTPException(status_code=400, detail="no Vercel project linked (set project_id in the Vercel connector)")
+    if not (record.commit_sha or record.head_commit or record.pushed):
+        raise HTTPException(status_code=409, detail="push the commit to GitHub before deploying (gitSource deploy)")
+    if record.deploy_state:
+        raise HTTPException(status_code=409, detail="a deploy is already in flight for this run")
+    if record.deployment_id:
+        raise HTTPException(status_code=409, detail="this run already has a deployment; use redeploy or rollback")
+    record.deploy_state = "deploying"
+    record.external_state = "deploying"
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.append_event(project_id, run_id, {"type": "deploy_started", "target": target})
+    get_default_manager().submit(
+        _finalize_vercel_deploy, project_id, run_id, target, git_ref=git_ref, kind="deploy"
+    )
+    return {"contract": contract, "applied": True, "async": True, "run": record.model_dump()}
+
+
+class VercelRedeployRequest(BaseModel):
+    deployment_id: str
+    with_latest_commit: bool = False
+    environment: str = "preview"
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/vercel/redeploy")
+def api_vercel_redeploy(project_id: str, run_id: str, req: VercelRedeployRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+    target = req.environment if req.environment in ("preview", "production") else "preview"
+    vstatus = vercel_connector.status(project_id)
+    contract = {
+        "action": "redeploy",
+        "title": f"Redeploy on Vercel ({target})",
+        "external": True,
+        "destructive": target == "production",
+        "target": target,
+        "source_deployment_id": req.deployment_id,
+        "with_latest_commit": req.with_latest_commit,
+        "token_configured": vstatus.configured,
+        "linked": bool(vstatus.project_id),
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+    if not vstatus.configured or not vstatus.project_id:
+        raise HTTPException(status_code=400, detail="Vercel not configured/linked")
+    if record.deploy_state:
+        raise HTTPException(status_code=409, detail="a deploy is already in flight for this run")
+    record.deploy_state = "redeploying"
+    record.external_state = "redeploying"
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.append_event(project_id, run_id, {"type": "redeploy_started", "source": req.deployment_id})
+    get_default_manager().submit(
+        _finalize_vercel_deploy, project_id, run_id, target,
+        source_deployment_id=req.deployment_id, with_latest_commit=req.with_latest_commit, kind="redeploy",
+    )
+    return {"contract": contract, "applied": True, "async": True, "run": record.model_dump()}
+
+
+class VercelRollbackRequest(BaseModel):
+    target_deployment_id: str
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/vercel/rollback")
+def api_vercel_rollback(project_id: str, run_id: str, req: VercelRollbackRequest):
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    record = _load_run_record(project_id, run_id)
+    vstatus = vercel_connector.status(project_id)
+    contract = {
+        "action": "rollback",
+        "title": "Roll back Vercel production",
+        "external": True,
+        "destructive": True,
+        "target": req.target_deployment_id,
+        "current": record.deployment_id,
+        "token_configured": vstatus.configured,
+        "linked": bool(vstatus.project_id),
+        "summary": "Re-points production traffic to a previous deployment (instant, no rebuild).",
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False, "run": record.model_dump()}
+    if not vstatus.configured or not vstatus.project_id:
+        raise HTTPException(status_code=400, detail="Vercel not configured/linked")
+    record.deploy_state = "rolling_back"
+    record.external_state = "rolling_back"
+    run_store.write_run_json(project_id, run_id, record)
+    res = vercel_connector.promote_deployment(project_id, req.target_deployment_id)
+    record.deploy_state = None
+    record.external_state = None
+    if not res.ok:
+        run_store.write_run_json(project_id, run_id, record)
+        raise HTTPException(status_code=502, detail=res.error or "rollback failed")
+    record.deployment_id = req.target_deployment_id
+    record.deployment_target = "production"
+    run_store.write_run_json(project_id, run_id, record)
+    run_store.rerender_result_md(project_id, run_id, record)
+    run_store.append_event(project_id, run_id, {"type": "deploy_rollback", "target": req.target_deployment_id})
+    ops_ledger.append_ops_entry(
+        project_id, "rollback", "Vercel rollback (production)",
+        {"target": "vercel:production", "deployment_id": req.target_deployment_id},
+        timestamp=_utc_stamp(),
+    )
+    return {"contract": contract, "applied": True, "run": record.model_dump()}
+
+
+class VercelEnvSetRequest(BaseModel):
+    key: str
+    confirm: bool = False
+
+
+@app.post("/api/projects/{project_id}/vercel/env/set")
+def api_vercel_env_set(project_id: str, req: VercelEnvSetRequest):
+    _require_project(project_id)
+    entries = {e["key"]: e for e in app_env.list_env(project_id)}
+    entry = entries.get(req.key)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"env var {req.key} is not in the registry")
+    vstatus = vercel_connector.status(project_id)
+    # H4: a secret app-env var is FORCED to type "sensitive" (write-only on
+    # Vercel, not readable back / not in build logs); only an explicitly public
+    # var may be "plain".
+    var_type = "sensitive" if entry["secret"] else "plain"
+    contract = {
+        "action": "env_set",
+        "title": f"Push env var {req.key} to Vercel",
+        "external": True,
+        "destructive": False,
+        "key": req.key,
+        "targets": entry["targets"],
+        "type": var_type,
+        "value_configured": entry["is_set"],  # never the value itself
+        "token_configured": vstatus.configured,
+        "linked": bool(vstatus.project_id),
+        "requires_confirmation": True,
+    }
+    if not req.confirm:
+        return {"contract": contract, "applied": False}
+    if not vstatus.configured or not vstatus.project_id:
+        raise HTTPException(status_code=400, detail="Vercel not configured/linked")
+    if not entry["is_set"]:
+        raise HTTPException(status_code=400, detail="env var has no value set in the registry")
+    value = credentials.get_env_value(project_id, req.key)  # the ONLY value read
+    res = vercel_connector.set_env_var(
+        project_id, req.key, value or "", targets=entry["targets"], var_type=var_type
+    )
+    if not res.ok:
+        raise HTTPException(status_code=502, detail=res.error or "env var push failed")
+    ops_ledger.append_ops_entry(
+        project_id, "env_set", f"Pushed {req.key} to Vercel",
+        {"key": req.key, "targets": ",".join(entry["targets"]), "type": var_type},
+        timestamp=_utc_stamp(),
+    )
+    return {"contract": {**contract, "env_id": res.env_id}, "applied": True}
 
 
 # --- Main-agent file inspection endpoints (Task 06.1) ---

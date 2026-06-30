@@ -288,6 +288,18 @@ export interface RunRecord {
   diff_stat?: string | null
   /** Transient sub-status while a Git action runs; null at rest. UI treats as in-progress. */
   git_state?: 'checkpointing' | 'committing' | 'pushing' | 'opening_pr' | 'rolling_back' | null
+  /**
+   * Phase 8 — Production Path (Vercel deploy) linkage. Scalar refs only; never a
+   * secret. All optional so older runs render unchanged. Project-level
+   * provisioning facts (Stripe/Supabase) live in the OPS.md ledger, not here.
+   */
+  deployment_id?: string | null
+  deployment_url?: string | null
+  deployment_target?: 'preview' | 'production' | null
+  /** Transient sub-status while a deploy/redeploy/rollback runs; null at rest. */
+  deploy_state?: 'deploying' | 'building' | 'redeploying' | 'rolling_back' | null
+  /** Umbrella transient sub-status for any in-flight external action (UI poll gate). */
+  external_state?: string | null
 }
 
 /** Task 06.2D — managed preview dev-server status. */
@@ -373,4 +385,95 @@ export interface GitActionResponse {
   run: RunRecord
   commit_sha?: string | null
   refused?: string[]
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 8 — Production Path connectors, env registry, external actions */
+/* ------------------------------------------------------------------ */
+
+export type ConnectorProvider = 'github' | 'vercel' | 'supabase' | 'stripe'
+
+/** Phase 8 — presence-only status for any provider (never a value). The
+ * provider-specific metadata fields (login / username / project_ref / …) are
+ * optional and only set for the relevant provider. */
+export interface ConnectorStatus {
+  provider: string
+  configured: boolean
+  source: 'project' | 'global_file' | 'env' | 'none'
+  scope: 'project' | 'global' | 'none'
+  /** Presence (boolean) for each of the provider's secret fields — never values. */
+  secret_fields?: Record<string, boolean>
+  // github
+  login?: string | null
+  default_remote?: string | null
+  // vercel
+  username?: string | null
+  org_id?: string | null
+  project_id?: string | null
+  // supabase
+  project_ref?: string | null
+  url?: string | null
+  anon_key?: string | null
+  // stripe
+  account?: string | null
+  publishable_key?: string | null
+}
+
+/** Phase 8 — every provider's status, keyed by provider id (GET /connectors). */
+export type ConnectorStatusMap = Record<ConnectorProvider, ConnectorStatus>
+
+/** Phase 8 — live Vercel connector status (presence + linked project). */
+export interface VercelStatus extends ConnectorStatus {
+  connected?: boolean
+  linked?: boolean
+  error?: string | null
+}
+
+/** Phase 8 — one app-env var, presence-only (the built app's env; never a value). */
+export interface EnvVarEntry {
+  key: string
+  targets: string[]
+  secret: boolean
+  is_set: boolean
+}
+
+export type EnvRegistry = EnvVarEntry[]
+
+/** Phase 8 — external-action kinds the generic contract panel drives. */
+export type ExternalActionKind = 'deploy' | 'redeploy' | 'rollback' | 'env_set'
+
+/** Phase 8 — an External Action Contract (preview on confirm:false). Superset of
+ * the per-action fields; the panel reads only what each kind populates. */
+export interface ExternalActionContract {
+  action: string
+  title: string
+  external?: boolean
+  destructive?: boolean
+  requires_confirmation?: boolean
+  mode?: 'test' | 'live'
+  live_gate_passed?: boolean
+  target?: string | null
+  token_configured?: boolean
+  linked?: boolean
+  // deploy / redeploy / rollback
+  git_ref?: string | null
+  commit?: string | null
+  source_deployment_id?: string | null
+  with_latest_commit?: boolean
+  current?: string | null
+  summary?: string
+  // env_set
+  key?: string
+  targets?: string[]
+  type?: 'sensitive' | 'encrypted' | 'plain'
+  value_configured?: boolean
+  env_id?: string | null
+}
+
+/** Phase 8 — wrapper response from a two-phase external-action endpoint. */
+export interface ExternalActionResponse {
+  contract: ExternalActionContract
+  applied: boolean
+  async?: boolean
+  run?: RunRecord
 }

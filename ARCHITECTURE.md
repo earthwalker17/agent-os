@@ -101,12 +101,12 @@ conversations, messages, and pending executions.
 |-------------------|-------------------------------------------------------------------------|
 | `main.py`         | FastAPI app + all HTTP endpoints (projects, conversations, chat, memory, execution, inspection, verification, preview, **run control** — events / cancel / retry). Wires everything together. |
 | `orchestrator.py` | The chat brain. Loads SOUL + memory, **compacts** project memory for the prompt (Phase 6.1 `_compact_memory` — STATUS/PROJECT/SOUL whole, archive sections tail-trimmed over a threshold), assembles context (incl. an optional **mode** block from an `@`-command or a routed intent), produces the reply, runs the bounded inspection loop, then the structured **memory-intake** judge (`judge_memory_intake → MemoryDecision`). |
-| `memory_engine.py`| **Phase 6** — stdlib-only leaf module: the single markdown memory write path (`apply_update(base_dir, allow=…)` — policy-filtered, atomic, OSError-guarded, append-deduped, robust section replace), shared writable-file sets + `CANONICAL_SECTIONS` / `DEFAULT_SECTION`, the structured `MemoryDecision`, and idempotent `ensure_memory_scaffold`. Imported by both `orchestrator` and `execution.memory_reconciliation` (de-duped the old writers). |
+| `memory_engine.py`| **Phase 6** — stdlib-only leaf module: the single markdown memory write path (`apply_update(base_dir, allow=…)` — policy-filtered, atomic, OSError-guarded, append-deduped, robust section replace), shared writable-file sets + `CANONICAL_SECTIONS` / `DEFAULT_SECTION`, the structured `MemoryDecision`, and idempotent `ensure_memory_scaffold`. Imported by both `orchestrator` and `execution.memory_reconciliation` (de-duped the old writers). **Phase 8** adds `OPS_WRITABLE` + scaffolds `OPS.md` (a `## Ledger` section) but deliberately keeps it OUT of `WRITABLE_PROJECT` / `RECONCILIATION_WRITABLE` / `DEFAULT_SECTION` — so only the deterministic `ops_ledger` writes it, never an LLM judge. |
 | `llm.py`          | Thin LLM entry point: `chat(system, messages, model?, provider?) -> str` + `chat_vision(system, prompt, images, …)` for image input. Delegates to `providers.py` (07.1); shared transient-retry; no context assembly — callers own that. |
 | `providers.py`    | **Provider Registry 2.0** — capability-aware model providers (Claude / GPT / Gemini / DeepSeek / Kimi / GLM). Key-presence availability (+ accepted env aliases, e.g. `ZAI_API_KEY` for GLM), default-provider preference (Claude first), a per-provider **model registry** with per-model `vision` flags, env-overridable default model + base URL, model validation (`is_known_model`), a `complete()` dispatcher, and a `complete_vision()` text+image dispatcher gated on the **selected model's** vision flag (`is_vision_capable`/`model_is_vision`/`default_vision_model`/`vision_available`/`default_vision_provider`). Anthropic via SDK; GPT/DeepSeek/Kimi/GLM via OpenAI-compatible `urllib` HTTPS; Gemini via `generateContent` (no new deps). |
 | `database.py`     | SQLite persistence: conversations, messages, `pending_executions`. |
 | `uploads.py`      | Task 07.0 — chat attachment storage: filename sanitization + allow-list, per-dir dedup, chat-only storage under `chat_uploads/{conv}/`, optional workspace copy via `ProjectSandbox`. HTTP-agnostic (takes bytes). |
-| `credentials.py`  | **Phase 7** — central credential accessor (the only reader of secret values). Global token from env (`GITHUB_TOKEN`/aliases) + per-project gitignored `credentials/projects/{id}.json` (project overrides global). `get_github_token` (connector-only), `status` (presence/login only — never the value), `set/delete/update_github_*`, and `redact()` (strips known stored tokens + common token shapes). Store lives under `credentials/` (gitignored), outside `projects/`/`memory/`. |
+| `credentials.py`  | **Phase 7 + Phase 8** — central credential accessor (the only reader of secret values). **Phase 8** generalized it to a provider registry (`github | vercel | supabase | stripe`) with typed secret + non-secret fields: generic `get_token` / `get_secret` / `get_metadata` / `status` / `status_all` / `set_credential` / `update_metadata` / `delete_credential` (the `*_github_*` helpers stay as aliases) + `get_env_value` (the sole app-env value reader). **Stripe live-gate** at the store boundary (non-`*_test_` key refused unless `allow_live`). `redact()` widened (`sk_`/`rk_`/`whsec_`/`sbp_` shapes + a Postgres connection-string password regex + `_all_known_tokens` over every provider + a `register_secret_source` hook for app-env values) — **no bare-JWT regex** (anon is a public JWT; `service_role` is redacted by exact value, classified by field name). Store under `credentials/` (gitignored). |
 
 ### Execution layer (`backend/execution/`)
 | File                       | Purpose                                                                |
@@ -136,6 +136,9 @@ conversations, messages, and pending executions.
 | `git_ops.py`               | **Phase 7** — sandboxed local Git ops, all via `ToolRuntime.run_git`: `ensure_repo` (lazy `git init` + safe `.gitignore` + identity + initial commit), `git_status`, `current_branch`, `create_checkpoint` (out-of-branch snapshot via `write-tree`/`commit-tree` on a throwaway index → tagged), `capture_diff` (redacted + bounded, includes new files), `commit` (secret-refusing stage), `partition_changes`, `create_branch`, `rollback` (gated). Never raises into the run loop. |
 | `github_connector.py`      | **Phase 7** — GitHub via REST/`urllib` (no `gh` CLI, no new deps): `status` (validate token via `GET /user`), `ensure_remote` (tokenless URL), `push_branch` (token injected ONLY via `GIT_ASKPASS` env — never argv/`.git/config`), `create_pull_request` (`POST /pulls`). Output is redacted; the token never enters a logged surface. |
 | `_git_askpass.sh`          | Runtime-generated (gitignored, under `credentials/`) `GIT_ASKPASS` helper — echoes the token from an env var the connector sets per-push. Contains no secret; keeps the token out of argv and `.git/config`. |
+| `app_env.py`               | **Phase 8** — project-scoped app-env registry (`credentials/env/{id}.json`): the BUILT app's env vars (DATABASE_URL / NEXT_PUBLIC_* / STRIPE_*), DISTINCT from connector tokens. Presence-only `set/delete/list_env` (never a value); the single value reader is `credentials.get_env_value`; secret values register into the redactor. |
+| `vercel_connector.py`      | **Phase 8** — Vercel REST-over-`urllib` (no CLI for deploy/redeploy/rollback/env): `status` (whoami), `create_deployment` (gitSource), `get_deployment` (poll `readyState`), `list_deployments`, `promote_deployment` (rollback), `set_env_var`. Token in the `Authorization` header ONLY; every returned string `credentials.redact`-ed with `project_id`; `normalize_url` strips a protection-bypass query; never auto-creates a project. |
+| `ops_ledger.py`            | **Phase 8** — the ONE writer of `projects/{id}/OPS.md` (`append_ops_entry`): deterministic, ids/URLs/key-NAMES only, redacted at the call site, idempotent on a `dedup_key`; also appends a redacted line to `execution_workspaces/{id}/ops/events.jsonl`. OPS.md is scaffolded but excluded from every LLM-judge writable set. |
 
 `tests/` mirrors these per feature; all stub `llm.chat` so no API key is needed.
 
@@ -158,6 +161,10 @@ conversations, messages, and pending executions.
 | `components/RunTrace.tsx` | **Live Trace modal** — a lightweight vertical chronological thread of all run activity (planning, every file read/write/append/search, shell command, task start/finish, verification, repair, browser, cancel/retry). Pairs `tool_call`+`tool_result` into one row; drops raw `llm_response` (no chain-of-thought). Polls `…/events?since=` + run.json while active, auto-scrolls; replayable after the run. |
 | `components/runEventUtils.ts` | Shared event-rendering helpers (`kindFor` status→palette, `str`, `clockTime`) used by `RunTimeline` + `RunTrace`. |
 | `components/EditModal.tsx` / `ConfirmDialog.tsx` / `GlobalMemoryModal.tsx` | Memory editing, confirmations, global-memory viewer. |
+| `components/ConnectorsModal.tsx` (08) | Multi-provider connector setup (Vercel / Supabase / Stripe) over the generic `/credentials/{provider}` routes; write-only inputs, presence-only display, Stripe TEST badge + `allow_live` opt-in. (GitHub keeps its validating `ConnectorModal.tsx`.) |
+| `components/EnvRegistryPanel.tsx` (08) | Project app-env registry in `ContextPanel` — write-only values, presence list, per-key "Push to Vercel" (the env-set contract). |
+| `components/ExternalActionPanel.tsx` (08) | Generic two-phase External-Action contract preview block (external/destructive/TEST tags + confirm gate); shared driver for the deploy panel. |
+| `components/DeployOpsPanel.tsx` (08) | Production Path controls in the run chat card — deploy / redeploy / rollback contracts (preview→confirm), last-deploy URL/state badges, polls while a deploy is in flight. |
 
 ---
 
@@ -325,6 +332,23 @@ in `@review`/`@debug` (never the raw diff).
 
 ---
 
+### I. Production Path — Vercel deploy (Phase 8) — `vercel_connector` + `ops_ledger`
+Extends Project Ops from "delivered to GitHub" to "deployed". Same contract
+shape as §H. **Connectors** (`credentials.py` provider registry) hold Vercel /
+Supabase / Stripe tokens with the GitHub no-leak guarantees; an **app-env
+registry** (`app_env.py`) holds the built app's env vars (presence-only; the one
+value reader is `credentials.get_env_value`). **Deploy/redeploy/rollback** are
+run-scoped two-phase contracts (`POST …/runs/{id}/vercel/deploy|redeploy|rollback`,
+`confirm:false`→preview / `confirm:true`→execute); **env-set/status/deployments**
+are project-scoped; every mutating route rejects GENERAL. A deploy is **async**:
+confirm stamps a transient `deploy_state`, returns immediately, and finalizes
+off-thread (`BackgroundRunManager.submit` polls Vercel to `READY`) → stamps
+`deployment_url`/`id`/`target`, writes `deployment.json` + redacted `deploy.log`,
+re-renders `result.md`, and appends a redacted `OPS.md` ledger entry. Secrets
+reach Vercel only via the `Authorization` header / an env push value read once at
+action time — never a contract / event / log / artifact / the UI. (Stripe +
+Supabase connectors are designed but land in later increments.)
+
 ## 8. Core data model — `RunRecord` (serialized as `run.json`)
 
 `run_id`, `project_id`, `task_title`, `status` (`running`/`completed`/
@@ -356,7 +380,13 @@ anchor), `head_commit`, `branch`, `commit_sha`, `pushed`, `pr_url` / `pr_number`
 `git_state` sub-status (`checkpointing`/`committing`/`pushing`/`opening_pr`/
 `rolling_back`; mirrors `verification_state`, never a `RunStatus` value).
 `ResultSummary` gains compact `commit_sha`/`branch`/`pr_url`/`diff_stat` (metadata
-only). **No secret ever appears on either model.**
+only). **Phase 8** adds run-scoped deploy linkage (all `Optional`/defaulted):
+`deployment_id` / `deployment_url` (normalized, bypass-token stripped) /
+`deployment_target`, plus the transient sub-statuses `deploy_state` /
+`external_state` (mirror `git_state`; never a `RunStatus`). `ResultSummary` gains
+`deployment_url`/`deployment_target`. Project-level provisioning facts
+(Stripe/Supabase ids, env key names) live in the `OPS.md` ledger, NOT on the
+record. **No secret ever appears on either model.**
 
 Status semantics: **`completed` only after verification passes (or safe skip);**
 files-written-but-verification-failed is `partial`; `skipped` is acceptable only
@@ -397,6 +427,14 @@ values.
   `GIT_ASKPASS` subprocess env (tokenless remote) and never touch argv,
   `.git/config`, commits, logs, events, memory, prompts, or the UI; `credentials.py`
   is the sole secret reader and `status` is presence-only.
+- **External connectors are contract-first + secret-clean (Phase 8).** Vercel /
+  Supabase / Stripe go through the same two-phase preview→confirm contracts and
+  the single secret reader (`credentials.py`); a token reaches a connector only
+  via an `Authorization` header or an exec-time env, never argv/logs/artifacts/UI;
+  every returned string is redacted with the `project_id`. No inferred-intent
+  deploy/migration/payment; `orchestrator.py` imports no connector/executor
+  (asserted by a test). Stripe stays TEST-only behind a per-request executor gate.
+  `OPS.md` is written only by the deterministic `ops_ledger`, never by an LLM.
 
 ---
 

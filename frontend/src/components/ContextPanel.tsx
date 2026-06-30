@@ -1,5 +1,6 @@
 import type { ProjectContext } from '../types'
 import RunsSection from './RunsSection'
+import EnvRegistryPanel from './EnvRegistryPanel'
 
 interface Props {
   projectId: string | null
@@ -41,6 +42,8 @@ function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Pro
           )
         })}
       </div>
+
+      <EnvRegistryPanel projectId={projectId} />
 
       <RunsSection projectId={projectId} refreshSignal={runsRefreshSignal} />
     </aside>

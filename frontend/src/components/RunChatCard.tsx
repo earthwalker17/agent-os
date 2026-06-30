@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RunRecord } from '../types'
 import GitOpsPanel from './GitOpsPanel'
+import DeployOpsPanel from './DeployOpsPanel'
 
 interface Props {
   projectId: string
@@ -128,8 +129,17 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
   // Phase 7 — a Git action (commit/push/PR/rollback) sets a transient git_state;
   // keep polling so the card reflects the settled delivery state.
   const gitInFlight = record?.git_state != null
+  // Phase 8 — a deploy/redeploy finalizes off-thread; keep polling so the card
+  // reflects the settled deployment URL when it lands.
+  const deployInFlight = record?.deploy_state != null || record?.external_state != null
   const shouldPoll =
-    isRunning || commandVerifyingState || isVerifyingState || verifying || needsSettle || gitInFlight
+    isRunning ||
+    commandVerifyingState ||
+    isVerifyingState ||
+    verifying ||
+    needsSettle ||
+    gitInFlight ||
+    deployInFlight
   useEffect(() => {
     if (!shouldPoll) return
     const id = window.setInterval(() => {
@@ -602,6 +612,20 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
       {/* --- Phase 7: Project Ops (commit / push / PR / rollback) --- */}
       {isTerminal && status !== 'cancelled' && (
         <GitOpsPanel
+          projectId={projectId}
+          runId={runId}
+          record={record}
+          compact
+          onRecordChange={(rec) => {
+            if (mounted.current) setRecord(rec)
+            onRunsChanged?.()
+          }}
+        />
+      )}
+
+      {/* --- Phase 8: Production Path (deploy / redeploy / rollback) --- */}
+      {isTerminal && status !== 'cancelled' && (
+        <DeployOpsPanel
           projectId={projectId}
           runId={runId}
           record={record}

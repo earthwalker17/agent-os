@@ -8,6 +8,8 @@ Layout under `execution_workspaces/{project_id}/runs/{run_id}/`:
     result.md      — human-readable result summary
     plan.json      — Phase 5 execution plan / task graph
     diff.patch     — Phase 7 post-run diff (redacted, read on demand)
+    deployment.json— Phase 8 redacted deploy contract + result (read on demand)
+    deploy.log     — Phase 8 redacted build/CLI log (bounded, read on demand)
 
 This module only knows about reading/writing those files. The runner owns the
 loop logic; the API endpoints query through this store.
@@ -193,6 +195,43 @@ def write_diff_patch(project_id: str, run_id: str, content: str) -> None:
 
 def read_diff_patch(project_id: str, run_id: str) -> str | None:
     path = get_run_dir(project_id, run_id) / "diff.patch"
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+# Phase 8 — deployment artifacts. ``deployment.json`` holds the redacted deploy
+# contract + result (deployment id/url/target/timestamps); ``deploy.log`` holds
+# the bounded raw build/CLI log. Both are read on demand (never inlined into
+# run.json / result.md / the main-agent context, §6). The connector MUST redact
+# any string (``credentials.redact(text, project_id)``) BEFORE it reaches here.
+_DEPLOY_LOG_MAX_CHARS = 200_000
+
+
+def write_deployment_json(project_id: str, run_id: str, data: dict) -> None:
+    path = get_run_dir(project_id, run_id) / "deployment.json"
+    _atomic_write_text(path, json.dumps(data, indent=2, default=str))
+
+
+def read_deployment_json(project_id: str, run_id: str) -> dict | None:
+    path = get_run_dir(project_id, run_id) / "deployment.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def write_deploy_log(project_id: str, run_id: str, content: str) -> None:
+    text = content or ""
+    if len(text) > _DEPLOY_LOG_MAX_CHARS:
+        text = text[:_DEPLOY_LOG_MAX_CHARS] + "\n... [deploy.log truncated] ...\n"
+    _atomic_write_text(get_run_dir(project_id, run_id) / "deploy.log", text)
+
+
+def read_deploy_log(project_id: str, run_id: str) -> str | None:
+    path = get_run_dir(project_id, run_id) / "deploy.log"
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
@@ -387,6 +426,7 @@ def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
         f"{_visual_review_block(record.visual_review)}"
         f"{_render_plan_section(record.plan)}"
         f"{_git_section(record)}"
+        f"{_deployment_section(record)}"
         f"## Notes for Main Agent\n{notes.strip() or '_(none)_'}\n"
     )
 
@@ -426,6 +466,26 @@ def _git_section(record: RunRecord) -> str:
     if record.pr_url:
         num = f" (#{record.pr_number})" if record.pr_number else ""
         lines.append(f"- pull request{num}: {record.pr_url}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _deployment_section(record: RunRecord) -> str:
+    """Render the Phase 8 Deployment section for result.md.
+
+    Returns ``""`` when the run has no deployment, so result.md for non-deploy
+    runs stays byte-identical to the legacy output (same empty-when-absent
+    discipline as ``_git_section``). Metadata only — never a secret, never the
+    raw build log (that lives in ``deploy.log``).
+    """
+    if not any((record.deployment_id, record.deployment_url, record.deployment_target)):
+        return ""
+    lines: list[str] = ["## Deployment"]
+    if record.deployment_target:
+        lines.append(f"- target: `vercel:{record.deployment_target}`")
+    if record.deployment_url:
+        lines.append(f"- url: {record.deployment_url}")
+    if record.deployment_id:
+        lines.append(f"- deployment: `{record.deployment_id}`")
     return "\n".join(lines) + "\n\n"
 
 

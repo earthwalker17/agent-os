@@ -155,6 +155,78 @@ def test_result_md_renders_git_section():
     assert "diff --git" not in md
 
 
+# ---------- Phase 8: deployment fields + artifacts + section ----------
+
+
+def test_old_record_round_trips_deploy_fields():
+    rec = RunRecord(run_id="r1", project_id="p", task_title="t", status="completed")
+    assert rec.deployment_id is None
+    assert rec.deployment_url is None
+    assert rec.deployment_target is None
+    assert rec.deploy_state is None
+    assert rec.external_state is None
+    # ResultSummary defaults too
+    rs = ResultSummary(run_id="r", status="completed")
+    assert rs.deployment_url is None and rs.deployment_target is None
+
+
+def test_deploy_fields_serialize():
+    rec = RunRecord(
+        run_id="r1",
+        project_id="p",
+        task_title="t",
+        status=RunStatus.COMPLETED,
+        deployment_id="dpl_abc123",
+        deployment_url="https://app-xyz.vercel.app",
+        deployment_target="preview",
+    )
+    rt = RunRecord(**json.loads(rec.model_dump_json()))
+    assert rt.deployment_id == "dpl_abc123"
+    assert rt.deployment_url == "https://app-xyz.vercel.app"
+    assert rt.deployment_target == "preview"
+
+
+def test_result_md_no_deployment_section_for_plain_run():
+    rec = RunRecord(run_id="r", project_id="p", task_title="t", status=RunStatus.COMPLETED)
+    md = run_store.render_result_md(rec, "did stuff")
+    assert "## Deployment" not in md
+    # legacy-identity guard: the section is "" when absent, so inserting it does
+    # not change a non-deploy run's rendered output.
+    assert run_store._deployment_section(rec) == ""
+
+
+def test_result_md_renders_deployment_section():
+    rec = RunRecord(
+        run_id="r",
+        project_id="p",
+        task_title="t",
+        status=RunStatus.COMPLETED,
+        deployment_id="dpl_abc123",
+        deployment_url="https://app-xyz.vercel.app",
+        deployment_target="preview",
+    )
+    md = run_store.render_result_md(rec, "did stuff")
+    assert "## Deployment" in md
+    assert "vercel:preview" in md
+    assert "https://app-xyz.vercel.app" in md
+    assert "dpl_abc123" in md
+
+
+def test_deployment_artifacts_round_trip():
+    def body(_):
+        run_store.init_run_dir("p", "r1")
+        run_store.write_deployment_json("p", "r1", {"deployment_id": "dpl_x", "url": "https://a.vercel.app"})
+        got = run_store.read_deployment_json("p", "r1")
+        assert got and got["deployment_id"] == "dpl_x"
+        assert run_store.read_deployment_json("p", "missing") is None
+        run_store.write_deploy_log("p", "r1", "build ok\n")
+        assert "build ok" in (run_store.read_deploy_log("p", "r1") or "")
+        run_store.write_deploy_log("p", "r1", "x" * (run_store._DEPLOY_LOG_MAX_CHARS + 5000))
+        assert "truncated" in (run_store.read_deploy_log("p", "r1") or "")
+
+    _run(body)
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []
