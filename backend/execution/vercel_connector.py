@@ -399,7 +399,14 @@ def set_env_var(
         return EnvVarResult(error="no Vercel project linked")
     if not value:
         return EnvVarResult(error="no value to push (set it in the env registry first)")
-    payload = {"key": key, "value": value, "type": var_type, "target": list(targets)}
+    target_list = list(targets)
+    if var_type == "sensitive":
+        # Vercel rejects a Sensitive env var that targets "development"
+        # ("You cannot set a Sensitive Environment Variable's target to
+        # development."). Restrict sensitive vars to production/preview so a
+        # secret app-env var (which is forced to type="sensitive") still pushes.
+        target_list = [t for t in target_list if t != "development"] or ["production", "preview"]
+    payload = {"key": key, "value": value, "type": var_type, "target": target_list}
     try:
         code, data = _vercel_api(
             "POST",

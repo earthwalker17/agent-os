@@ -1,6 +1,8 @@
 import type { ProjectContext } from '../types'
 import RunsSection from './RunsSection'
 import EnvRegistryPanel from './EnvRegistryPanel'
+import GitPanel from './GitPanel'
+import ExternalLinksPanel from './ExternalLinksPanel'
 
 interface Props {
   projectId: string | null
@@ -43,7 +45,11 @@ function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Pro
         })}
       </div>
 
+      <GitPanel projectId={projectId} refreshSignal={runsRefreshSignal} />
+
       <EnvRegistryPanel projectId={projectId} />
+
+      <ExternalLinksPanel projectId={projectId} refreshSignal={runsRefreshSignal} />
 
       <RunsSection projectId={projectId} refreshSignal={runsRefreshSignal} />
     </aside>

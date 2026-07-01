@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { ConnectorProvider, ConnectorStatus } from '../types'
 
 interface Props {
@@ -15,28 +15,35 @@ interface FieldDef {
 
 interface ProviderDef {
   label: string
+  /** The account-level access token now lives in backend/.env, not the UI. */
+  envHint: { field: string; env: string }
   secrets: FieldDef[]
   meta: FieldDef[]
   note?: string
 }
 
-// github keeps its own dedicated connector modal (it validates + captures login);
+// github keeps its own dedicated Git panel (token → .env, repo URL project-level);
 // this modal covers the Phase 8 providers via the generic /credentials/{provider}.
+//
+// Account-level access TOKENS are entered once in backend/.env (VERCEL_TOKEN,
+// SUPABASE_ACCESS_TOKEN, STRIPE_SECRET_KEY) — the connectors read them from
+// there. Only PROJECT-specific fields are entered here.
 const CONFIG: Record<Exclude<ConnectorProvider, 'github'>, ProviderDef> = {
   vercel: {
     label: 'Vercel',
-    secrets: [{ key: 'token', label: 'Access token', placeholder: 'from vercel.com/account/tokens' }],
+    envHint: { field: 'Access token', env: 'VERCEL_TOKEN' },
+    secrets: [],
     meta: [
-      { key: 'org_id', label: 'Team / Org ID (optional)' },
       { key: 'project_id', label: 'Project ID (link the Vercel project)' },
+      { key: 'org_id', label: 'Team / Org ID (optional)' },
     ],
   },
   supabase: {
     label: 'Supabase',
+    envHint: { field: 'Access token (sbp_…)', env: 'SUPABASE_ACCESS_TOKEN' },
     secrets: [
-      { key: 'access_token', label: 'Access token (sbp_…)' },
-      { key: 'db_password', label: 'Database password' },
-      { key: 'service_role', label: 'service_role key (optional, secret)' },
+      { key: 'db_password', label: 'Database password (project-specific)' },
+      { key: 'service_role', label: 'service_role key (optional, project-specific)' },
     ],
     meta: [
       { key: 'project_ref', label: 'Project ref' },
@@ -46,9 +53,9 @@ const CONFIG: Record<Exclude<ConnectorProvider, 'github'>, ProviderDef> = {
   },
   stripe: {
     label: 'Stripe (TEST)',
+    envHint: { field: 'Secret key (sk_test_…)', env: 'STRIPE_SECRET_KEY' },
     secrets: [
-      { key: 'secret_key', label: 'Secret key (sk_test_…)' },
-      { key: 'webhook_secret', label: 'Webhook signing secret (whsec_…)' },
+      { key: 'webhook_secret', label: 'Webhook signing secret (whsec_…, usually auto-set on register)' },
     ],
     meta: [{ key: 'publishable_key', label: 'Publishable key (pk_test_…, public)' }],
     note: 'Test mode only — a live key is refused unless you explicitly allow it.',
@@ -58,9 +65,11 @@ const CONFIG: Record<Exclude<ConnectorProvider, 'github'>, ProviderDef> = {
 const PROVIDERS = Object.keys(CONFIG) as Exclude<ConnectorProvider, 'github'>[]
 
 /**
- * Phase 8 — multi-provider connector setup (Vercel / Supabase / Stripe). Secrets
- * are written to the gitignored credential store and never returned; the UI only
- * ever shows presence. Mirrors the GitHub ConnectorModal but generalized.
+ * Phase 8 — multi-provider connector setup (Vercel / Supabase / Stripe). Account
+ * tokens are set in backend/.env; only project-specific fields are entered here.
+ * Secrets are write-only (never returned); saved non-secret metadata stays
+ * visible in the inputs so the user can see + edit what's set. Closing with
+ * unsaved edits prompts to save first — only Save persists.
  */
 function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
   const [provider, setProvider] = useState<Exclude<ConnectorProvider, 'github'>>('vercel')
@@ -70,6 +79,7 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [statuses, setStatuses] = useState<Record<string, ConnectorStatus>>({})
+  const [dirty, setDirty] = useState(false)
 
   const def = CONFIG[provider]
   const current = statuses[provider]
@@ -87,27 +97,37 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
     load()
   }, [load])
 
-  // reset the form when switching providers
+  // Prefill the (non-secret) metadata inputs from the saved status so the user
+  // always sees what's set — and re-runs after a save/provider-switch. Secret
+  // inputs stay blank (write-only) but their label shows "(set)".
   useEffect(() => {
-    setFields({})
+    const st = statuses[provider] as unknown as Record<string, unknown> | undefined
+    const init: Record<string, string> = {}
+    for (const f of CONFIG[provider].meta) {
+      const v = st?.[f.key]
+      if (v != null && String(v).trim()) init[f.key] = String(v)
+    }
+    setFields(init)
+    setDirty(false)
     setError(null)
     setAllowLive(false)
-  }, [provider])
+  }, [provider, statuses])
 
-  const setField = (k: string, v: string) => setFields((f) => ({ ...f, [k]: v }))
+  const setField = (k: string, v: string) => {
+    setFields((f) => ({ ...f, [k]: v }))
+    setDirty(true)
+  }
 
-  const hasInput = useMemo(() => Object.values(fields).some((v) => v.trim()), [fields])
-
-  const save = async () => {
-    if (!hasInput) {
-      setError('Enter at least one value')
-      return
+  const save = async (): Promise<boolean> => {
+    const clean: Record<string, string> = {}
+    for (const [k, v] of Object.entries(fields)) if (v.trim()) clean[k] = v.trim()
+    if (Object.keys(clean).length === 0) {
+      setError('Enter at least one project value')
+      return false
     }
     setBusy(true)
     setError(null)
     try {
-      const clean: Record<string, string> = {}
-      for (const [k, v] of Object.entries(fields)) if (v.trim()) clean[k] = v.trim()
       const res = await fetch(`/api/projects/${projectId}/credentials/${provider}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -115,11 +135,13 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
-      await load()
-      setFields({})
+      await load() // re-prefill from the refreshed status (keeps saved values visible)
       onSaved?.()
+      setDirty(false)
+      return true
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to save')
+      return false
     } finally {
       setBusy(false)
     }
@@ -132,6 +154,7 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
       await fetch(`/api/projects/${projectId}/credentials/${provider}?scope=${scope}`, { method: 'DELETE' })
       await load()
       onSaved?.()
+      setDirty(false)
     } catch {
       setError('Failed to disconnect')
     } finally {
@@ -139,8 +162,23 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
     }
   }
 
+  // Closing with unsaved edits prompts to save (only Save persists).
+  const attemptClose = useCallback(async () => {
+    if (dirty && !busy) {
+      const doSave = window.confirm(
+        'You have unsaved changes.\n\nOK — Save & close\nCancel — Discard changes & close',
+      )
+      if (doSave) {
+        const ok = await save()
+        if (!ok) return // save failed — stay open so the user can fix it
+      }
+    }
+    onClose()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty, busy])
+
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-overlay" onClick={attemptClose}>
       <div className="connector-modal" onClick={(e) => e.stopPropagation()}>
         <h3>Connectors</h3>
         <div className="gitops-actions" style={{ marginBottom: 8 }}>
@@ -159,11 +197,18 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
 
         <p className="run-chat-muted">
           {def.note ||
-            'Stored in the gitignored credential store. Never appears in prompts, logs, commits, memory, or the UI.'}
+            'Only project-specific fields are entered here — saved values stay visible. Secrets are write-only and never shown again.'}
         </p>
+
+        {/* Account-level token lives in .env, not the UI. */}
+        <div className="connector-env-hint">
+          {def.envHint.field}: set <code>{def.envHint.env}</code> in <code>backend/.env</code>{' '}
+          (account-level — shared by all projects).
+        </div>
+
         {current?.configured && (
           <p className="run-chat-muted">
-            Currently configured · scope {current.scope} · source {current.source}
+            Token configured · scope {current.scope} · source {current.source}
           </p>
         )}
 
@@ -178,7 +223,7 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
               className="connector-input"
               value={fields[f.key] || ''}
               onChange={(e) => setField(f.key, e.target.value)}
-              placeholder={f.placeholder || '••••••'}
+              placeholder={current?.secret_fields?.[f.key] ? '•••••• (saved — leave blank to keep)' : f.placeholder || '••••••'}
               autoComplete="off"
             />
           </div>
@@ -191,6 +236,7 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
               className="connector-input"
               value={fields[f.key] || ''}
               onChange={(e) => setField(f.key, e.target.value)}
+              placeholder={f.placeholder || ''}
               autoComplete="off"
             />
           </div>
@@ -208,14 +254,14 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
 
         {provider === 'stripe' && (
           <label className="run-chat-muted" style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 }}>
-            <input type="checkbox" checked={allowLive} onChange={(e) => setAllowLive(e.target.checked)} />
+            <input type="checkbox" checked={allowLive} onChange={(e) => { setAllowLive(e.target.checked); setDirty(true) }} />
             Allow a live (non-test) key — discouraged
           </label>
         )}
 
         {error && <div className="run-chat-error">{error}</div>}
         <div className="modal-actions">
-          <button className="gitops-confirm" onClick={save} disabled={busy}>
+          <button className="gitops-confirm" onClick={save} disabled={busy || !dirty}>
             {busy ? 'Saving…' : 'Save'}
           </button>
           {current?.configured && (
@@ -223,7 +269,7 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
               Disconnect
             </button>
           )}
-          <button className="btn-cancel" onClick={onClose} disabled={busy}>
+          <button className="btn-cancel" onClick={attemptClose} disabled={busy}>
             Close
           </button>
         </div>

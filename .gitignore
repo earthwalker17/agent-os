@@ -129,3 +129,7 @@ desktop.ini
 tmp/
 temp/
 .cache/
+
+# Locally-installed external CLIs (supabase / stripe) — per-machine binaries
+# used by the sandboxed executors; large + platform-specific, never committed.
+.tools/

@@ -1788,6 +1788,51 @@ def api_delete_github_credential(project_id: str, scope: str = "project"):
     )
 
 
+# ----- project GitHub repo target (owner/repo) -----
+# Distinct from the account-level token (which lives in .env): the repo a project
+# is pushed to is project-specific, so it is entered in the UI. Stored as the
+# github connector's ``default_remote`` metadata; read project-first via
+# get_metadata so it works even when the token comes from .env.
+
+
+def _parse_owner_repo(url: str) -> str:
+    """Normalize a GitHub repo reference to ``owner/repo``. Accepts
+    ``owner/repo``, ``https://github.com/owner/repo(.git)``, or
+    ``git@github.com:owner/repo(.git)``. Raises 400 on anything else."""
+    u = (url or "").strip()
+    u = re.sub(r"^https?://github\.com/", "", u, flags=re.IGNORECASE)
+    u = re.sub(r"^git@github\.com:", "", u, flags=re.IGNORECASE)
+    u = re.sub(r"\.git$", "", u, flags=re.IGNORECASE).strip("/")
+    parts = [p for p in u.split("/") if p]
+    if len(parts) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="enter a GitHub repo as owner/repo or a github.com URL",
+        )
+    return f"{parts[0]}/{parts[1]}"
+
+
+class SetRepoUrlRequest(BaseModel):
+    repo_url: str
+
+
+@app.get("/api/projects/{project_id}/github/repo")
+def api_get_github_repo(project_id: str):
+    _require_project(project_id)
+    remote = credentials.get_metadata("github", "default_remote", project_id)
+    return {"repo": remote, "url": f"https://github.com/{remote}" if remote else None}
+
+
+@app.post("/api/projects/{project_id}/github/repo")
+def api_set_github_repo(project_id: str, req: SetRepoUrlRequest):
+    _require_project(project_id)
+    remote = _parse_owner_repo(req.repo_url)
+    credentials.set_credential(
+        "github", project_id, fields={"default_remote": remote}, scope="project"
+    )
+    return {"repo": remote, "url": f"https://github.com/{remote}"}
+
+
 # ----- generic multi-provider connectors (Phase 8: vercel / supabase / stripe;
 # github keeps its own connector-validating routes above) -----
 #
@@ -1999,6 +2044,13 @@ def api_git_push(project_id: str, run_id: str, req: GitPushRequest):
     remote_info = github_connector.get_remote(project_id, remote=req.remote)
     owner, repo = req.owner, req.repo
     if not remote_info and not (owner and repo):
+        # The project's stored GitHub repo (set from the "GitHub repo" field in
+        # the UI, kept as the github connector's default_remote) is the canonical
+        # push target — so a push needs no owner/repo re-entry from any path.
+        stored = credentials.get_metadata("github", "default_remote", project_id)
+        if stored and "/" in stored:
+            owner, repo = stored.split("/", 1)
+    if not remote_info and not (owner and repo):
         # Lowest-friction fallback (Phase 8): a Vercel-linked project already
         # knows its connected GitHub repo — push to that same repo instead of
         # asking the user to re-specify it. Only consulted on the first push
@@ -2055,6 +2107,15 @@ def api_git_push(project_id: str, run_id: str, req: GitPushRequest):
     record.branch = branch
     run_store.write_run_json(project_id, run_id, record)
     run_store.rerender_result_md(project_id, run_id, record)
+    # Remember where this project pushes so the UI can show a clickable repo link
+    # afterward (idempotent; never stores a token).
+    if target and "/" in target:
+        try:
+            credentials.set_credential(
+                "github", project_id, fields={"default_remote": target}, scope="project"
+            )
+        except Exception:  # noqa: BLE001 — best-effort, never fail a push
+            pass
     run_store.append_event(
         project_id,
         run_id,

@@ -258,6 +258,45 @@ def test_set_env_var_sensitive_type_in_body():
     _run(body)
 
 
+def test_set_env_var_sensitive_drops_development_target():
+    """Vercel rejects a Sensitive env var that targets ``development``
+    ("You cannot set a Sensitive Environment Variable's target to development").
+    A sensitive var requested for all three targets must be sent as
+    production/preview only."""
+    def body(sb):
+        credentials.set_credential("vercel", "proj", fields={"token": "t"})
+        credentials.update_metadata("vercel", "proj", {"project_id": "prj_1"})
+        op = _ok_opener(201, {"created": {"id": "env_2"}})
+        res = vc.set_env_var(
+            "proj", "STRIPE_SECRET_KEY", "sk_test_x",
+            targets=["production", "preview", "development"], var_type="sensitive", opener=op,
+        )
+        assert res.ok
+        sent = json.loads(op.captured["data"])
+        assert "development" not in sent["target"]
+        assert set(sent["target"]) == {"production", "preview"}
+
+    _run(body)
+
+
+def test_set_env_var_plain_keeps_all_targets():
+    """A non-sensitive (plain) var keeps every requested target, including
+    ``development`` — the drop is scoped to sensitive vars only."""
+    def body(sb):
+        credentials.set_credential("vercel", "proj", fields={"token": "t"})
+        credentials.update_metadata("vercel", "proj", {"project_id": "prj_1"})
+        op = _ok_opener(201, {"created": {"id": "env_3"}})
+        res = vc.set_env_var(
+            "proj", "NEXT_PUBLIC_X", "v",
+            targets=["production", "preview", "development"], var_type="plain", opener=op,
+        )
+        assert res.ok
+        sent = json.loads(op.captured["data"])
+        assert set(sent["target"]) == {"production", "preview", "development"}
+
+    _run(body)
+
+
 def test_status_presence_only():
     def body(sb):
         credentials.set_credential("vercel", "proj", fields={"token": "TopSecretVercel"})

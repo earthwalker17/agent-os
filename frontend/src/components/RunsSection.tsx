@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { GitHubConnectorStatus, GitStatus, PreviewStatus, RunRecord } from '../types'
+import type { PreviewStatus, RunRecord } from '../types'
 import RunDetailModal from './RunDetailModal'
 import RunTrace from './RunTrace'
-import ConnectorModal from './ConnectorModal'
-import ConnectorsModal from './ConnectorsModal'
 
 interface Props {
   projectId: string
@@ -71,11 +69,6 @@ function RunsSection({ projectId, refreshSignal }: Props) {
   const [preview, setPreview] = useState<PreviewStatus | null>(null)
   const [previewBusy, setPreviewBusy] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
-  // Phase 7 — project-level Git + GitHub connector state.
-  const [gitStatus, setGitStatus] = useState<GitStatus | null>(null)
-  const [connector, setConnector] = useState<GitHubConnectorStatus | null>(null)
-  const [showConnector, setShowConnector] = useState(false)
-  const [showConnectors, setShowConnectors] = useState(false)
 
   const loadRuns = useCallback(async () => {
     setLoading(true)
@@ -116,31 +109,11 @@ function RunsSection({ projectId, refreshSignal }: Props) {
     }
   }, [projectId])
 
-  const loadGit = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/projects/${projectId}/git/status`)
-      setGitStatus(res.ok ? await res.json() : null)
-    } catch {
-      setGitStatus(null)
-    }
-  }, [projectId])
-
-  const loadConnector = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/projects/${projectId}/github/connector`)
-      setConnector(res.ok ? await res.json() : null)
-    } catch {
-      setConnector(null)
-    }
-  }, [projectId])
-
   // Initial load + reload on project switch + manual refresh signal.
   useEffect(() => {
     loadRuns()
     loadPreview()
-    loadGit()
-    loadConnector()
-  }, [loadRuns, loadPreview, loadGit, loadConnector, refreshSignal])
+  }, [loadRuns, loadPreview, refreshSignal])
 
   // Auto-poll while any run is active. The effect re-binds only when the
   // *presence* of active runs flips, not on every fetch tick, so the interval
@@ -154,10 +127,9 @@ function RunsSection({ projectId, refreshSignal }: Props) {
     const id = window.setInterval(() => {
       loadRuns()
       loadPreview()
-      loadGit()
     }, POLL_INTERVAL_MS)
     return () => window.clearInterval(id)
-  }, [hasActive, loadRuns, loadPreview, loadGit])
+  }, [hasActive, loadRuns, loadPreview])
 
   const startPreview = useCallback(async () => {
     setPreviewBusy(true)
@@ -303,46 +275,6 @@ function RunsSection({ projectId, refreshSignal }: Props) {
         </div>
       )}
 
-      {/* Phase 7 — project-level Git + GitHub connector strip. */}
-      {(gitStatus?.is_repo || connector) && (
-        <div className="git-control">
-          <div className="git-control-row">
-            {gitStatus?.is_repo ? (
-              <span className="git-branch-badge" title="Current branch + working-tree state">
-                ⎇ {gitStatus.branch || 'detached'}
-                {gitStatus.dirty ? (
-                  <span className="git-dirty"> · {(gitStatus.untracked ?? 0) + (gitStatus.modified ?? 0) + (gitStatus.staged ?? 0)} uncommitted</span>
-                ) : (
-                  <span className="git-clean"> · clean</span>
-                )}
-              </span>
-            ) : (
-              <span className="run-chat-muted">No git repo yet (created on first run)</span>
-            )}
-            <button
-              type="button"
-              className={`git-connect-btn${connector?.connected ? ' connected' : ''}`}
-              onClick={() => setShowConnector(true)}
-              title="Connect a GitHub token for push + pull requests"
-            >
-              {connector?.connected
-                ? `GitHub: ${connector.login || 'connected'}`
-                : connector?.configured
-                  ? 'GitHub: configured'
-                  : 'Connect GitHub'}
-            </button>
-            <button
-              type="button"
-              className="git-connect-btn"
-              onClick={() => setShowConnectors(true)}
-              title="Connect Vercel / Supabase / Stripe (Production Path)"
-            >
-              Connectors
-            </button>
-          </div>
-        </div>
-      )}
-
       {error && <div className="runs-error">{error}</div>}
 
       {!error && runs.length === 0 && !loading && (
@@ -404,7 +336,6 @@ function RunsSection({ projectId, refreshSignal }: Props) {
           onRunsChanged={() => {
             loadRuns()
             loadPreview()
-            loadGit()
           }}
         />
       )}
@@ -415,22 +346,6 @@ function RunsSection({ projectId, refreshSignal }: Props) {
           runId={openTraceId}
           onClose={() => setOpenTraceId(null)}
         />
-      )}
-
-      {showConnector && (
-        <ConnectorModal
-          projectId={projectId}
-          status={connector}
-          onClose={() => setShowConnector(false)}
-          onSaved={(s) => {
-            setConnector(s)
-            loadGit()
-          }}
-        />
-      )}
-
-      {showConnectors && (
-        <ConnectorsModal projectId={projectId} onClose={() => setShowConnectors(false)} />
       )}
     </details>
   )

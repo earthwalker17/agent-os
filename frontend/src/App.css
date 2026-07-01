@@ -3045,3 +3045,36 @@ html, body, #root {
 .env-registry > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
 .env-add { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
 .env-add .connector-input { flex: 1 1 120px; min-width: 0; }
+
+/* Git panel + external-links panel (mirror the env-registry panel style) */
+.git-panel,
+.links-panel { margin: 8px 0; }
+.git-panel > summary,
+.links-panel > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+.git-panel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 4px 0;
+}
+.git-conn-badge { font-size: 12px; color: var(--text-muted); }
+.git-conn-badge.connected { color: #2ea043; }
+.connector-env-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin: 4px 0;
+}
+.external-link {
+  color: var(--accent, #3b82f6);
+  text-decoration: none;
+  font-size: 12px;
+  word-break: break-all;
+}
+.external-link:hover { text-decoration: underline; }
+.links-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.links-item { padding: 3px 0; }

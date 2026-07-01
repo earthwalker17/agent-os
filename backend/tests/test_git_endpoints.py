@@ -322,6 +322,72 @@ def test_credentials_work_in_general():
     _run(body)
 
 
+# ---------- github repo target (owner/repo) ----------
+
+
+def test_github_repo_endpoint_set_get():
+    def body(env):
+        env.make_project("p")
+        # empty initially
+        g0 = env.client.get("/api/projects/p/github/repo")
+        assert g0.status_code == 200 and g0.json()["repo"] is None
+        # accepts a full URL (with .git) and normalizes to owner/repo
+        s = env.client.post("/api/projects/p/github/repo", json={"repo_url": "https://github.com/octo/demo.git"})
+        assert s.status_code == 200
+        assert s.json()["repo"] == "octo/demo"
+        assert s.json()["url"] == "https://github.com/octo/demo"
+        # persists + reads back
+        g1 = env.client.get("/api/projects/p/github/repo")
+        assert g1.json()["repo"] == "octo/demo"
+        # a bare owner/repo is accepted too
+        s2 = env.client.post("/api/projects/p/github/repo", json={"repo_url": "acme/widgets"})
+        assert s2.json()["repo"] == "acme/widgets"
+        # garbage is rejected
+        bad = env.client.post("/api/projects/p/github/repo", json={"repo_url": "not-a-repo"})
+        assert bad.status_code == 400
+
+    _run(body)
+
+
+def test_push_resolves_stored_repo_target():
+    def body(env):
+        env.make_project("p")
+        env.make_run("p")
+        env.client.post("/api/projects/p/execution/runs/run-1/git/commit", json={"confirm": True, "message": "c"})
+        credentials.set_github_credential("p", token="ghp_dummdummdummdummdummy")
+        # store the project's repo target (no git remote, no owner/repo in the push body)
+        env.client.post("/api/projects/p/github/repo", json={"repo_url": "octo/demo"})
+        prev_get, prev_ensure, prev_push = (
+            github_connector.get_remote,
+            github_connector.ensure_remote,
+            github_connector.push_branch,
+        )
+        github_connector.get_remote = lambda pid, **kw: None
+        github_connector.ensure_remote = lambda pid, owner, repo, **kw: (True, f"{owner}/{repo}")
+        github_connector.push_branch = lambda pid, branch, **kw: github_connector.PushResult(
+            ok=True, branch=branch, remote="origin"
+        )
+        try:
+            # preview: target resolved from the stored repo (no owner/repo supplied)
+            pv = env.client.post("/api/projects/p/execution/runs/run-1/git/push", json={"confirm": False})
+            assert pv.status_code == 200
+            assert pv.json()["contract"]["target"] == "octo/demo"
+            # confirm: push succeeds against the stored target
+            cf = env.client.post("/api/projects/p/execution/runs/run-1/git/push", json={"confirm": True})
+            assert cf.status_code == 200 and cf.json()["applied"]
+            assert cf.json()["contract"]["target"] == "octo/demo"
+            # the stored default_remote persists (drives the clickable repo link)
+            assert credentials.get_metadata("github", "default_remote", "p") == "octo/demo"
+        finally:
+            (
+                github_connector.get_remote,
+                github_connector.ensure_remote,
+                github_connector.push_branch,
+            ) = (prev_get, prev_ensure, prev_push)
+
+    _run(body)
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

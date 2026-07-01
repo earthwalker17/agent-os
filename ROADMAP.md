@@ -427,12 +427,46 @@ toggles it off in the Vercel dashboard.
 commit → push → Vercel deploy → Supabase migrate → Stripe test checkout/webhook,
 every external step a preview→confirm contract, every secret leak-audited).
 
-**Next session — 8.8 ("ships a minimal SaaS" E2E + pressure-test).** Drive the
-full golden path live against real full-stack SaaS apps: DB-backed state +
-Supabase Auth/RLS + Stripe test checkout + a Vercel preview URL, webhook tested
-locally (`stripe listen`) AND against the deployed endpoint, deployment recorded
-in `OPS.md`, safe redeploy/rollback — then stress it on more apps to surface
-gaps. See `BLUEPRINT.md` Pillar 2 + the approved Phase 8 plan §7.
+**8.8 — Full golden-path E2E (validated live).** Drove the complete Production
+Path through Agent OS itself on a dedicated project (`agent-os-phase8-e2e`,
+repo `earthwalker17/agent-os-phase8-e2e`): the Coding Agent built **"CloudNotes"**
+— a Next.js 14 App-Router SaaS (Supabase Auth/RLS + Stripe test checkout +
+webhook) from an empty repo → local build green → commit → push → **Vercel
+production deploy (READY)** → Supabase `link` + migration `db push --linked`
+(profiles + orders + RLS, verified live via PostgREST) → Stripe test
+Product+Price → deployed webhook registered → env pushed to Vercel. Live proof at
+`https://agent-os-phase8-e2e.vercel.app`: landing/login/dashboard 200,
+`POST /api/checkout` returns a real `cs_test_…` Checkout Session, and a
+**properly-signed `checkout.session.completed` event → the deployed webhook →
+200 + a row persisted in Supabase `orders`** (full payment→persistence loop).
+Secret-leak audit clean (no token value or shape in any run/ops/deploy artifact,
+`OPS.md`, `diff.patch`, backend logs, or the pushed repo; tokenless git remote).
+
+  - **Bugs found + fixed.** (1) Vercel connector `set_env_var` sent a Sensitive
+    var with `target:["…","development"]`, which Vercel rejects
+    ("cannot set a Sensitive Environment Variable's target to development") —
+    now drops `development` for `sensitive` vars (regression tests added to
+    `test_vercel_connector`). (2) The generated app deployed as framework
+    "Other" (Vercel linked an empty repo) and failed the build with "No Output
+    Directory named public" despite a green `next build`; fixed in-repo by
+    committing `vercel.json {"framework":"nextjs"}`. (3) A follow-up migration
+    added the `customer_email` column the webhook expected (two Coding-Agent
+    tasks had diverged on it).
+  - **Operational findings (not code-changed).** The inferred `npm install`
+    verification is bounded by the 600 s `run_shell` ceiling — a cold Next.js
+    install can exceed it (pre-warming `node_modules` makes verification skip
+    install and run only `next build`); the Vercel/GitHub connectors don't retry
+    transient network errors (intermittent SSL EOF surfaced as a redeploy
+    blocker even though the deployment reached READY — see `deployment.json` as
+    the source of truth); the "push auto-derives the GitHub repo from the linked
+    Vercel project" path returned no owner/repo here (fell back to explicit
+    owner/repo); the deployed `whsec_` is never readable via HTTP (wire it into
+    the app-env registry server-side from the credential store, then push). A
+    real webhook always carries a non-null `status`, so the app's `orders.status
+    not null` + `status ?? null` insert only fails for synthetic events.
+
+**Next — pressure-test on more apps + the operational hardening above.** See
+`BLUEPRINT.md` Pillar 2 + the approved Phase 8 plan §7.
 
 ## Current Constraints
 
