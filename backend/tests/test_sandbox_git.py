@@ -223,6 +223,42 @@ def test_run_git_rejects_bad_args():
     _run(body)
 
 
+# ---------- path-name guards (resolve_under) ----------
+
+
+def test_resolve_rejects_git_and_sensitive_names():
+    sb = ProjectSandbox("p")
+    for rel in (".git", ".git/config", ".git/hooks/pre-commit", ".env",
+                ".env.local", "keys/server.pem", "id_rsa.key", ".ssh/id_rsa"):
+        assert _raises(lambda r=rel: sb.resolve_repo_path(r)), rel
+
+
+def test_resolve_rejects_windows_trailing_dot_space_bypass():
+    # Windows strips trailing dots/spaces at the FS layer, so these open the
+    # REAL .git / .env despite differing from the raw guard strings. They must
+    # be rejected exactly like their canonical forms.
+    sb = ProjectSandbox("p")
+    for rel in (".git.", ".git ", ".git./hooks/pre-commit", ".env.",
+                ".env .", "keys/server.pem.", "sub/.env. "):
+        assert _raises(lambda r=rel: sb.resolve_repo_path(r)), rel
+
+
+def test_resolve_rejects_windows_reserved_device_names():
+    sb = ProjectSandbox("p")
+    for rel in ("NUL", "nul", "con", "PRN", "aux", "COM1", "lpt9",
+                "sub/aux.txt", "dir/NUL", "CON.log"):
+        assert _raises(lambda r=rel: sb.resolve_repo_path(r)), rel
+
+
+def test_resolve_allows_normal_paths():
+    sb = ProjectSandbox("p")
+    # Names that merely CONTAIN a reserved token or a dot are fine.
+    for rel in ("src/app.py", "components/Console.tsx", "auxiliary.txt",
+                "nullable.ts", "readme.md", "a.b.c/file.txt", "connector.py"):
+        target = sb.resolve_repo_path(rel)  # should not raise
+        assert target.name
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

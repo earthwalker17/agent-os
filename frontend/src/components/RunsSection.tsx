@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { PreviewStatus, RunRecord } from '../types'
 import RunDetailModal from './RunDetailModal'
 import RunTrace from './RunTrace'
@@ -125,9 +125,31 @@ function RunsSection({ projectId, refreshSignal }: Props) {
   const activeCount = runs.filter(isActive).length
   const hasActive = activeCount > 0
 
+  // Watchdog backstop: `isActive` also polls while a transient *_state is set.
+  // The backend clears those on every settle, but if one ever lingered on a
+  // terminal run this panel would poll forever. Cap consecutive ticks during
+  // which NO run is actually `running` (transient-only activity) at a generous
+  // window — well beyond any legit contract action (deploy settles <=300s
+  // server-side). A genuinely running build resets the watchdog every tick.
+  const runsRef = useRef(runs)
+  runsRef.current = runs
+  const watchdogRef = useRef(0)
+
   useEffect(() => {
-    if (!hasActive) return
+    if (!hasActive) {
+      watchdogRef.current = 0
+      return
+    }
     const id = window.setInterval(() => {
+      if (runsRef.current.some((r) => r.status === 'running')) {
+        watchdogRef.current = 0
+      } else {
+        watchdogRef.current += 1
+        if (watchdogRef.current > 200) {
+          window.clearInterval(id)
+          return
+        }
+      }
       loadRuns()
       loadPreview()
     }, POLL_INTERVAL_MS)

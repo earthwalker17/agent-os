@@ -235,6 +235,89 @@ containment guard), a widened **`.git` write guard** (was `.git/config`-only),
 every transient sub-status**, and the **cyclic-wave dependency gate** re-checks
 just-in-time to match sequential skip semantics.
 
+## Phase 9.1 — Post-Phase-9 Hardening Pass (execution-layer pressure test)
+
+A dedicated hardening pass over the execution / scheduling / orchestration /
+delegation / recovery / project-management stack after Phase 9. An 8-agent
+read-only adversarial review swept every subsystem; the load-bearing findings
+were re-verified against the code and fixed in place (bounded, behavior-
+preserving). Additive — every Phase 5–9 invariant holds; **635 backend tests**
+pass (~33 new regressions), `npm run build` green. Full driver + evidence in the
+session; no new feature layer.
+
+- **Sandbox chokepoint (constitutional).** `resolve_under` now normalizes each
+  path component the way Windows resolves it (trailing dots/spaces stripped) so a
+  `".git."` / `".env."` / `"server.pem."` can no longer bypass the `.git`/
+  sensitive-name guard and hit the real target (RCE via `.git/hooks`); Windows
+  **reserved device names** (`NUL/CON/PRN/AUX/COM1-9/LPT1-9`) are now screened
+  (they resolve to devices, not files → phantom "applied" writes).
+- **Role enforcement everywhere.** The legacy sequential multi-task loop now
+  applies the role overlay + enforced `allowed_tools` for read-only roles — a
+  `reviewer`/`inspector` on a non-team-eligible plan (single-task waves) no longer
+  runs as a full coder with write/shell against the live repo.
+- **Transient-state hygiene.** `sweep_stuck_runs` clears **all six** transient
+  `*_state` fields on a stuck-`running` run; a new **`sweep_terminal_transient_states`**
+  clears a leaked in-progress state on an already-*terminal* run (e.g. a crash
+  during the post-status verify tail left `verification_state='verifying'` forever),
+  while **preserving** a settled `browser_verification_state` (`passed`/`failed`).
+  (The over-aggressive first cut of this sweep — which wiped a settled
+  `browser_verification_state` — was caught by a live backend-restart during the
+  E2E and fixed.)
+- **Concurrency / lost-update.** New per-`(project,run)` **`run_store.mutate_run_json`**
+  lock (mirrors the events lock) closes unsynchronized read-modify-write races:
+  the cancel endpoint no longer reverts a run that finalized during its TOCTOU
+  window; browser-verify folds its result onto a fresh record (won't clobber a
+  concurrent commit); the Vercel deploy confirm claims atomically (two confirms →
+  one deployment) and the off-thread finalizer preserves a concurrent commit's
+  fields. A DB-atomic **`claim_pending_execution`** makes double-confirm dispatch
+  exactly one run (invariant: no two units write the same live tree).
+- **Integration correctness.** Conflict detection keys on `os.path.normcase`, so
+  a case-only collision (`src/App.ts` vs `src/app.ts`) on Windows/macOS surfaces
+  as a conflict instead of one task silently overwriting the other. Clean waves
+  now **reclaim** their patch-overlay file copies (keeping `manifest.json`) —
+  bounded disk.
+- **Secret hygiene.** The Gemini key moved from the request URL to the
+  `x-goog-api-key` header (URLs are echoed into error messages/logs); `_safe_url`
+  redacts any stray `key=`/`api_key=` query secret before it reaches a
+  `ProviderError`.
+- **Robustness.** Per-request LLM timeout (env-overridable) so a hung provider
+  call can't wedge a parallel wave; `compileall` excludes the full skip-dir set
+  (`.venv`/`venv`/`dist`/`build`/…), not just `node_modules`; Windows dev-server
+  teardown reaps the whole tree (`taskkill /F /T`) on the happy path + a pre-start
+  5174-in-use guard; `memory_engine` uses exact-heading replace + block-equality
+  append dedup (no more clobbering `## Decisions Archive` or dropping a distinct
+  short entry); SVG attachments serve as `attachment` + `nosniff` (stored-XSS);
+  URL path-segment validation (`_safe_id` + a run_store structural guard) blocks
+  `..`/separator traversal on `project_id`/`run_id`.
+- **Observability.** The main-agent `@debug`/`@review` context now surfaces a
+  team run's wave/role/integration shape (metadata only); the Run Detail modal
+  adopts the events since-cursor; the poll gates gain a watchdog cap; the Live
+  Trace pairs tool_call↔tool_result via an O(N) index (the old 200-event forward
+  scan left interleaved parallel-unit calls stuck "running").
+- **Validated live on real Windows through Agent OS itself.** Team build (5-task
+  plan, 3 parallel coders in isolated patch workspaces → clean integration →
+  reviewer wave → verification gate → `completed`, all transient states clear,
+  overlays trimmed, project memory reconciled); PM delegation loop (judge →
+  pending plan → confirm+recovery-budget → run); double-confirm race (→ [200,409],
+  one run); cancel mid-run (→ clean `cancelled`, no stuck state); Git golden path
+  (commit + push live; PR blocked by the PAT's scope, surfaced cleanly);
+  connector contract previews (deploy/migration) + GENERAL rejection; crash
+  recovery (kill mid-run → restart → swept to `failed`, all transient cleared);
+  **secret-leak audit clean** (7 tracked secret values, 101 artifact/memory files,
+  zero leaks).
+- **Adversarial self-review caught + fixed 4 regressions in the hardening diff
+  itself** (an 8-agent find→verify pass over the highest-risk changes, plus a
+  live backend-restart during the E2E): the terminal-state sweep wiped a *settled*
+  `browser_verification_state='passed'` (now clears only `'running'`); the
+  `compileall -x` exclusion used unanchored substrings so `src/distribution/`
+  matched `dist` and was silently un-checked (replaced with an exact-dir-name
+  `py_compile` walk); the pending atomic-claim could strand a plan in
+  `'dispatching'` on a crash mid-confirm (added a startup revert-to-`pending`
+  reconciler); and a malformed `run_id` returned HTTP 500 instead of a clean 404
+  (readers treat a guard-rejected id as absent). One flagged item (per-request
+  timeout wired only to the Anthropic client, not the finite-timeout urllib path)
+  was verified a non-issue.
+
 ---
 
 ## Current Constraints
@@ -262,7 +345,12 @@ just-in-time to match sequential skip semantics.
 ## Test Coverage
 
 Backend tests live under `backend/tests/`, stub `llm.chat` (no API key needed),
-and are each runnable standalone (`python tests/<file>.py`). **604 total**;
+and are each runnable standalone (`python tests/<file>.py`). **635 total**
+(Phase 9.1 hardening added ~29 regressions across sandbox device-name/dot guards,
+sequential-path role enforcement, terminal transient-state sweeps, cancel/deploy
+run.json-lock races, pending double-confirm claim, integration case-collision,
+compileall skip-dirs, browser teardown/port-guard, memory-engine matching,
+attachment XSS, provider timeout + Gemini-key redaction, and team-run PM context);
 `npm run build` (tsc + vite) green.
 
 | File | Tests | Covers |

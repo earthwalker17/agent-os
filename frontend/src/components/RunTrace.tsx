@@ -273,24 +273,37 @@ function describeEvent(e: RunEvent, key: string): TraceRow | null {
 function buildRows(events: RunEvent[]): TraceRow[] {
   const rows: TraceRow[] = []
   const consumed = new Set<number>()
+  // Pre-index tool_result indices by their pairing key (task_id|step|phase|tool)
+  // so a tool_call finds its result regardless of how far apart they are. In a
+  // team run up to 3 units interleave into one event stream, so a call and its
+  // result can be separated by far more than a fixed forward-scan window would
+  // cover — the old 200-event cap left such calls rendered as "running" forever.
+  const keyOf = (n: RunEvent): string =>
+    `${n.task_id ?? ''}|${n.step ?? ''}|${n.phase ?? ''}|${n.tool_name ?? ''}`
+  const resultsByKey = new Map<string, number[]>()
+  for (let j = 0; j < events.length; j++) {
+    if (events[j].type === 'tool_result') {
+      const k = keyOf(events[j])
+      const arr = resultsByKey.get(k)
+      if (arr) arr.push(j)
+      else resultsByKey.set(k, [j])
+    }
+  }
   for (let i = 0; i < events.length; i++) {
     if (consumed.has(i)) continue
     const e = events[i]
     if (e.type === 'llm_response') continue
     if (e.type === 'tool_call') {
+      // Earliest unconsumed result AFTER this call with the same key. Buckets
+      // are tiny (same step+task+tool), so this stays effectively linear.
+      const arr = resultsByKey.get(keyOf(e))
       let match = -1
-      for (let j = i + 1; j < events.length && j <= i + 200; j++) {
-        if (consumed.has(j)) continue
-        const n = events[j]
-        if (
-          n.type === 'tool_result' &&
-          n.step === e.step &&
-          n.phase === e.phase &&
-          n.tool_name === e.tool_name &&
-          n.task_id === e.task_id
-        ) {
-          match = j
-          break
+      if (arr) {
+        for (const j of arr) {
+          if (j > i && !consumed.has(j)) {
+            match = j
+            break
+          }
         }
       }
       if (match >= 0) {

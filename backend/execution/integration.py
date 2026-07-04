@@ -21,6 +21,7 @@ The runner owns event emission and artifact persistence; this module is pure
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 from .models import ExecutionTask, IntegrationConflict
@@ -67,8 +68,14 @@ def integrate_wave(
     """
     result = WaveIntegration(wave=wave_no)
 
-    # path -> (task_id, content) of the applied (first-writer) version.
-    applied_versions: dict[str, tuple[str, str]] = {}
+    # normcased path -> (original_rel, task_id, content) of the applied
+    # (first-writer) version. Keyed via ``os.path.normcase`` so collision
+    # detection matches the actual filesystem: on Windows/macOS it folds case
+    # (``src/App.ts`` and ``src/app.ts`` are the SAME on-disk file, so keying on
+    # exact case would miss the collision and let the second writer silently
+    # overwrite the first with no conflict); on a case-sensitive POSIX FS it is a
+    # no-op, so genuinely distinct files still both apply cleanly.
+    applied_versions: dict[str, tuple[str, str, str]] = {}
 
     for unit in units:
         overlay = get_overlay_root(project_id, run_id, unit.id)
@@ -84,10 +91,11 @@ def integrate_wave(
                 )
                 continue
 
-            prior = applied_versions.get(rel)
+            key = os.path.normcase(rel)
+            prior = applied_versions.get(key)
             if prior is not None:
-                prior_task, prior_content = prior
-                if prior_content == content:
+                prior_rel, prior_task, prior_content = prior
+                if prior_content == content and prior_rel == rel:
                     # Identical output from independent tasks — already applied.
                     result.per_task[unit.id].append(rel)
                     continue
@@ -98,11 +106,20 @@ def integrate_wave(
                     wave=wave_no,
                 )
                 result.conflicts.append(conflict)
-                blocker = (
-                    f"integration conflict: {rel!r} was also written by "
-                    f"{prior_task!r}; this task's version was not applied "
-                    f"(see its patch workspace)"
-                )
+                if prior_rel != rel:
+                    # Same on-disk file reached via different-case paths — the
+                    # kind of collision a case-sensitive exact-match key misses.
+                    blocker = (
+                        f"integration conflict: {rel!r} collides case-insensitively "
+                        f"with {prior_rel!r} written by {prior_task!r}; this task's "
+                        f"version was not applied (see its patch workspace)"
+                    )
+                else:
+                    blocker = (
+                        f"integration conflict: {rel!r} was also written by "
+                        f"{prior_task!r}; this task's version was not applied "
+                        f"(see its patch workspace)"
+                    )
                 if blocker not in unit.blockers:
                     unit.blockers.append(blocker)
                 continue
@@ -113,7 +130,7 @@ def integrate_wave(
                     f"{unit.id}: applying {rel!r} failed: {tool_result.error}"
                 )
                 continue
-            applied_versions[rel] = (unit.id, content)
+            applied_versions[key] = (rel, unit.id, content)
             result.applied.append(rel)
             result.per_task[unit.id].append(rel)
 

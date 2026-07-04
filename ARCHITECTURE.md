@@ -298,10 +298,18 @@ so old records round-trip; **no secret ever appears on the record.**
   provisioning facts (Stripe/Supabase ids, env key names) live in `OPS.md`, not here.
 
 Transient `*_state` fields mirror `verification_state` and are **never** a
-`RunStatus`; every settle path (finalize / cancel / crash handler / startup
-sweep) clears them so a crash can't wedge the UI poll gates. `ResultSummary` is
-the compact main-agent view (summary + lists + verification/plan +
-commit/branch/PR/diff-stat + deployment metadata).
+`RunStatus`; every settle path clears the in-progress values so a crash can't
+wedge the UI poll gates: `_finalize`/`_finalize_cancelled`/the crash handler
+clear them in-process, and at startup two sweeps back them cross-process —
+`sweep_stuck_runs` (rewrites a still-`running` run to `failed`, clearing all six)
+and `sweep_terminal_transient_states` (clears a leaked in-progress value on an
+already-*terminal* run — e.g. a crash during the post-status verify tail).
+**Exception:** `browser_verification_state` also holds a *settled* result
+(`passed`/`failed`), so the terminal sweep clears only its transient `running`.
+Endpoints/finalizers that mutate a live run's record do it through the
+per-`(project,run)` `run_store.mutate_run_json` lock (atomic reads never lose an
+update). `ResultSummary` is the compact main-agent view (summary + lists +
+verification/plan + commit/branch/PR/diff-stat + deployment metadata).
 
 Status semantics: **`completed` only after verification passes (or safe skip)**;
 files-written-but-failed is `partial`; `skipped` only when nothing safe can run.
@@ -398,6 +406,41 @@ rewrites) and are overwritten with the authoritative lists at finalize.
 - **"Progress" for a continuation = write ops, not unique paths.** A polish pass
   that overwrites files makes progress without new paths; the budget-extension
   check counts successful writes.
+- **Windows strips trailing dots/spaces from each path component.** `".git."` /
+  `".env."` / `"server.pem."` open the *real* `.git`/`.env`, so a raw
+  equality/suffix guard is bypassable — `sandbox.resolve_under` normalizes each
+  component (`rstrip(" .")`) before the sensitive-name/`.git` checks. It also
+  screens **reserved device names** (`NUL/CON/PRN/AUX/COM1-9/LPT1-9`): they open a
+  device, so a "write" succeeds against nothing and the run claims phantom output.
+- **`browser_verification_state` is BOTH transient and settled.** `'running'` is
+  an in-progress gate; `'passed'`/`'failed'` are the real outcome. A blanket
+  "clear every transient `*_state` on a terminal run" sweep wipes the settled
+  result — the terminal-run sweep (`sweep_terminal_transient_states`) must clear
+  only `'running'` for that field (while clearing any non-null
+  `verification_state`/`integration_state`/`git_state`, which are purely
+  in-progress). A live backend-restart during E2E caught the over-broad first cut.
+- **`verification_state` is set AFTER the status is already terminal.** The
+  verify/browser tail runs post-status, so a crash there leaves `completed` +
+  `verification_state='verifying'` — which `sweep_stuck_runs` skips (not
+  `running`). Needs a companion terminal-run sweep, or the UI poll-gate spins
+  forever. (The startup sweep pair is the cross-process backstop; the in-process
+  crash handler clears all six directly.)
+- **`os.path.replace` is atomic but not a lock.** run.json is read-modify-written
+  by many endpoints + off-thread finalizers; atomic writes stop *torn reads* but
+  not *lost updates*. Contended mutators (cancel / browser-verify / deploy-confirm
+  / deploy-finalizer) go through the per-`(project,run)` `run_store.mutate_run_json`
+  lock; the check-then-act deploy guard and pending-confirm dispatch became atomic
+  claims (`_claim_deploy` under the lock; DB `claim_pending_execution`) so a
+  double-click can't launch two runs/deployments.
+- **Case-insensitive filesystems need `os.path.normcase` for "same file".** Two
+  parallel patch tasks writing `src/App.ts` and `src/app.ts` map to ONE on-disk
+  file on Windows/macOS; keying integration on the exact case misses the collision
+  and one task silently overwrites the other. Key on `normcase` (a no-op on
+  case-sensitive POSIX, so distinct files still both apply).
+- **A key in a request URL leaks into error messages.** `_http_post_json` echoes
+  the URL into every `ProviderError` (→ logs/tracebacks); the Gemini key rides the
+  `x-goog-api-key` header instead, and `_safe_url` redacts any stray `key=` query
+  secret defensively.
 
 ## 11. Starting a future session
 

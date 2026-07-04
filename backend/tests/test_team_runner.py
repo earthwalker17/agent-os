@@ -259,7 +259,10 @@ def test_parallel_wave_executes_isolates_and_integrates():
         assert (repo / "src" / "a.txt").read_text(encoding="utf-8") == "module A\n"
         assert (repo / "src" / "b.txt").read_text(encoding="utf-8") == "module B\n"
         assert (repo / "src" / "c.txt").read_text(encoding="utf-8") == "wired\n"
-        assert (get_overlay_root(_PID, run_id, "t1") / "src" / "a.txt").exists()
+        # T3.1 — after a CLEAN integration the overlay file copies are reclaimed
+        # (the files now live in the repo); the manifest (audit) still records
+        # that the file went through the overlay, proving isolation.
+        assert not (get_overlay_root(_PID, run_id, "t1") / "src" / "a.txt").exists()
         manifest = read_patch_manifest(_PID, run_id, "t1")
         assert manifest and manifest["files"] == ["src/a.txt"]
         assert manifest["role"] == "coder" and manifest["status"] == "completed"
@@ -582,6 +585,56 @@ def test_sequential_plans_do_not_take_the_team_path():
         types = _event_types(summary.run_id)
         assert "team_execution_started" not in types
         assert "wave_started" not in types
+
+    _run(body)
+
+
+# ---------- read-only role enforcement on the SEQUENTIAL path (T1.2) ----------
+
+
+def test_sequential_reviewer_role_is_enforced_and_writes_bounced():
+    """A reviewer/inspector task on a NON-team-eligible plan (single-task waves)
+    must still run read-only: the legacy multi-task loop has to apply the role
+    overlay + tool gate, not run it as a plain coder against the live repo."""
+    def body(layout):
+        repo = layout.init_workspace()
+        caller = _keyed_caller(
+            _plan(
+                [
+                    _ptask("t1", "Build the module", role="coder"),
+                    _ptask("t2", "Review the module", role="reviewer", depends_on=["t1"]),
+                ]
+            ),
+            {
+                "t1": [
+                    _tool("write_file", path="mod.py", content="y = 2\n"),
+                    _final(files_changed=["mod.py"]),
+                ],
+                "t2": [
+                    # The reviewer tries to mutate — must be bounced, not executed.
+                    _tool("write_file", path="sneaky.py", content="import os\n"),
+                    _tool("run_shell", command="echo hi"),
+                    _tool("read_file", path="mod.py"),
+                    _final(summary="review: module looks correct"),
+                ],
+            },
+        )
+        summary = _dispatch(layout, caller)
+        assert summary.status == "completed", summary.blockers
+        # This plan must NOT have taken the team path (single-task waves).
+        assert summary.plan.execution_mode == "sequential"
+        assert not (layout.execution_dir / _PID / "patches").exists()
+        # The reviewer's write + shell never touched the live repo.
+        assert not (repo / "sneaky.py").exists()
+        assert (repo / "mod.py").exists()  # coder's write did land
+        bounced = [
+            e
+            for e in _events(summary.run_id)
+            if e.get("type") == "tool_result"
+            and e.get("success") is False
+            and "reviewer role" in str(e.get("error", ""))
+        ]
+        assert bounced, "reviewer write/shell was not bounced on the sequential path"
 
     _run(body)
 

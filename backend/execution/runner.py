@@ -53,6 +53,7 @@ from .patch_workspace import (
     collect_patch_files,
     get_overlay_root,
     init_patch_workspace,
+    trim_overlay_workspace,
     write_patch_manifest,
 )
 from .planner import (
@@ -650,7 +651,20 @@ class CodingAgentRunner:
             # Surface any dependency that didn't cleanly complete but didn't
             # block this task (progress-aware skip) so the agent can compensate.
             degraded = degraded_dependencies(unit, by_id)
-            system_prompt = build_system_prompt(self._agent_md, self.project_id, MAX_TASK_STEPS)
+            # Role awareness (Phase 9): a plan can assign a read-only role
+            # (reviewer / inspector) to a task even when the plan is NOT
+            # team-eligible (e.g. a sequential inspect->build->review where every
+            # wave holds one task). Without the role overlay + enforced tool set
+            # here, such a task would run as a plain coder with full write/shell
+            # access against the live repo — violating "reviewer/inspector never
+            # mutate". Mirror `_run_wave_unit_sequential`: role-aware prompt for
+            # all roles; a `_UnitContext` tool-gate for read-only roles. The
+            # default `coder` role has an empty overlay and no ctx, so a plain
+            # multi-task plan stays byte-identical to the legacy path.
+            role = get_role(unit.role)
+            system_prompt = build_system_prompt(
+                self._agent_md, self.project_id, MAX_TASK_STEPS, role_block=role.prompt
+            )
             initial = build_task_unit_user_prompt(
                 goal=plan.goal,
                 task_no=idx,
@@ -667,18 +681,42 @@ class CodingAgentRunner:
             before_c = len(self._observed_commands_run)
             self._begin_unit(unit, before_f, before_c)
             try:
-                final_action, loop_failed_reason = self._run_task_unit(
-                    run_id,
-                    system_prompt,
-                    initial,
-                    MAX_TASK_STEPS,
-                    phase="execution",
-                    max_continuations=MAX_TASK_CONTINUATIONS,
-                    continuation_steps=TASK_CONTINUATION_STEPS,
-                )
+                if role.read_only:
+                    ctx = _UnitContext(
+                        self.runtime,
+                        task_id=unit.id,
+                        role=unit.role,
+                        allowed_tools=allowed_tools_for(unit.role),
+                    )
+                    final_action, loop_failed_reason = self._run_task_unit(
+                        run_id,
+                        system_prompt,
+                        initial,
+                        MAX_TASK_STEPS,
+                        phase="execution",
+                        max_continuations=MAX_TASK_CONTINUATIONS,
+                        continuation_steps=TASK_CONTINUATION_STEPS,
+                        ctx=ctx,
+                    )
+                    unit_files = list(ctx.observed_files)
+                    unit_cmds = list(ctx.observed_cmds)
+                else:
+                    final_action, loop_failed_reason = self._run_task_unit(
+                        run_id,
+                        system_prompt,
+                        initial,
+                        MAX_TASK_STEPS,
+                        phase="execution",
+                        max_continuations=MAX_TASK_CONTINUATIONS,
+                        continuation_steps=TASK_CONTINUATION_STEPS,
+                    )
+                    unit_files = self._observed_files_changed[before_f:]
+                    unit_cmds = self._observed_commands_run[before_c:]
             finally:
                 self._active_unit = None
-            self._apply_unit_result(unit, final_action, loop_failed_reason, before_f, before_c)
+            self._apply_unit_result_from_lists(
+                unit, final_action, loop_failed_reason, unit_files, unit_cmds
+            )
             run_store.append_event(
                 self.project_id,
                 run_id,
@@ -893,6 +931,14 @@ class CodingAgentRunner:
                     )
                     record.integration_state = None
                     self._persist_progress(run_id, record, plan)
+                    # Reclaim overlay file copies once the wave has integrated
+                    # CLEANLY — the files now live in the shared repo and the
+                    # applied list is in integration.json + each manifest.json.
+                    # A conflicted/error wave keeps its overlays for forensics
+                    # (the losing version must stay inspectable).
+                    if not wave_integ.conflicts and not wave_integ.errors:
+                        for u in patch_units:
+                            trim_overlay_workspace(self.project_id, run_id, u.id)
                 if self._cancelled():
                     raise _RunCancelled()
 
@@ -1836,10 +1882,10 @@ class CodingAgentRunner:
         blocker = "run cancelled by user"
         if blocker not in record.blockers:
             record.blockers = list(record.blockers) + [blocker]
-        # Settle transient sub-status + the cancel-request flag.
+        # Settle every transient sub-status + the cancel-request flag so a
+        # terminal cancelled run never leaves a UI poll gate active.
         record.cancel_requested = False
-        record.verification_state = None
-        record.integration_state = None
+        run_store._clear_transient_states(record)
         # Mark any in-flight task skipped so the task graph reads cleanly.
         if record.plan is not None:
             for unit in record.plan.tasks:

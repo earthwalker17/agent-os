@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   BrowserVerificationResult,
   ExecutionPlan,
@@ -413,6 +413,10 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
   const [retriedRunId, setRetriedRunId] = useState<string | null>(null)
   // Bounded post-terminal settle polling (Phase 6.1) — see the poll effect.
   const [settleTicks, setSettleTicks] = useState(0)
+  // Event cursor: refresh() fetches only new events (?since=) and appends them,
+  // instead of re-fetching + re-parsing the whole events.jsonl every 2s (which
+  // grows unbounded on a long team run). Mirrors RunTrace's cursor.
+  const eventCursor = useRef(0)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -434,7 +438,9 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
       }
       if (evRes.ok) {
         const data = await evRes.json()
-        setEvents(Array.isArray(data?.events) ? data.events : [])
+        const evs = Array.isArray(data?.events) ? data.events : []
+        setEvents(evs)
+        eventCursor.current = typeof data?.total === 'number' ? data.total : evs.length
       }
     } catch (err) {
       console.error('Failed to load run detail:', err)
@@ -444,17 +450,21 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
     }
   }, [projectId, runId])
 
-  // Silent refresh (no loading flash) for polling an active run.
+  // Silent refresh (no loading flash) for polling an active run. Fetches only
+  // events past the cursor and appends them (no full re-fetch).
   const refresh = useCallback(async () => {
     try {
       const [recRes, evRes] = await Promise.all([
         fetch(`/api/projects/${projectId}/execution/runs/${runId}`),
-        fetch(`/api/projects/${projectId}/execution/runs/${runId}/events`),
+        fetch(`/api/projects/${projectId}/execution/runs/${runId}/events?since=${eventCursor.current}`),
       ])
       if (recRes.ok) setRecord(await recRes.json())
       if (evRes.ok) {
         const data = await evRes.json()
-        setEvents(Array.isArray(data?.events) ? data.events : [])
+        const delta = Array.isArray(data?.events) ? data.events : []
+        if (delta.length) setEvents((prev) => [...prev, ...delta])
+        eventCursor.current =
+          typeof data?.total === 'number' ? data.total : eventCursor.current + delta.length
       }
     } catch (err) {
       console.error('Run detail refresh failed:', err)
@@ -469,10 +479,16 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
   // bounded "settle" window after it goes terminal — memory reconciliation +
   // the recovery assessment are written ~2-4s AFTER the terminal status, so the
   // Recovery / Memory sections would otherwise need a manual reopen.
-  const active = isActive(record)
+  const rawActive = isActive(record)
+  // Watchdog: `isActive` is true while a transient *_state is set. The backend
+  // clears those on every settle path, but if one ever lingered on an
+  // already-terminal run the modal would poll (and show "in progress") forever.
+  // Once the status itself is terminal, cap the extra transient-state polling.
+  const statusTerminal = !!record && record.status !== 'running'
+  const active = rawActive && !(statusTerminal && settleTicks >= 20)
   const terminalSettlePending =
     !!record &&
-    !active &&
+    !rawActive &&
     record.status !== 'cancelled' &&
     record.memory_reconciliation == null &&
     settleTicks < 15
@@ -481,10 +497,13 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
     if (!shouldPoll) return
     const id = window.setInterval(() => {
       refresh()
-      setSettleTicks((t) => (active ? 0 : t + 1))
+      // Advance the tick counter whenever the underlying status is terminal
+      // (covers both the memory-settle window and the transient-state watchdog);
+      // reset only while the run is genuinely still running.
+      setSettleTicks((t) => (record && record.status === 'running' ? 0 : t + 1))
     }, POLL_INTERVAL_MS)
     return () => window.clearInterval(id)
-  }, [shouldPoll, refresh, active])
+  }, [shouldPoll, refresh, record])
 
   const cancelRun = useCallback(async () => {
     setControlBusy(true)

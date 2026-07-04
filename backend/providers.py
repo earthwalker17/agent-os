@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -173,6 +174,27 @@ _BASE_URL_ENV = {
 _OPENAI_COMPAT = {PROVIDER_GPT, PROVIDER_DEEPSEEK, PROVIDER_KIMI, PROVIDER_GLM}
 
 _HTTP_TIMEOUT = 120
+
+
+def _llm_timeout() -> float:
+    """Per-request LLM timeout (seconds), env-overridable.
+
+    A bounded timeout matters for the team runtime: parallel wave units run on a
+    dedicated pool and the coordinator blocks on ``as_completed`` with no timeout,
+    so one unit whose provider call hangs would stall the whole wave (and defer a
+    user cancel) for as long as the client waits. A finite timeout lets a stalled
+    call fail into ``llm.chat``'s transient-retry/backoff instead of wedging. Kept
+    generous — a real completion at max tokens can take a while.
+    """
+    raw = os.environ.get("AGENT_OS_LLM_TIMEOUT")
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return 300.0
 
 
 class ProviderError(RuntimeError):
@@ -431,7 +453,7 @@ def _complete_anthropic(system, messages, model, max_tokens) -> str:
     if _anthropic_client is None:
         from anthropic import Anthropic
 
-        _anthropic_client = Anthropic(api_key=_api_key(PROVIDER_CLAUDE))
+        _anthropic_client = Anthropic(api_key=_api_key(PROVIDER_CLAUDE), timeout=_llm_timeout())
     response = _anthropic_client.messages.create(
         model=model,
         max_tokens=max_tokens,
@@ -448,7 +470,7 @@ def _complete_anthropic_vision(system, prompt, images, model, max_tokens) -> str
     if _anthropic_client is None:
         from anthropic import Anthropic
 
-        _anthropic_client = Anthropic(api_key=_api_key(PROVIDER_CLAUDE))
+        _anthropic_client = Anthropic(api_key=_api_key(PROVIDER_CLAUDE), timeout=_llm_timeout())
     content: list[dict] = [
         {
             "type": "image",
@@ -496,9 +518,11 @@ def _complete_openai_vision(
 
 def _complete_gemini_vision(api_key, system, prompt, images, model, max_tokens) -> str:
     """Google Gemini ``generateContent`` vision shape — inline_data + text."""
+    # Key in the header, not the query string (see _complete_gemini) — keeps the
+    # live key out of URL-bearing error messages / logs.
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={api_key}"
+        f"{model}:generateContent"
     )
     parts: list[dict] = [
         {"inline_data": {"mime_type": media_type, "data": data}}
@@ -511,7 +535,7 @@ def _complete_gemini_vision(api_key, system, prompt, images, model, max_tokens) 
     }
     if system:
         payload["system_instruction"] = {"parts": [{"text": system}]}
-    data = _http_post_json(url, {}, payload)
+    data = _http_post_json(url, {"x-goog-api-key": api_key}, payload)
     try:
         out_parts = data["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in out_parts)
@@ -519,11 +543,20 @@ def _complete_gemini_vision(api_key, system, prompt, images, model, max_tokens) 
         raise ProviderError(f"unexpected Gemini response: {str(data)[:200]}")
 
 
+def _safe_url(url: str) -> str:
+    """Strip a ``key=`` / ``api_key=`` query secret from a URL before it is
+    echoed into an error message (defense in depth — providers now send keys as
+    headers, but a stray query secret must never reach a log/traceback)."""
+    return re.sub(r"(?i)([?&](?:key|api_key)=)[^&\s]+", r"\1[REDACTED]", url)
+
+
 def _http_post_json(url: str, headers: dict, payload: dict) -> dict:
     """POST ``payload`` as JSON and return the parsed JSON response.
 
     Network/HTTP/parse failures raise ``ProviderError`` with a bounded preview
-    of the upstream body so the chat endpoint can surface a clean message.
+    of the upstream body so the chat endpoint can surface a clean message. The
+    URL is redacted (``_safe_url``) before it enters any error message so an API
+    key can never leak through a query string.
     """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -532,18 +565,19 @@ def _http_post_json(url: str, headers: dict, payload: dict) -> dict:
         headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
+    safe = _safe_url(url)
     try:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
-        raise ProviderError(f"HTTP {exc.code} from {url}: {detail}")
+        raise ProviderError(f"HTTP {exc.code} from {safe}: {detail}")
     except urllib.error.URLError as exc:
-        raise ProviderError(f"network error calling {url}: {exc.reason}")
+        raise ProviderError(f"network error calling {safe}: {exc.reason}")
     try:
         return json.loads(body)
     except json.JSONDecodeError:
-        raise ProviderError(f"non-JSON response from {url}: {body[:200]}")
+        raise ProviderError(f"non-JSON response from {safe}: {body[:200]}")
 
 
 def _complete_openai_compatible(
@@ -565,9 +599,13 @@ def _complete_openai_compatible(
 
 def _complete_gemini(api_key, system, messages, model, max_tokens) -> str:
     """Google Gemini ``generateContent`` REST shape."""
+    # The API key rides the ``x-goog-api-key`` HEADER, never the query string —
+    # ``_http_post_json`` echoes the URL into every error message (and thus into
+    # logs / tracebacks), so a ``?key=`` URL would leak the live key on any
+    # transient Gemini failure. Headers are never echoed.
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={api_key}"
+        f"{model}:generateContent"
     )
     contents: list[dict] = []
     for m in messages:
@@ -580,7 +618,7 @@ def _complete_gemini(api_key, system, messages, model, max_tokens) -> str:
     }
     if system:
         payload["system_instruction"] = {"parts": [{"text": system}]}
-    data = _http_post_json(url, {}, payload)
+    data = _http_post_json(url, {"x-goog-api-key": api_key}, payload)
     try:
         parts = data["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts)

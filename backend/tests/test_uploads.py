@@ -258,6 +258,37 @@ def test_http_upload_chat_only():
     _run(body)
 
 
+def test_svg_attachment_is_served_as_download_not_inline():
+    """T2.6: an uploaded SVG (which can carry <script>) must be served with
+    Content-Disposition: attachment + X-Content-Type-Options: nosniff so it
+    can't execute as a top-level document in the backend origin. A raster image
+    stays inline (but still nosniff)."""
+    def body(env: _Env):
+        env.make_project("p1")
+        conv = create_conversation("p1", "c")
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+        res = _upload(env, conv["id"], [("files", ("x.svg", io.BytesIO(svg), "image/svg+xml"))])
+        assert res.status_code == 200, res.text
+        att = res.json()["attachments"][0]
+        got = env.client.get(
+            f"/api/conversations/{conv['id']}/attachments/{att['stored_filename']}"
+        )
+        assert got.status_code == 200
+        assert "attachment" in got.headers.get("content-disposition", "").lower()
+        assert got.headers.get("x-content-type-options") == "nosniff"
+
+        # A PNG stays inline (no forced attachment) but still nosniff.
+        res2 = _upload(env, conv["id"], [("files", ("y.png", io.BytesIO(b"\x89PNG"), "image/png"))])
+        att2 = res2.json()["attachments"][0]
+        got2 = env.client.get(
+            f"/api/conversations/{conv['id']}/attachments/{att2['stored_filename']}"
+        )
+        assert got2.headers.get("x-content-type-options") == "nosniff"
+        assert "attachment" not in got2.headers.get("content-disposition", "").lower()
+
+    _run(body)
+
+
 def test_http_upload_to_workspace():
     def body(env: _Env):
         env.make_project("p1")

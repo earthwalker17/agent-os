@@ -25,7 +25,9 @@ after integration, on the integrated tree).
 from __future__ import annotations
 
 import json
+import logging
 import os
+import shutil
 from pathlib import Path
 
 from .manager import get_project_execution_dir
@@ -110,6 +112,30 @@ def collect_patch_files(overlay_root: Path) -> list[str]:
         if path.is_file():
             files.append(path.relative_to(overlay_root).as_posix())
     return sorted(files)
+
+
+def trim_overlay_workspace(project_id: str, run_id: str, task_id: str) -> bool:
+    """Delete a task's overlay file copies (``workspace/``) after a CLEAN
+    integration, keeping the sibling ``manifest.json`` audit record.
+
+    Each team run otherwise leaves a permanent full-file copy of everything its
+    parallel coders wrote under ``patches/{run_id}/{task}/workspace/`` — the tree
+    grows without bound across runs. Once the wave has integrated with no
+    conflicts/errors the overlay is dead (its files are in the shared repo and
+    the applied list is in ``integration.json`` + ``manifest.json``), so the bulk
+    copies are safe to reclaim. NEVER called for a conflicted/error wave — there
+    the losing version must stay inspectable. Best-effort; never raises."""
+    overlay = get_overlay_root(project_id, run_id, task_id)
+    if not overlay.exists():
+        return False
+    try:
+        shutil.rmtree(overlay, ignore_errors=True)
+        return not overlay.exists()
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "overlay trim failed for %s/%s/%s", project_id, run_id, task_id
+        )
+        return False
 
 
 def write_patch_manifest(

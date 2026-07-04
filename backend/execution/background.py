@@ -362,15 +362,13 @@ class BackgroundRunManager:
         record.completed_at = datetime.utcnow()
         record.blockers = list(record.blockers) + [error_line]
         # Settle every transient sub-status so a crash mid-phase can't leave the
-        # UI poll gates treating a terminal run as active forever (the other
-        # settle paths — _finalize_cancelled / sweep_stuck_runs / orphan-cancel —
-        # already clear these; the in-process crash handler must too).
-        record.verification_state = None
-        record.browser_verification_state = None
-        record.integration_state = None
-        record.git_state = None
-        record.deploy_state = None
-        record.external_state = None
+        # UI poll gates treating a terminal run as active forever. Each settle
+        # path clears the transient states it can leave behind: this in-process
+        # crash handler clears all six; the startup `sweep_stuck_runs` clears all
+        # six on still-`running` runs and `sweep_terminal_transient_states` clears
+        # the local gates on already-terminal runs; `_finalize_cancelled` and the
+        # orphan-cancel endpoint clear theirs.
+        run_store._clear_transient_states(record)
         run_store.write_run_json(project_id, run_id, record)
         run_store.append_event(
             project_id,

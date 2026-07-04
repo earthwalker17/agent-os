@@ -42,6 +42,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -398,38 +399,53 @@ def _taskkill_tree(proc: subprocess.Popen) -> None:
 
 
 def _terminate_dev_server(proc: subprocess.Popen, grace_seconds: int) -> None:
-    """Tear the dev server down. Never raises."""
+    """Tear the dev server down. Never raises.
+
+    On Windows the Popen handle is ``cmd.exe`` (shell=True); the ``npm.cmd`` ->
+    node/Vite children hold the dev port (5174). A CTRL_BREAK/``proc.kill()``
+    ends only ``cmd.exe`` and ORPHANS node — the port stays bound and the next
+    run fails ``--strictPort``. So on Windows we go straight to
+    ``taskkill /F /T`` (walks the whole tree by pid while the parent is still
+    alive), not a graceful signal that leaks the tree. POSIX keeps the graceful
+    SIGTERM -> SIGKILL escalation against the process group.
+    """
     if proc.poll() is not None:
         return
     try:
         if os.name == "nt":
+            # Reap the whole tree by pid — the only reliable way to free 5174.
+            _taskkill_tree(proc)
             try:
-                proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+                proc.wait(timeout=max(1, grace_seconds))
             except Exception:  # noqa: BLE001
-                proc.terminate()
-        else:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except Exception:  # noqa: BLE001
-                proc.terminate()
+                pass
+            # If the tree reap didn't settle the handle (e.g. taskkill couldn't
+            # resolve the pid), fall back to a direct kill so the process object
+            # is left terminated rather than lingering.
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        # POSIX: graceful SIGTERM to the group, then escalate to SIGKILL.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:  # noqa: BLE001
+            proc.terminate()
         try:
             proc.wait(timeout=max(1, grace_seconds))
             return
         except subprocess.TimeoutExpired:
             pass
-        # Escalate. On Windows a plain proc.kill() only terminates the cmd.exe
-        # shell and orphans the node/Vite child (leaking port 5174); taskkill /T
-        # reaps the whole tree.
         try:
-            if os.name != "nt":
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            else:
-                _taskkill_tree(proc)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:  # noqa: BLE001
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
+            proc.kill()
         try:
             proc.wait(timeout=2)
         except Exception:  # noqa: BLE001
@@ -440,6 +456,24 @@ def _terminate_dev_server(proc: subprocess.Popen, grace_seconds: int) -> None:
             proc.kill()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    """Best-effort: is ``host:port`` already accepting TCP connections?
+
+    Used to abort browser verification when the dev port is already bound (by a
+    foreign server or another project's preview) — otherwise the readiness probe
+    is answered by that server and we screenshot the WRONG app into this run's
+    artifacts and mark it passed. Never raises; returns False on any error."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------- screenshot runner ----------
@@ -1052,6 +1086,30 @@ def _core_browser_verification(
         capturer = _legacy_single_capture_adapter(screenshot_runner)
     else:
         capturer = _default_playwright_capture
+
+    # Pre-flight (real launches only): if the dev port is already bound, a
+    # foreign server / another project's preview would answer the readiness
+    # probe and we'd screenshot the WRONG app and mark it passed. Abort with a
+    # clear blocker instead. Skipped when a fake ``process_starter`` is injected
+    # (tests) — there is no real socket to collide with.
+    if process_starter is None:
+        parsed = urllib.parse.urlparse(config.url)
+        host = parsed.hostname or DEFAULT_DEV_HOST
+        port = parsed.port or DEFAULT_DEV_PORT
+        if _port_in_use(host, port):
+            return BrowserVerificationResult(
+                enabled=True,
+                command=config.command,
+                url=config.url,
+                status="failed",
+                screenshot_path=None,
+                output_preview=(
+                    f"port {port} is already in use — stop the running preview/dev "
+                    f"server before verifying (a foreign server on {host}:{port} would "
+                    "be captured as this app)."
+                ),
+                duration_ms=int((time.perf_counter() - start) * 1000),
+            )
 
     proc: Optional[subprocess.Popen] = None
     stdout_drainer: Optional[_StreamDrainer] = None

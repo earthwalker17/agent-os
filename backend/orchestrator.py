@@ -316,10 +316,52 @@ def _latest_nongreen_run_context(project_id: str) -> str:
         lines = [f"- **{title}** — status `{status}`"]
         if summary:
             lines.append(f"  - summary: {summary[:400]}")
+        # Phase 9 — when this was a TEAM run, surface the wave/integration
+        # picture so the main agent (project manager) can reason about what the
+        # team actually did rather than seeing a flat status. Metadata only
+        # (counts + conflicts), never repo contents (§6 context hygiene).
+        team_line = _team_run_context(rec)
+        if team_line:
+            lines.append(team_line)
         for b in blockers[:5]:
             lines.append(f"  - blocker: {str(b)[:200]}")
         return "\n".join(lines)
     return ""
+
+
+def _team_run_context(rec: dict) -> str:
+    """One compact line describing a team run's wave/integration shape, or ''.
+
+    Reads only the metadata already on the run record (``plan.execution_mode``,
+    ``plan.tasks`` roles/waves, ``integration`` counts) — never repo contents.
+    Empty for a sequential run, so the PM context is unchanged for those.
+    """
+    plan = rec.get("plan") or {}
+    integ = rec.get("integration") or {}
+    is_team = plan.get("execution_mode") == "team" or integ.get("enabled")
+    if not is_team:
+        return ""
+    tasks = plan.get("tasks") or []
+    waves = sorted({t.get("wave") for t in tasks if t.get("wave") is not None})
+    roles: dict[str, int] = {}
+    for t in tasks:
+        r = str(t.get("role") or "coder")
+        roles[r] = roles.get(r, 0) + 1
+    role_str = ", ".join(f"{n}×{r}" for r, n in roles.items())
+    applied = len(integ.get("files_applied") or [])
+    conflicts = integ.get("conflicts") or []
+    parts = [
+        f"team run: {len(tasks)} task(s) across {len(waves)} wave(s)",
+    ]
+    if role_str:
+        parts.append(f"roles {role_str}")
+    parts.append(f"{applied} file(s) integrated")
+    if conflicts:
+        paths = ", ".join(str(c.get("path")) for c in conflicts[:3])
+        parts.append(f"{len(conflicts)} integration conflict(s) [{paths}]")
+    else:
+        parts.append("no integration conflicts")
+    return "  - " + "; ".join(parts)
 
 
 def _latest_git_state_context(project_id: str) -> str:

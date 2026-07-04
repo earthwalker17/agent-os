@@ -230,10 +230,13 @@ def test_infer_python_without_tests_syntax_check():
         specs = infer_verification_specs(repo)
         assert len(specs) == 1
         assert specs[0].kind == "syntax"
-        assert "compileall" in specs[0].command
-        # node_modules is excluded so a full-stack repo's vendored .py files
-        # can't derail the syntax check.
-        assert "node_modules" in specs[0].command
+        # The syntax check byte-compiles via py_compile with an EXACT-name dir
+        # skip set matching the inference walk, so a committed .venv / build /
+        # dist with non-source or Python-2-only .py can't derail it (T2.3).
+        cmd = specs[0].command
+        assert "py_compile" in cmd
+        for excluded in ("node_modules", "venv", "dist", "build", "__pycache__"):
+            assert excluded in cmd, excluded
 
     _run(body)
 
@@ -382,6 +385,54 @@ def test_run_specs_stops_at_first_failure():
         assert v.commands[1].status == "skipped"  # never ran
         # Aggregate reflects the first failing command.
         assert v.exit_code == 1
+
+    _run(body)
+
+
+def test_syntax_check_ignores_venv_build_dirs():
+    """T2.3: a committed .venv / build dir holding a Python-2-only (invalid in
+    py3) file must NOT fail the inferred syntax check — it would spuriously
+    downgrade a clean run and fire repair passes over files the agent never
+    wrote. Runs the REAL compileall spec via a subprocess."""
+    def body(layout: _TempLayout):
+        from execution.tool_runtime import ToolRuntime
+
+        repo = layout.init_workspace(
+            "p",
+            repo_files={
+                "app.py": "x = 1\n",  # clean real source
+                # py2-only syntax that py3 rejects, in EXACT-name excluded dirs:
+                ".venv/lib/legacy.py": "print 'hello'\n",
+                "build/old.py": "exec 'x=1'\n",
+                "node_modules/vendor/tool.py": "print 'x'\n",
+            },
+        )
+        specs = infer_verification_specs(repo)
+        assert specs and specs[0].kind == "syntax"
+        v = run_verification_specs("p", specs, mode="inferred", runtime=ToolRuntime("p"))
+        assert v.status == "passed", (v.status, [c.output for c in v.commands])
+
+    _run(body)
+
+
+def test_syntax_check_still_catches_errors_in_substring_named_dirs():
+    """T2.3 regression: a dir whose name merely CONTAINS an excluded token
+    (`distribution` contains `dist`, `rebuild` contains `build`) must still be
+    syntax-checked — the exact-name skip set must not over-exclude by substring."""
+    def body(layout: _TempLayout):
+        from execution.tool_runtime import ToolRuntime
+
+        repo = layout.init_workspace(
+            "p",
+            repo_files={
+                "ok.py": "x = 1\n",
+                "src/distribution/bad.py": "def broken(:\n",   # real syntax error
+            },
+        )
+        specs = infer_verification_specs(repo)
+        assert specs and specs[0].kind == "syntax"
+        v = run_verification_specs("p", specs, mode="inferred", runtime=ToolRuntime("p"))
+        assert v.status == "failed", "syntax error in src/distribution/ was not caught"
 
     _run(body)
 

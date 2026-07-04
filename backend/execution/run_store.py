@@ -55,12 +55,46 @@ def _atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _safe_segment(value: str, kind: str) -> str:
+    """Structural guard: reject a path segment that could traverse its root.
+
+    A last line of defense (the HTTP layer also validates ids): a ``run_id`` /
+    ``project_id`` that is empty, ``.``/``..``, or contains a path separator or
+    ``..`` must never be joined into a filesystem path — it would escape the
+    runs directory. Ids we mint (``new_run_id`` / project slugs) always pass.
+    """
+    if (
+        not isinstance(value, str)
+        or value in ("", ".", "..")
+        or "/" in value
+        or "\\" in value
+        or ".." in value
+        or "\x00" in value
+    ):
+        raise ValueError(f"unsafe {kind}: {value!r}")
+    return value
+
+
 def get_runs_dir(project_id: str) -> Path:
-    return get_project_execution_dir(project_id) / "runs"
+    return get_project_execution_dir(_safe_segment(project_id, "project_id")) / "runs"
 
 
 def get_run_dir(project_id: str, run_id: str) -> Path:
-    return get_runs_dir(project_id) / run_id
+    return get_runs_dir(project_id) / _safe_segment(run_id, "run_id")
+
+
+def _read_run_dir(project_id: str, run_id: str) -> Optional[Path]:
+    """Resolve a run dir for READ access, or ``None`` for a malformed id.
+
+    The structural ``_safe_segment`` guard raises ``ValueError`` for an id with
+    ``..`` / a separator / NUL. Writers pass server-minted ids so a raise there is
+    a real bug, but a READER is handed a raw URL path segment — so it treats a
+    bad id as 'absent' (returns the empty value) and the HTTP layer answers a
+    clean 404 instead of leaking a 500 (traversal is still blocked either way)."""
+    try:
+        return get_run_dir(project_id, run_id)
+    except ValueError:
+        return None
 
 
 def init_run_dir(project_id: str, run_id: str) -> Path:
@@ -85,7 +119,10 @@ def read_task_card(project_id: str, run_id: str) -> tuple[str, str]:
     reconstruct the original task card for a fresh run. Returns ``("", "")``
     when the file is absent.
     """
-    path = get_run_dir(project_id, run_id) / "task_card.md"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return "", ""
+    path = rd / "task_card.md"
     if not path.exists():
         return "", ""
     text = path.read_text(encoding="utf-8")
@@ -132,7 +169,10 @@ def read_events(project_id: str, run_id: str) -> list[dict]:
     event carries at least ``type`` and ``timestamp`` (stamped by
     :func:`append_event`).
     """
-    path = get_run_dir(project_id, run_id) / "events.jsonl"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return []
+    path = rd / "events.jsonl"
     if not path.exists():
         return []
     events: list[dict] = []
@@ -156,13 +196,60 @@ def write_run_json(project_id: str, run_id: str, record: RunRecord) -> None:
 
 
 def read_run_json(project_id: str, run_id: str) -> dict | None:
-    path = get_run_dir(project_id, run_id) / "run.json"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return None
+    path = rd / "run.json"
     if not path.exists():
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+
+
+# Per-run read-modify-write lock for run.json. `_atomic_write_text` guarantees a
+# reader never sees a torn file, but it does NOT prevent LOST UPDATES: an HTTP
+# endpoint (cancel / browser-verify / git-commit / deploy-confirm) and an
+# off-thread finalizer can each `read -> mutate -> write` the same record
+# concurrently, and the last writer silently drops the other's fields (a
+# browser-verify final write clobbering a concurrent commit's commit_sha, or two
+# deploy confirms both passing the `if record.deploy_state` guard). Serializing
+# the read-modify-write closes that window. Mirrors `_event_lock`: one small Lock
+# per run touched in this process, reclaimed on restart. Held only for the brief
+# read+mutate+write, never across an LLM/network call.
+_RUN_JSON_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_RUN_JSON_LOCKS_GUARD = threading.Lock()
+
+
+def run_json_lock(project_id: str, run_id: str) -> threading.Lock:
+    with _RUN_JSON_LOCKS_GUARD:
+        return _RUN_JSON_LOCKS.setdefault((project_id, run_id), threading.Lock())
+
+
+def mutate_run_json(project_id: str, run_id: str, apply):
+    """Atomically read → mutate → write a run's record under its per-run lock.
+
+    ``apply(record)`` receives the current :class:`RunRecord` (freshly read from
+    disk) and may mutate it in place and/or return a replacement record. Returns
+    the record that was written, or ``None`` if run.json is missing/corrupt (the
+    mutation is skipped). Use this — never a bare read + write_run_json — for any
+    endpoint or finalizer that updates a run that could be mutated concurrently.
+    """
+    lock = run_json_lock(project_id, run_id)
+    with lock:
+        raw = read_run_json(project_id, run_id)
+        if raw is None:
+            return None
+        try:
+            record = RunRecord(**raw)
+        except Exception:  # noqa: BLE001
+            return None
+        result = apply(record)
+        if result is not None:
+            record = result
+        write_run_json(project_id, run_id, record)
+        return record
 
 
 def write_plan_json(project_id: str, run_id: str, plan: ExecutionPlan) -> None:
@@ -177,7 +264,10 @@ def write_plan_json(project_id: str, run_id: str, plan: ExecutionPlan) -> None:
 
 
 def read_plan_json(project_id: str, run_id: str) -> dict | None:
-    path = get_run_dir(project_id, run_id) / "plan.json"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return None
+    path = rd / "plan.json"
     if not path.exists():
         return None
     try:
@@ -191,7 +281,10 @@ def write_result_md(project_id: str, run_id: str, content: str) -> None:
 
 
 def read_result_md(project_id: str, run_id: str) -> str | None:
-    path = get_run_dir(project_id, run_id) / "result.md"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return None
+    path = rd / "result.md"
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
@@ -212,7 +305,10 @@ def write_diff_patch(project_id: str, run_id: str, content: str) -> None:
 
 
 def read_diff_patch(project_id: str, run_id: str) -> str | None:
-    path = get_run_dir(project_id, run_id) / "diff.patch"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return None
+    path = rd / "diff.patch"
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
@@ -232,7 +328,10 @@ def write_deployment_json(project_id: str, run_id: str, data: dict) -> None:
 
 
 def read_deployment_json(project_id: str, run_id: str) -> dict | None:
-    path = get_run_dir(project_id, run_id) / "deployment.json"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return None
+    path = rd / "deployment.json"
     if not path.exists():
         return None
     try:
@@ -253,7 +352,10 @@ def write_integration_json(project_id: str, run_id: str, data: dict) -> None:
 
 
 def read_integration_json(project_id: str, run_id: str) -> dict | None:
-    path = get_run_dir(project_id, run_id) / "integration.json"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return None
+    path = rd / "integration.json"
     if not path.exists():
         return None
     try:
@@ -270,7 +372,10 @@ def write_deploy_log(project_id: str, run_id: str, content: str) -> None:
 
 
 def read_deploy_log(project_id: str, run_id: str) -> str | None:
-    path = get_run_dir(project_id, run_id) / "deploy.log"
+    rd = _read_run_dir(project_id, run_id)
+    if rd is None:
+        return None
+    path = rd / "deploy.log"
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
@@ -295,6 +400,126 @@ def list_runs(project_id: str) -> list[dict]:
             entries.append(record)
     entries.sort(key=lambda r: r.get("run_id", ""), reverse=True)
     return entries
+
+
+# The transient sub-status fields that mirror ``verification_state``: never a
+# ``RunStatus``, always cleared on every settle path. Kept here as the single
+# source of truth for "clear them all" so a new field can't silently leak.
+_TRANSIENT_STATE_FIELDS = (
+    "verification_state",
+    "browser_verification_state",
+    "integration_state",
+    "git_state",
+    "deploy_state",
+    "external_state",
+)
+
+# Fields that a startup terminal-run sweep may clear itself, and which VALUES
+# count as a lingering in-progress state on an already-terminal run. ``deploy_state``
+# / ``external_state`` are DELIBERATELY excluded — a crash mid-deploy may have left
+# a real external action half-applied, so ``reconcile_stuck_external_actions`` owns
+# those (it queries the provider before clearing).
+#
+# NOTE the asymmetry: ``verification_state`` / ``integration_state`` / ``git_state``
+# only ever hold an in-progress value (any non-null is a leak on a terminal run),
+# but ``browser_verification_state`` also holds SETTLED results — ``'passed'`` /
+# ``'failed'`` are the real outcome and must be preserved; only its in-progress
+# ``'running'`` is a leak. So each field maps to the set of values safe to clear.
+_TERMINAL_CLEARABLE_STATES: dict[str, set | None] = {
+    "verification_state": None,           # None => clear any non-null value
+    "integration_state": None,
+    "git_state": None,
+    "browser_verification_state": {"running"},  # clear ONLY the transient value
+}
+
+
+def _terminal_clearable_value(field: str, value) -> bool:
+    """Whether ``field``'s current ``value`` is a lingering in-progress state
+    that a terminal-run sweep should null (vs. a settled result to keep)."""
+    if not value:
+        return False
+    allowed = _TERMINAL_CLEARABLE_STATES.get(field)
+    return True if allowed is None else value in allowed
+
+
+def _clear_transient_states(record: RunRecord) -> None:
+    """Null every transient ``*_state`` sub-status on ``record`` (in place).
+
+    Used by the settle paths for a run that is being moved to a FAILED/CANCELLED
+    terminal status (crash handler / cancel / sweep-of-running) — at that moment
+    every ``*_state`` is an in-progress value with no settled meaning, so clearing
+    all six is correct. (The terminal-run sweep, by contrast, must preserve a
+    settled ``browser_verification_state`` — see ``sweep_terminal_transient_states``.)"""
+    for field in _TRANSIENT_STATE_FIELDS:
+        setattr(record, field, None)
+
+
+def sweep_terminal_transient_states() -> list[str]:
+    """Clear leaked local transient sub-states on already-*terminal* runs.
+
+    ``sweep_stuck_runs`` only rescues runs still marked ``running``. But
+    ``verification_state`` / ``browser_verification_state`` are set *after* the
+    run's status has already gone terminal (the verify/browser tail in
+    ``_finalize`` runs post-status), so a crash in that window leaves e.g.
+    ``status='completed'`` + ``verification_state='verifying'`` on disk — which
+    ``sweep_stuck_runs`` skips (not running) and the UI then polls forever.
+
+    This companion sweep walks terminal runs and nulls any lingering
+    in-progress ``*_state`` per ``_TERMINAL_CLEARABLE_STATES`` — clearing any
+    non-null ``verification_state``/``integration_state``/``git_state`` but ONLY
+    a transient ``browser_verification_state='running'`` (its ``passed``/
+    ``failed`` is a settled result to keep). Never deploy/external — those are the
+    external reconciler's job. Best-effort; returns the runs it fixed.
+    """
+    fixed: list[str] = []
+    root = get_execution_root()
+    if not root.exists() or not root.is_dir():
+        return fixed
+    terminal = {
+        RunStatus.COMPLETED.value,
+        RunStatus.PARTIAL.value,
+        RunStatus.BLOCKED.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+    }
+    for project_dir in root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        runs_dir = project_dir / "runs"
+        if not runs_dir.exists() or not runs_dir.is_dir():
+            continue
+        for run_dir in runs_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            run_json_path = run_dir / "run.json"
+            if not run_json_path.exists():
+                continue
+            try:
+                raw = json.loads(run_json_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if raw.get("status") not in terminal:
+                continue
+            # Only act when a field holds a lingering IN-PROGRESS value — never
+            # touch a settled browser_verification_state ('passed'/'failed').
+            to_clear = [
+                f for f in _TERMINAL_CLEARABLE_STATES
+                if _terminal_clearable_value(f, raw.get(f))
+            ]
+            if not to_clear:
+                continue
+            try:
+                record = RunRecord(**raw)
+            except Exception:  # noqa: BLE001
+                continue
+            for field in to_clear:
+                setattr(record, field, None)
+            try:
+                write_run_json(project_dir.name, run_dir.name, record)
+                fixed.append(f"{project_dir.name}/{run_dir.name}")
+            except Exception:  # noqa: BLE001
+                continue
+    return fixed
 
 
 def sweep_stuck_runs() -> list[str]:
@@ -350,10 +575,12 @@ def sweep_stuck_runs() -> list[str]:
                 )
             record.status = RunStatus.FAILED
             record.completed_at = datetime.utcnow()
-            # Phase 9 — settle the transient integration sub-status so a crash
-            # mid-integration can't leave the UI poll gates reading the run as
-            # active forever.
-            record.integration_state = None
+            # Settle EVERY transient sub-status so a crash mid-phase can't leave
+            # the UI poll gates reading the run as active forever. (A crash can
+            # land in verification / browser / git / integration / deploy — the
+            # in-process crash handler clears all six; this startup sweep, the
+            # other cross-process settle path, must match it.)
+            _clear_transient_states(record)
             interrupted_msg = "run interrupted before finalize (server restart or crash)"
             if interrupted_msg not in record.blockers:
                 record.blockers = list(record.blockers) + [interrupted_msg]

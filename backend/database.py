@@ -322,13 +322,73 @@ def update_pending_execution_plan(
         return cursor.rowcount > 0
 
 
+def claim_pending_execution(pending_id: str) -> bool:
+    """Atomically transition a pending row 'pending' -> 'dispatching'.
+
+    Returns True for exactly ONE caller when several confirm requests race the
+    same pending plan (a guarded ``UPDATE ... WHERE status='pending'`` — SQLite
+    serializes the write, so the rowcount is 1 for the winner and 0 for every
+    loser). Only the winner should call ``dispatch()``; the losers get a 409.
+    This is the atomic guard that stops a double-click from launching two Coding
+    Agent runs against the same live ``repo/`` tree.
+    """
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        cursor = conn.execute(
+            "UPDATE pending_executions "
+            "SET status = 'dispatching', updated_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (now, pending_id),
+        )
+        return cursor.rowcount > 0
+
+
+def revert_pending_execution_to_pending(pending_id: str) -> bool:
+    """Undo a claim (dispatching -> pending) when the dispatch itself failed, so
+    the plan's 'OK, run this' button doesn't dead-end on a transient error."""
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        cursor = conn.execute(
+            "UPDATE pending_executions "
+            "SET status = 'pending', updated_at = ? "
+            "WHERE id = ? AND status = 'dispatching'",
+            (now, pending_id),
+        )
+        return cursor.rowcount > 0
+
+
+def reconcile_stuck_pending_executions() -> int:
+    """At startup, revert any pending row stranded in the intermediate
+    'dispatching' state back to 'pending'.
+
+    'dispatching' is a momentary in-process claim between
+    ``claim_pending_execution`` and ``mark_pending_execution_dispatched``; if a
+    row is still 'dispatching' at process start, the process that claimed it died
+    mid-confirm. Reverting to 'pending' re-enables the confirmable plan so the
+    'OK, run this' button never dead-ends. Safe against a crash that occurred
+    *after* dispatch: that run is itself swept to ``failed`` by
+    ``sweep_stuck_runs``, so re-confirming is a clean retry (never a duplicate
+    live run). Returns the number of rows reverted."""
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        cursor = conn.execute(
+            "UPDATE pending_executions "
+            "SET status = 'pending', updated_at = ? "
+            "WHERE status = 'dispatching'",
+            (now,),
+        )
+        return cursor.rowcount
+
+
 def mark_pending_execution_dispatched(pending_id: str, run_id: str) -> bool:
     now = datetime.now().isoformat()
     with get_db() as conn:
         cursor = conn.execute(
             "UPDATE pending_executions "
             "SET status = 'dispatched', run_id = ?, updated_at = ? "
-            "WHERE id = ? AND status = 'pending'",
+            # Accept either 'pending' (legacy direct path) or 'dispatching' (the
+            # atomic-claim path) so the winner of a claim can finalize the row.
+            "WHERE id = ? AND status IN ('pending', 'dispatching')",
             (run_id, now, pending_id),
         )
         return cursor.rowcount > 0

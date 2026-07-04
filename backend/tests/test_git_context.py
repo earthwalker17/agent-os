@@ -108,6 +108,69 @@ def test_mode_guidance_includes_git_for_review_and_debug():
     _run(body)
 
 
+def test_nongreen_context_includes_team_wave_integration_shape():
+    """T3.2: after a partial TEAM run, the main-agent (@debug/@review) context
+    must reflect waves / roles / integration conflicts, not just a flat status —
+    so the PM can reason about what the team actually did."""
+    from execution.models import (
+        ExecutionPlan, ExecutionTask, IntegrationResult, IntegrationConflict, TaskStatus,
+    )
+
+    def body(layout):
+        plan = ExecutionPlan(
+            goal="build textkit",
+            execution_mode="team",
+            tasks=[
+                ExecutionTask(id="t1", title="mod A", role="coder", wave=1,
+                              workspace="patch", status=TaskStatus.COMPLETED),
+                ExecutionTask(id="t2", title="mod B", role="coder", wave=1,
+                              workspace="patch", status=TaskStatus.COMPLETED),
+                ExecutionTask(id="t3", title="review", role="reviewer", wave=2,
+                              status=TaskStatus.COMPLETED),
+            ],
+        )
+        integ = IntegrationResult(
+            enabled=True, waves=1, files_applied=["src/a.py"],
+            conflicts=[IntegrationConflict(path="src/shared.py", applied_task="t1",
+                                           rejected_task="t2", wave=1)],
+        )
+        run_store.init_run_dir("p", "run-team")
+        rec = RunRecord(
+            run_id="run-team", project_id="p", task_title="textkit build",
+            status=RunStatus.PARTIAL, summary="mostly built",
+            blockers=["integration conflict on 'src/shared.py'"],
+            plan=plan, integration=integ,
+        )
+        run_store.write_run_json("p", "run-team", rec)
+
+        out = orchestrator._latest_nongreen_run_context("p")
+        assert "team run" in out
+        assert "wave" in out
+        assert "coder" in out and "reviewer" in out
+        assert "integration conflict" in out
+        assert "src/shared.py" in out
+        # still metadata-only — no repo contents / raw diff
+        assert "diff --git" not in out
+
+    _run(body)
+
+
+def test_nongreen_context_sequential_run_has_no_team_line():
+    """A sequential partial run must NOT gain a team line (unchanged behavior)."""
+    def body(layout):
+        run_store.init_run_dir("p", "run-seq")
+        rec = RunRecord(
+            run_id="run-seq", project_id="p", task_title="seq task",
+            status=RunStatus.PARTIAL, summary="did some",
+        )
+        run_store.write_run_json("p", "run-seq", rec)
+        out = orchestrator._latest_nongreen_run_context("p")
+        assert "seq task" in out
+        assert "team run" not in out
+
+    _run(body)
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

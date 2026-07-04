@@ -95,6 +95,78 @@ def test_pending_lifecycle():
     assert marked2 is False
 
 
+def test_claim_pending_is_atomic_single_winner():
+    """T1.5: claim_pending_execution transitions pending->dispatching for exactly
+    one caller; a second claim (concurrent confirm) loses. The winner can then
+    finalize to dispatched; a revert restores pending on dispatch failure."""
+    db = _fresh_db_module()
+    conv = db.create_conversation("agent-os", "c")
+    pending = db.create_pending_execution(
+        project_id="agent-os", conversation_id=conv["id"], source_message_id=None,
+        title="t", display_plan="p", task_card="c",
+    )
+    pid = pending["id"]
+
+    # First claim wins; the row is now 'dispatching'.
+    assert db.claim_pending_execution(pid) is True
+    assert db.get_pending_execution(pid)["status"] == "dispatching"
+    # A second confirm racing the same plan loses the claim (no second dispatch).
+    assert db.claim_pending_execution(pid) is False
+
+    # The winner finalizes the claimed row to dispatched (accepts 'dispatching').
+    assert db.mark_pending_execution_dispatched(pid, "20260701-000000-run00001") is True
+    assert db.get_pending_execution(pid)["status"] == "dispatched"
+    assert db.get_pending_execution(pid)["run_id"] == "20260701-000000-run00001"
+
+
+def test_revert_pending_releases_claim():
+    """A claimed plan whose dispatch failed reverts to pending so the button
+    doesn't dead-end."""
+    db = _fresh_db_module()
+    conv = db.create_conversation("agent-os", "c")
+    pending = db.create_pending_execution(
+        project_id="agent-os", conversation_id=conv["id"], source_message_id=None,
+        title="t", display_plan="p", task_card="c",
+    )
+    pid = pending["id"]
+    assert db.claim_pending_execution(pid) is True
+    assert db.revert_pending_execution_to_pending(pid) is True
+    assert db.get_pending_execution(pid)["status"] == "pending"
+    # Can be claimed again after the revert.
+    assert db.claim_pending_execution(pid) is True
+    # Revert only applies to a 'dispatching' row — a dispatched one is untouched.
+    db.mark_pending_execution_dispatched(pid, "run-x")
+    assert db.revert_pending_execution_to_pending(pid) is False
+
+
+def test_reconcile_reverts_stranded_dispatching_rows():
+    """A crash between claim and mark leaves a row stuck in 'dispatching' — the
+    startup reconciler must revert it to 'pending' so the OK button doesn't
+    dead-end (any dispatched run is separately swept to failed)."""
+    db = _fresh_db_module()
+    conv = db.create_conversation("agent-os", "c")
+    p1 = db.create_pending_execution(
+        project_id="agent-os", conversation_id=conv["id"], source_message_id=None,
+        title="t1", display_plan="p", task_card="c")["id"]
+    p2 = db.create_pending_execution(
+        project_id="agent-os", conversation_id=conv["id"], source_message_id=None,
+        title="t2", display_plan="p", task_card="c")["id"]
+    p3 = db.create_pending_execution(
+        project_id="agent-os", conversation_id=conv["id"], source_message_id=None,
+        title="t3", display_plan="p", task_card="c")["id"]
+    # p1 stranded mid-confirm; p2 pending; p3 already dispatched.
+    db.claim_pending_execution(p1)  # -> 'dispatching'
+    db.claim_pending_execution(p3); db.mark_pending_execution_dispatched(p3, "run-x")
+
+    n = db.reconcile_stuck_pending_executions()
+    assert n == 1  # only p1 was 'dispatching'
+    assert db.get_pending_execution(p1)["status"] == "pending"   # reverted -> confirmable
+    assert db.get_pending_execution(p2)["status"] == "pending"   # untouched
+    assert db.get_pending_execution(p3)["status"] == "dispatched"  # untouched
+    # The reverted plan can be claimed + confirmed again (clean retry).
+    assert db.claim_pending_execution(p1) is True
+
+
 def test_message_metadata_roundtrip():
     db = _fresh_db_module()
     conv = db.create_conversation("agent-os", "test conv")

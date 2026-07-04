@@ -339,6 +339,82 @@ def test_success_path_records_passed_and_screenshot(monkeypatch_helper=None):
     _run(body)
 
 
+def test_windows_teardown_reaps_process_tree():
+    """T2.4: on Windows the dev-server teardown must reap the WHOLE process tree
+    (taskkill /F /T), not just cmd.exe — otherwise node/Vite orphans and keeps
+    port 5174, breaking the next run's --strictPort bind."""
+    import os as _os
+    if _os.name != "nt":
+        return  # taskkill path is Windows-only
+
+    def body(layout: _TempLayout):
+        task_md = (
+            "## Browser Verification\n\n```bash\nnpm run dev\nurl: http://127.0.0.1:5173\n```\n"
+        )
+        layout.init_workspace("agent-os", task_md_body=task_md)
+        run_dir = layout.make_run_dir("agent-os", "r1")
+
+        proc = _FakeProc()
+        reaped = {"called": False}
+        prev_wait = bv._wait_for_url
+        prev_reap = bv._taskkill_tree
+        bv._wait_for_url = _always_ready  # type: ignore[assignment]
+
+        def _fake_reap(p):
+            reaped["called"] = True
+            p.kill()  # settle the fake handle
+
+        bv._taskkill_tree = _fake_reap  # type: ignore[assignment]
+        try:
+            run_browser_verification(
+                "agent-os", run_dir=run_dir,
+                process_starter=_fake_starter_factory(proc),
+                screenshot_runner=_writing_screenshot_runner,
+            )
+        finally:
+            bv._wait_for_url = prev_wait  # type: ignore[assignment]
+            bv._taskkill_tree = prev_reap  # type: ignore[assignment]
+
+        assert reaped["called"], "teardown did not reap the process tree (taskkill)"
+
+    _run(body)
+
+
+def test_port_in_use_aborts_before_capturing_foreign_app():
+    """T2.4: if the dev port is already bound (foreign server / other preview),
+    verification must abort with a clear blocker instead of screenshotting the
+    wrong app. Only fires on a REAL launch (process_starter=None)."""
+
+    def body(layout: _TempLayout):
+        task_md = (
+            "## Browser Verification\n\n```bash\nnpm run dev\nurl: http://127.0.0.1:5174\n```\n"
+        )
+        layout.init_workspace("agent-os", task_md_body=task_md)
+        run_dir = layout.make_run_dir("agent-os", "r1")
+
+        started = {"n": 0}
+
+        def _counting_starter(_cmd, _cwd):
+            started["n"] += 1
+            return _FakeProc()
+
+        prev_port = bv._port_in_use
+        bv._port_in_use = lambda host, port: True  # type: ignore[assignment]
+        try:
+            # process_starter=None so the pre-check runs; the real starter would
+            # be _counting_starter if the check DIDN'T fire.
+            result = bv.run_browser_verification(
+                "agent-os", run_dir=run_dir, screenshot_runner=_writing_screenshot_runner,
+            )
+        finally:
+            bv._port_in_use = prev_port  # type: ignore[assignment]
+
+        assert result.status == "failed"
+        assert "already in use" in (result.output_preview or "")
+
+    _run(body)
+
+
 def test_unreachable_url_records_failed_and_cleans_up():
     def body(layout: _TempLayout):
         task_md = (

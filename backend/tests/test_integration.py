@@ -144,6 +144,43 @@ def test_failed_task_output_still_integrates_matching_sequential_semantics():
     _run(body)
 
 
+# ---------- case-insensitive collision (T1.6) ----------
+
+
+def test_case_only_path_collision_is_detected_not_silently_overwritten():
+    """On a case-insensitive filesystem (Windows/macOS) two tasks writing paths
+    that differ ONLY in case target the SAME on-disk file. That must surface as a
+    conflict (first-writer-wins), never a silent overwrite. On a case-sensitive
+    FS the two are genuinely distinct files and both apply cleanly."""
+    import os
+
+    def body(layout):
+        repo = layout.init_workspace()
+        _write_patch("t1", {"src/App.ts": "version A\n"})
+        _write_patch("t2", {"src/app.ts": "version B\n"})
+        u1, u2 = _unit("t1"), _unit("t2")
+        result = integrate_wave(_PID, _RUN, 1, [u1, u2], ToolRuntime(_PID))
+
+        case_insensitive = os.path.normcase("A") == os.path.normcase("a")
+        if case_insensitive:
+            # Same file: first writer wins, the collision is surfaced + blocked.
+            assert len(result.conflicts) == 1, result.conflicts
+            c = result.conflicts[0]
+            assert c.applied_task == "t1" and c.rejected_task == "t2"
+            assert result.applied == ["src/App.ts"]
+            assert any("conflict" in b for b in u2.blockers)
+            # The winner's content is what's on disk (not silently clobbered).
+            on_disk = list((repo / "src").glob("*.ts"))
+            assert len(on_disk) == 1
+            assert on_disk[0].read_text(encoding="utf-8") == "version A\n"
+        else:
+            # Distinct files on a case-sensitive FS — both apply, no conflict.
+            assert result.conflicts == []
+            assert sorted(result.applied) == ["src/App.ts", "src/app.ts"]
+
+    _run(body)
+
+
 # ---------- safety ----------
 
 

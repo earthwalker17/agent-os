@@ -219,15 +219,41 @@ def _has_python_sources(repo_dir: Path) -> bool:
     return False
 
 
+# A single-line Python program (run via ``python -c``) that syntax-checks every
+# ``.py`` under the repo, pruning the SAME tool/vendored dirs the inference walk
+# skips (``_SKIP_DIR_NAMES``) — by EXACT directory name. This replaces a
+# ``compileall -x <regex>`` approach: compileall matches ``-x`` as an unanchored
+# substring against the full path, so a bare ``dist``/``build``/``venv`` would
+# silently skip legit source like ``src/distribution/`` (false-negative), and the
+# separator-anchored regex fix is a cross-shell backslash-escaping minefield.
+# ``os.walk`` in-place dir pruning with an exact-name set is precise and portable.
+# Only single-quoted string literals inside, so it survives cmd.exe AND sh
+# double-quoting; ``py_compile.compile`` (doraise=False) returns a truthy cfile on
+# success / falsy None on failure (writing the error to stderr), so ``all(...)``
+# is the pass/fail signal.
+_SYNTAX_CHECK_CODE = (
+    "import os,py_compile,sys; "
+    "skip={'.git','node_modules','.venv','venv','__pycache__','dist','build'}; "
+    "fs=[os.path.join(r,f) for r,d,g in os.walk('.') "
+    "if (d.__setitem__(slice(None),[x for x in d if x not in skip]) or True) "
+    "for f in g if f.endswith('.py')]; "
+    "sys.exit(0 if all(py_compile.compile(p) for p in fs) else 1)"
+)
+
+
 def _syntax_check_spec() -> VerifyCommandSpec:
     """A lightweight, always-available Python syntax check.
 
-    ``compileall`` runs from the repo cwd, so ``node_modules`` (which can hold
-    vendored, sometimes Python-2-only ``.py`` files for a full-stack repo) is
-    excluded via ``-x`` so it can't derail an otherwise-clean backend.
+    Walks the repo from cwd and byte-compiles every ``.py``, pruning the same
+    tool/vendored dirs the inference walk skips (``node_modules`` / ``.venv`` /
+    ``venv`` / ``dist`` / ``build`` / ``__pycache__`` / ``.git``) by EXACT name —
+    so a committed virtualenv or vendored tree (possibly Python-2-only ``.py``)
+    can't derail an otherwise-clean backend, while a real source dir whose name
+    merely CONTAINS one of those tokens (``distribution`` / ``rebuild``) is still
+    checked. Kept in sync with ``_SKIP_DIR_NAMES``.
     """
     return VerifyCommandSpec(
-        command="python -m compileall -q -x node_modules .",
+        command=f'python -c "{_SYNTAX_CHECK_CODE}"',
         kind="syntax",
         timeout_seconds=_SYNTAX_TIMEOUT_SECONDS,
     )

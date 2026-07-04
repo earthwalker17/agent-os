@@ -215,6 +215,95 @@ def test_deploy_preview_then_confirm_stamps_run_and_ledger():
     _run(body)
 
 
+def test_concurrent_double_confirm_deploys_only_once():
+    """T2.1: two confirms for one run must not both launch a Vercel deployment.
+    With a deferred finalizer (deploy_state stays 'deploying'), the second
+    confirm has to be rejected by the atomic per-run claim, and
+    create_deployment is invoked exactly once."""
+    class _DeferManager:
+        def __init__(self):
+            self.queued = []
+
+        def submit(self, fn, *args, **kwargs):
+            self.queued.append((fn, args, kwargs))
+            return None
+
+    def body(env):
+        env.make_project("p")
+        env.make_run("p")
+        credentials.set_credential("vercel", "p", fields={"token": "t"})
+        credentials.update_metadata("vercel", "p", {"project_id": "prj_1", "org_id": "team_1"})
+        calls = {"n": 0}
+
+        def _create(*a, **k):
+            calls["n"] += 1
+            return vc.DeploymentResult(
+                ok=True, deployment_id="dpl_x", url="https://app.vercel.app", ready_state="READY"
+            )
+
+        env.patch_vc(status=_linked_status, create_deployment=_create,
+                     get_deployment=lambda *a, **k: vc.DeploymentResult(
+                         ok=True, deployment_id="dpl_x", url="https://app.vercel.app", ready_state="READY"))
+        defer = _DeferManager()
+        env._save(main, "get_default_manager", lambda: defer)
+
+        # First confirm claims the deploy (deploy_state='deploying'); finalizer
+        # is queued, NOT run, so the transient state is still set.
+        cf1 = env.client.post("/api/projects/p/execution/runs/run-1/vercel/deploy", json={"confirm": True})
+        assert cf1.status_code == 200 and cf1.json()["applied"] is True
+        assert (run_store.read_run_json("p", "run-1") or {})["deploy_state"] == "deploying"
+
+        # Second confirm, before the finalizer runs, must be rejected by the claim.
+        cf2 = env.client.post("/api/projects/p/execution/runs/run-1/vercel/deploy", json={"confirm": True})
+        assert cf2.status_code == 409, cf2.text
+
+        # Exactly one finalizer was queued; run it and confirm one deployment.
+        assert len(defer.queued) == 1
+        fn, args, kwargs = defer.queued[0]
+        fn(*args, **kwargs)
+        assert calls["n"] == 1
+        raw = run_store.read_run_json("p", "run-1")
+        assert raw["deployment_id"] == "dpl_x" and raw["deploy_state"] is None
+
+    _run(body)
+
+
+def test_deploy_finalizer_preserves_concurrent_commit_fields():
+    """T2.1: a commit/push landing on the run DURING the deploy poll must not be
+    clobbered by the finalizer's write (it folds only deploy-owned fields)."""
+    def body(env):
+        env.make_project("p")
+        env.make_run("p")
+        credentials.set_credential("vercel", "p", fields={"token": "t"})
+        credentials.update_metadata("vercel", "p", {"project_id": "prj_1", "org_id": "team_1"})
+
+        # get_deployment mutates the on-disk record mid-poll to simulate a user
+        # pushing a new commit while the finalizer is polling Vercel.
+        def _get(*a, **k):
+            def _push(r):
+                r.head_commit = "newcommit999"
+                r.pushed = True
+                return r
+            run_store.mutate_run_json("p", "run-1", _push)
+            return vc.DeploymentResult(ok=True, deployment_id="dpl_x",
+                                       url="https://app.vercel.app", ready_state="READY")
+
+        env.patch_vc(
+            status=_linked_status,
+            create_deployment=lambda *a, **k: vc.DeploymentResult(
+                ok=True, deployment_id="dpl_x", url=None, ready_state="BUILDING"),
+            get_deployment=_get,
+        )
+        cf = env.client.post("/api/projects/p/execution/runs/run-1/vercel/deploy", json={"confirm": True})
+        assert cf.status_code == 200
+        raw = run_store.read_run_json("p", "run-1")
+        # deploy stamped AND the concurrent push survived.
+        assert raw["deployment_id"] == "dpl_x"
+        assert raw["head_commit"] == "newcommit999" and raw["pushed"] is True
+
+    _run(body)
+
+
 def test_deploy_requires_token():
     def body(env):
         env.make_project("p")

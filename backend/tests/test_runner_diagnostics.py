@@ -94,6 +94,7 @@ class _TempLayout:
         status: str,
         with_result_md: bool = False,
         corrupt: bool = False,
+        extra: dict | None = None,
     ) -> Path:
         ws_dir = self.execution_dir / project_id
         (ws_dir / "runs").mkdir(parents=True, exist_ok=True)
@@ -114,6 +115,8 @@ class _TempLayout:
                 "commands_run": [],
                 "blockers": [],
             }
+            if extra:
+                payload.update(extra)
             run_json.write_text(json.dumps(payload), encoding="utf-8")
         (run_dir / "events.jsonl").touch()
         if with_result_md:
@@ -365,6 +368,135 @@ def test_sweep_handles_missing_execution_root():
         # is empty; the sweep should just return an empty list.
         swept = run_store.sweep_stuck_runs()
         assert swept == []
+
+    _run(body)
+
+
+# ---------- transient sub-state clearing (T1.3) ----------
+
+_ALL_TRANSIENT = {
+    "verification_state": "verifying",
+    "browser_verification_state": "running",
+    "integration_state": "integrating",
+    "git_state": "committing",
+    "deploy_state": "deploying",
+    "external_state": "migrating",
+}
+
+
+def test_sweep_clears_all_transient_states_on_stuck_running():
+    """A crash mid-phase can leave ANY of the six transient states set on a
+    still-`running` run. The startup sweep must clear them all, not just
+    integration_state, or the UI poll gates spin forever after restart."""
+    def body(layout: _TempLayout):
+        layout.init_workspace("p1")
+        layout.write_run("p1", "r1", status="running", extra=dict(_ALL_TRANSIENT))
+
+        swept = run_store.sweep_stuck_runs()
+        assert swept == ["p1/r1"]
+
+        raw = run_store.read_run_json("p1", "r1") or {}
+        assert raw["status"] == "failed"
+        for field in _ALL_TRANSIENT:
+            assert raw.get(field) is None, f"{field} not cleared by sweep"
+
+    _run(body)
+
+
+def test_terminal_sweep_clears_leaked_verification_state():
+    """verification_state / browser_verification_state are set AFTER the run's
+    status goes terminal (the verify tail), so a crash there leaves a completed
+    run with a lingering local transient state that sweep_stuck_runs skips.
+    sweep_terminal_transient_states must clear the LOCAL gates — but never
+    deploy_state/external_state (the external reconciler owns those)."""
+    def body(layout: _TempLayout):
+        layout.init_workspace("p1")
+        layout.write_run(
+            "p1", "done-1", status="completed",
+            extra={
+                "verification_state": "verifying",
+                "browser_verification_state": "running",
+                "integration_state": "integrating",
+                "git_state": "pushing",
+                # A real half-applied external action must be left for the
+                # provider-querying reconciler, NOT cleared here.
+                "deploy_state": "deploying",
+                "external_state": "migrating",
+            },
+        )
+        # A run with no leaked local state must be left alone (not "fixed").
+        layout.write_run("p1", "clean-1", status="completed")
+
+        fixed = run_store.sweep_terminal_transient_states()
+        assert "p1/done-1" in fixed
+        assert "p1/clean-1" not in fixed
+
+        raw = run_store.read_run_json("p1", "done-1") or {}
+        assert raw["status"] == "completed"  # status untouched
+        assert raw.get("verification_state") is None
+        assert raw.get("browser_verification_state") is None
+        assert raw.get("integration_state") is None
+        assert raw.get("git_state") is None
+        # deploy/external deliberately preserved for reconcile_stuck_external_actions.
+        assert raw.get("deploy_state") == "deploying"
+        assert raw.get("external_state") == "migrating"
+
+    _run(body)
+
+
+def test_terminal_sweep_leaves_running_runs_untouched():
+    def body(layout: _TempLayout):
+        layout.init_workspace("p1")
+        layout.write_run("p1", "run-1", status="running",
+                         extra={"verification_state": "verifying"})
+        fixed = run_store.sweep_terminal_transient_states()
+        assert fixed == []  # running runs are sweep_stuck_runs' job
+        assert (run_store.read_run_json("p1", "run-1") or {}).get("status") == "running"
+
+    _run(body)
+
+
+def test_terminal_sweep_preserves_settled_browser_verification_state():
+    """browser_verification_state holds a SETTLED result ('passed'/'failed') on a
+    terminal run — the sweep must NOT wipe it (only its transient 'running')."""
+    def body(layout: _TempLayout):
+        layout.init_workspace("p1")
+        # A completed run whose browser verification settled 'passed', with a
+        # genuinely leaked verification_state alongside.
+        layout.write_run(
+            "p1", "done-1", status="completed",
+            extra={"browser_verification_state": "passed",
+                   "verification_state": "verifying"},
+        )
+        # A completed run whose browser verification is a leaked 'running'.
+        layout.write_run(
+            "p1", "leaked-1", status="completed",
+            extra={"browser_verification_state": "running"},
+        )
+        fixed = run_store.sweep_terminal_transient_states()
+        assert "p1/done-1" in fixed and "p1/leaked-1" in fixed
+
+        done = run_store.read_run_json("p1", "done-1") or {}
+        # Settled 'passed' preserved; the leaked verifying cleared.
+        assert done.get("browser_verification_state") == "passed"
+        assert done.get("verification_state") is None
+
+        leaked = run_store.read_run_json("p1", "leaked-1") or {}
+        assert leaked.get("browser_verification_state") is None  # transient cleared
+
+    _run(body)
+
+
+def test_terminal_sweep_ignores_run_with_only_settled_browser_state():
+    """A terminal run whose ONLY set field is a settled 'passed' must be left
+    entirely untouched (not even rewritten)."""
+    def body(layout: _TempLayout):
+        layout.init_workspace("p1")
+        layout.write_run("p1", "ok-1", status="completed",
+                         extra={"browser_verification_state": "failed"})
+        fixed = run_store.sweep_terminal_transient_states()
+        assert "p1/ok-1" not in fixed
+        assert (run_store.read_run_json("p1", "ok-1") or {}).get("browser_verification_state") == "failed"
 
     _run(body)
 

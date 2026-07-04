@@ -138,15 +138,24 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
   const deployInFlight = record?.deploy_state != null || record?.external_state != null
   // Phase 9 — a team run's integration window sets a transient sub-status.
   const integrationInFlight = record?.integration_state != null
+  // Watchdog: the record-derived transient *_state signals keep polling until
+  // the backend clears them (which it does on every settle). If one ever
+  // lingered on a terminal run the card would spin "in progress" forever, so
+  // cap those polls at a generous window (settleTicks climbs each non-running
+  // tick; ~200 ticks ≈ 6.6 min, well past any legit contract action which
+  // settles <=300s server-side). A user-initiated `verifying` request and the
+  // bounded `needsSettle` window are unaffected.
+  const watchdogOpen = isRunning || settleTicks < 200
   const shouldPoll =
     isRunning ||
-    commandVerifyingState ||
-    isVerifyingState ||
     verifying ||
     needsSettle ||
-    gitInFlight ||
-    deployInFlight ||
-    integrationInFlight
+    ((commandVerifyingState ||
+      isVerifyingState ||
+      gitInFlight ||
+      deployInFlight ||
+      integrationInFlight) &&
+      watchdogOpen)
   useEffect(() => {
     if (!shouldPoll) return
     const id = window.setInterval(() => {

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -164,6 +165,25 @@ def _atomic_write(path: Path, text: str) -> None:
 # The single write path
 # ---------------------------------------------------------------------------
 
+def _block_already_present(body: str, current: str) -> bool:
+    """True when ``body`` is an EXACT repeat of existing content (block or line).
+
+    Dedups a re-append of the same entry (double reconciliation) without the
+    false positives of a raw substring test: a distinct new short entry that
+    merely happens to be a substring of existing text is NOT considered present.
+    """
+    b = body.strip()
+    if not b:
+        return False
+    # Exact whole-line match — the common single-line append (task-queue item,
+    # status note).
+    if b in {ln.strip() for ln in current.split("\n") if ln.strip()}:
+        return True
+    # Exact multi-line block match (blocks separated by blank lines).
+    blocks = [blk.strip() for blk in re.split(r"\n\s*\n", current) if blk.strip()]
+    return b in blocks
+
+
 def apply_update(
     base_dir: Path,
     *,
@@ -206,9 +226,14 @@ def apply_update(
 
     if action == "append":
         body = content.strip()
-        # Cheap dedup: don't re-append content already present (guards against a
-        # turn / run being reconciled twice producing duplicate entries).
-        if body and body in current:
+        # Dedup by BLOCK equality, not raw substring containment. A substring
+        # test drops a legitimately-new short entry whenever its text happens to
+        # appear anywhere in the file (e.g. appending "- [x] Add /healthcheck"
+        # when "Add /healthcheck endpoint" already exists) — a silently lost
+        # write reported to callers as "rejected". Compare the stripped new block
+        # against the stripped existing blocks (split on blank lines) and against
+        # the individual existing lines, so an exact repeat is still deduped.
+        if body and _block_already_present(body, current):
             return False
         if current and not current.endswith("\n"):
             current += "\n"
@@ -225,8 +250,14 @@ def apply_update(
         new_lines: list[str] = []
         in_section = False
         replaced = False
+        target_heading = f"## {section}"
         for line in lines:
-            if line.startswith(f"## {section}"):
+            # Match the heading EXACTLY (ignoring trailing whitespace), not by
+            # prefix. A prefix test (``startswith("## Decisions")``) would latch
+            # onto a sibling like ``## Decisions Archive`` when the intended
+            # ``## Decisions`` is absent, keeping the wrong heading and dropping
+            # its body — silently overwriting the wrong section.
+            if not replaced and line.rstrip() == target_heading:
                 new_lines.append(line)
                 new_lines.append(content)
                 in_section = True

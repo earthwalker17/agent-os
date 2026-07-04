@@ -472,6 +472,91 @@ def test_cancel_endpoint_does_not_clobber_finished_run():
     _run(body)
 
 
+def test_path_traversal_ids_are_rejected():
+    """T1.7: a '..' / '.' project_id or run_id segment (reachable via a decoded
+    %2e%2e) must be rejected, never joined into a filesystem path."""
+
+    def body(env: _Env):
+        env.setup("p")
+        env.seed_run("p", "r1", RunStatus.RUNNING)
+        # A traversal project_id is rejected with 400 (invalid id), not a 404
+        # after a filesystem join above PROJECTS_DIR.
+        assert env.client.get("/api/projects/../execution/runs/r1").status_code in (400, 404)
+        assert env.client.post("/api/projects/%2e%2e/execution/runs/r1/cancel").status_code in (400, 404)
+        # A traversal run_id is likewise refused (400 invalid id or 404 not found),
+        # never a path escape.
+        got = env.client.get("/api/projects/p/execution/runs/..")
+        assert got.status_code in (400, 404)
+        # A run_id containing '..' as a SUBSTRING (reaches the handler — the
+        # client doesn't normalize it) must return a clean 4xx, NOT a 500 from an
+        # uncaught guard ValueError. Covers the direct-read endpoints.
+        for path in ("execution/runs/a..b", "execution/runs/a..b/result",
+                     "execution/runs/a..b/cancel"):
+            method = env.client.post if path.endswith("cancel") else env.client.get
+            r = method(f"/api/projects/p/{path}")
+            assert r.status_code in (400, 404), (path, r.status_code)
+            assert r.status_code != 500
+        # A well-formed id still works.
+        ok = env.client.get("/api/projects/p/execution/runs/r1")
+        assert ok.status_code == 200
+
+    _run(body)
+
+
+def test_cancel_does_not_revert_run_that_finalized_during_toctou():
+    """T1.4: the on-disk run is genuinely COMPLETED (with a real result), but
+    the endpoint's status-gate read raced and saw it as RUNNING. The endpoint
+    must NOT write a stale RUNNING record back (which the old code did, then the
+    orphan path cancelled the completed run, destroying its result)."""
+
+    def body(env: _Env):
+        env.setup("p")
+        # Truth on disk: a finished run with a real summary + commit.
+        env.seed_run(
+            "p", "r1", RunStatus.COMPLETED,
+            summary="Built the feature", commit_sha="deadbeefcafe",
+        )
+
+        fake = _FakeManager(cancel_in_flight=False)
+        real_read = run_store.read_run_json
+        calls = {"n": 0}
+
+        def racing_read(pid, rid):
+            calls["n"] += 1
+            raw = real_read(pid, rid)
+            # ONLY the first read (the endpoint's status gate) sees the stale
+            # RUNNING snapshot; every subsequent read (incl. inside
+            # mutate_run_json) sees the committed truth: completed.
+            if raw is not None and calls["n"] == 1:
+                raw = dict(raw)
+                raw["status"] = "running"
+            return raw
+
+        prev_mgr = main.get_default_manager
+        main.get_default_manager = lambda: fake
+        run_store.read_run_json = racing_read
+        try:
+            res = env.client.post("/api/projects/p/execution/runs/r1/cancel")
+            assert res.status_code == 200
+            assert res.json()["status"] == "completed"
+        finally:
+            run_store.read_run_json = real_read
+            main.get_default_manager = prev_mgr
+
+        # The committed result survived: status stayed completed, no revert to
+        # running, cancel_requested not stuck, no cancelled finalize.
+        raw = run_store.read_run_json("p", "r1") or {}
+        assert raw["status"] == "completed"
+        assert not raw.get("cancel_requested")
+        assert raw.get("commit_sha") == "deadbeefcafe"
+        types = [e["type"] for e in run_store.read_events("p", "r1")]
+        assert "run_cancelled" not in types
+        result_md = run_store.read_result_md("p", "r1") or ""
+        assert "cancelled" not in result_md.lower()
+
+    _run(body)
+
+
 # ---------- retry endpoint ----------
 
 

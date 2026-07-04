@@ -98,7 +98,59 @@ def test_append_dedup_returns_false():
         assert ok is False
 
 
+def test_append_new_short_entry_that_is_a_substring_still_writes():
+    """T2.5: a distinct new entry must NOT be dropped just because its text is a
+    substring of existing content (the old raw-substring dedup lost writes)."""
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "TASK_QUEUE.md").write_text(
+            "# Task Queue\n\n## Queue\n- Add /healthcheck endpoint with a Pydantic model\n",
+            encoding="utf-8",
+        )
+        # "- [x] Add /healthcheck" is a substring of the existing line but is a
+        # genuinely new, distinct entry — it must be appended, not rejected.
+        ok = apply_update(
+            base, allow=WRITABLE_PROJECT, filename="TASK_QUEUE.md",
+            section="Queue", content="- [x] Add /healthcheck", action="append",
+        )
+        assert ok is True
+        text = (base / "TASK_QUEUE.md").read_text(encoding="utf-8")
+        assert "- [x] Add /healthcheck" in text
+        # An EXACT repeat of that same line is still deduped.
+        ok2 = apply_update(
+            base, allow=WRITABLE_PROJECT, filename="TASK_QUEUE.md",
+            section="Queue", content="- [x] Add /healthcheck", action="append",
+        )
+        assert ok2 is False
+
+
 # ---------- apply_update: replace ----------
+
+
+def test_replace_does_not_clobber_prefix_overlapping_sibling_section():
+    """T2.5: targeting 'Decisions' must not overwrite a '## Decisions Archive'
+    sibling when the exact '## Decisions' heading is absent — it should create
+    the exact heading instead of latching onto the prefix match."""
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "DECISIONS.md").write_text(
+            "# Decisions\n\n## Decisions Archive\n- historical choice that must survive\n",
+            encoding="utf-8",
+        )
+        ok = apply_update(
+            base, allow=WRITABLE_PROJECT, filename="DECISIONS.md",
+            section="Decisions", content="- new decision", action="replace",
+        )
+        assert ok is True
+        text = (base / "DECISIONS.md").read_text(encoding="utf-8")
+        # The archive heading + its body survived intact.
+        assert "## Decisions Archive" in text
+        assert "- historical choice that must survive" in text
+        # A distinct exact '## Decisions' heading was created with the new body.
+        assert "## Decisions\n- new decision" in text
+
+
+
 
 def test_replace_existing_section_overwrites_body():
     with tempfile.TemporaryDirectory() as d:

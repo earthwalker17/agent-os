@@ -24,6 +24,8 @@ from database import (
     delete_conversations_for_project, rename_project_conversations,
     create_pending_execution, get_pending_execution,
     update_pending_execution_plan, mark_pending_execution_dispatched,
+    claim_pending_execution, revert_pending_execution_to_pending,
+    reconcile_stuck_pending_executions,
 )
 from orchestrator import (
     orchestrate, load_memory, judge_memory_updates, apply_memory_updates, apply_memory_update,
@@ -117,6 +119,31 @@ def startup():
             print(f"[startup] marked {len(swept)} stuck run(s) as failed: {swept}")
     except Exception as exc:  # noqa: BLE001
         print(f"[startup] sweep_stuck_runs failed: {type(exc).__name__}: {exc}")
+
+    # Companion to the above: a crash during the post-status verify/browser tail
+    # leaves a run with a TERMINAL status but a lingering local transient state
+    # (e.g. verification_state='verifying'), which sweep_stuck_runs skips (it only
+    # touches `running` runs). Without this, the UI poll gates spin forever on a
+    # finished run. Clears only the local gates — never deploy/external (the
+    # reconciler below owns those). Best-effort.
+    try:
+        cleared = run_store.sweep_terminal_transient_states()
+        if cleared:
+            print(f"[startup] cleared leaked transient state on {len(cleared)} run(s): {cleared}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] sweep_terminal_transient_states failed: {type(exc).__name__}: {exc}")
+
+    # A pending plan stranded mid-confirm (process died between the atomic claim
+    # and the dispatched-mark) is stuck in the intermediate 'dispatching' state,
+    # where its "OK, run this" button dead-ends. Revert those to 'pending' so the
+    # plan is confirmable again (any run that WAS dispatched is swept to failed
+    # above, so re-confirming is a clean retry). Best-effort.
+    try:
+        reverted = reconcile_stuck_pending_executions()
+        if reverted:
+            print(f"[startup] reverted {reverted} stranded pending plan(s) to 'pending'")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] reconcile_stuck_pending_executions failed: {type(exc).__name__}: {exc}")
 
     # Phase 8 — reconcile runs left mid external action (deploy/migration) by a
     # prior process: query the provider for the true state, then clear the transient
@@ -988,6 +1015,14 @@ async def api_chat_upload(
     return {"attachments": attachments, "added_to_workspace": effective_add}
 
 
+# Raster image types that are safe to serve inline (they can't execute script as
+# a top-level document). Everything else — notably image/svg+xml — is forced to
+# download so an uploaded active document can't run in the backend origin.
+_INLINE_SAFE_IMAGE_MIMES = {
+    "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp",
+}
+
+
 @app.get("/api/conversations/{conversation_id}/attachments/{stored_filename}")
 def api_get_chat_attachment(conversation_id: str, stored_filename: str):
     """Serve a previously uploaded chat-only attachment for inline preview.
@@ -1002,7 +1037,24 @@ def api_get_chat_attachment(conversation_id: str, stored_filename: str):
     if path is None:
         raise HTTPException(status_code=404, detail="attachment not found")
     mime, _ = mimetypes.guess_type(str(path))
-    return FileResponse(str(path), media_type=mime or "application/octet-stream")
+    mime = mime or "application/octet-stream"
+    # Security: only raster images are safe to render inline in the backend
+    # origin. An SVG (or any active type) can carry a <script> that executes as a
+    # top-level document — stored XSS at localhost:8000, same origin as every
+    # unauthenticated run/credential endpoint. Force such types to DOWNLOAD
+    # (Content-Disposition: attachment) and always send nosniff so the browser
+    # can't MIME-sniff a non-image into HTML. Inline <img> previews are
+    # unaffected (scripts in an SVG loaded as an image never run).
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if mime in _INLINE_SAFE_IMAGE_MIMES:
+        return FileResponse(str(path), media_type=mime, headers=headers)
+    return FileResponse(
+        str(path),
+        media_type=mime,
+        filename=path.name,
+        content_disposition_type="attachment",
+        headers=headers,
+    )
 
 
 # --- Memory update endpoints ---
@@ -1068,7 +1120,30 @@ def _project_display_name(project_id: str) -> str | None:
     return None
 
 
+# Path-segment guard for ids that arrive as URL path parameters (project_id,
+# run_id, pending_id, …). Only ``api_create_project`` validates the id charset
+# at creation; every other route takes the id as a raw segment and joins it into
+# a filesystem path. A single ``..`` / ``.`` segment (reachable via a decoded
+# ``%2e%2e``) would otherwise resolve above the intended root — worst case
+# ``api_delete_project`` rmtree'ing the parent tree. Ids we mint are lowercase
+# slugs / ``YYYYMMDD-HHMMSS-<hex>`` run ids / hex pending ids, plus the reserved
+# ``__GENERAL__``; all match this charset. Reject anything else at the boundary.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_id(value: str, *, kind: str = "id") -> str:
+    """Return ``value`` if it is a safe single path segment, else HTTP 400.
+
+    Rejects empties, ``.``/``..``, path separators, and any character outside
+    ``[A-Za-z0-9._-]`` so the id can never traverse out of its intended root.
+    """
+    if not isinstance(value, str) or value in ("", ".", "..") or not _SAFE_ID_RE.match(value):
+        raise HTTPException(status_code=400, detail=f"invalid {kind}")
+    return value
+
+
 def _require_project(project_id: str) -> Path:
+    _safe_id(project_id, kind="project id")
     project_path = PROJECTS_DIR / project_id
     if not project_path.exists() or not project_path.is_dir():
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1315,41 +1390,58 @@ def api_cancel_run(project_id: str, run_id: str):
             detail=f"only a running run can be cancelled (status={record.status.value})",
         )
 
-    record.cancel_requested = True
-    run_store.write_run_json(project_id, run_id, record)
-    run_store.append_event(project_id, run_id, {"type": "run_cancel_requested"})
+    # Stamp cancel_requested ONLY while the run is still `running`, under the
+    # per-run lock, re-reading first. Without this guard the endpoint would
+    # blindly write a stale RUNNING record — reverting a run that finalized
+    # between our first read and this write, and destroying its real result.
+    stamped = {"ok": False}
+
+    def _mark(rec: RunRecord):
+        if rec.status != RunStatus.RUNNING:
+            return rec  # already settled between our read and now — don't revert
+        rec.cancel_requested = True
+        stamped["ok"] = True
+        return rec
+
+    run_store.mutate_run_json(project_id, run_id, _mark)
+    if stamped["ok"]:
+        run_store.append_event(project_id, run_id, {"type": "run_cancel_requested"})
 
     in_flight = get_default_manager().request_cancel(run_id)
     if not in_flight:
-        # No runner in this process owns the run. Re-read to make sure it didn't
-        # just finalize, then finalize the orphan directly so it doesn't hang.
-        fresh = run_store.read_run_json(project_id, run_id)
-        if fresh is not None and fresh.get("status") == RunStatus.RUNNING.value:
-            try:
-                orphan = RunRecord(**fresh)
-            except Exception:
-                orphan = record
-            orphan.status = RunStatus.CANCELLED
-            orphan.completed_at = datetime.utcnow()
-            orphan.cancel_requested = False
-            orphan.integration_state = None
-            orphan.summary = "Run cancelled by user."
+        # No runner in this process owns the run (e.g. after a restart the cancel
+        # registry is empty). Finalize the orphan to `cancelled` — but only if it
+        # is genuinely STILL running when we take the lock, so a run that just
+        # finalized (or that a live worker is finalizing) is never clobbered.
+        settled = {"orphan": None}
+
+        def _finalize_orphan(rec: RunRecord):
+            if rec.status != RunStatus.RUNNING:
+                return rec  # already terminal — respect it
+            rec.status = RunStatus.CANCELLED
+            rec.completed_at = datetime.utcnow()
+            rec.cancel_requested = False
+            run_store._clear_transient_states(rec)
+            rec.summary = "Run cancelled by user."
             blocker = "run cancelled by user (no active worker)"
-            if blocker not in orphan.blockers:
-                orphan.blockers = list(orphan.blockers) + [blocker]
-            # Settle any in-flight plan task to SKIPPED and rewrite plan.json,
-            # mirroring runner._finalize_cancelled. This branch runs in the
-            # endpoint after a restart (no worker owns the run), so without it a
-            # multi-task run would end `cancelled` while plan.json still shows a
-            # task perpetually `running`.
-            if orphan.plan is not None:
-                for unit in orphan.plan.tasks:
+            if blocker not in rec.blockers:
+                rec.blockers = list(rec.blockers) + [blocker]
+            if rec.plan is not None:
+                for unit in rec.plan.tasks:
                     if unit.status == TaskStatus.RUNNING:
                         unit.status = TaskStatus.SKIPPED
                         if "run cancelled" not in unit.blockers:
                             unit.blockers.append("run cancelled")
+            settled["orphan"] = rec
+            return rec
+
+        final = run_store.mutate_run_json(project_id, run_id, _finalize_orphan)
+        orphan = settled["orphan"]
+        if orphan is not None:
+            # We won the settle — write the dependent artifacts (plan.json /
+            # result.md / event) from the record we committed.
+            if orphan.plan is not None:
                 run_store.write_plan_json(project_id, run_id, orphan.plan)
-            run_store.write_run_json(project_id, run_id, orphan)
             run_store.write_result_md(
                 project_id,
                 run_id,
@@ -1363,6 +1455,7 @@ def api_cancel_run(project_id: str, run_id: str):
                 project_id, run_id, {"type": "run_cancelled", "reason": "orphan"}
             )
             return orphan.model_dump()
+        # Someone else settled it first — fall through and return the latest.
 
     # Worker is in flight (or the run already settled) — return the latest record.
     latest = run_store.read_run_json(project_id, run_id)
@@ -1541,8 +1634,12 @@ def api_run_browser_verification(
     # Task 06.2D — mark the run as actively browser-verifying BEFORE the
     # blocking work so a concurrent Runs-panel poll (served on a separate
     # thread) sees the run is active again rather than looking finished/stale.
-    record.browser_verification_state = "running"
-    run_store.write_run_json(project_id, run_id, record)
+    # Under the per-run lock so it can't clobber a concurrent commit/deploy write.
+    def _mark_running(r: RunRecord):
+        r.browser_verification_state = "running"
+        return r
+
+    run_store.mutate_run_json(project_id, run_id, _mark_running)
     run_store.append_event(
         project_id, run_id, {"type": "browser_verification_started"}
     )
@@ -1559,18 +1656,16 @@ def api_run_browser_verification(
         run_dir=run_store.get_run_dir(project_id, run_id),
         keep_alive_registrar=_keep_alive,
     )
-    apply_ui_browser_verification_to_record(record, result)
-    # Settle the transient sub-status to the terminal verification status so
-    # the frontend stops showing the in-progress state.
-    record.browser_verification_state = result.status
 
     # AI visual judgment over the captured screenshots — synchronously, in this
     # same request. Diagnostic-only (never changes run status) and best-effort:
     # skips gracefully (with a reason) when no vision-capable provider key is
-    # configured. Runs only on a passing capture with screenshots.
+    # configured. Runs only on a passing capture with screenshots. Computed from
+    # the read-only task context before the locked merge.
+    visual_review = None
     if result.status == "passed" and result.pages:
         title, body = run_store.read_task_card(project_id, run_id)
-        record.visual_review = run_visual_review(
+        visual_review = run_visual_review(
             project_id,
             run_id,
             task_card=body or title or record.task_title,
@@ -1581,7 +1676,19 @@ def api_run_browser_verification(
             model=(req.model if req else None),
         )
 
-    run_store.write_run_json(project_id, run_id, record)
+    # Fold the browser-verification outcome onto a FRESH read of the record under
+    # the lock, so a commit/push/deploy that landed during the (multi-second)
+    # capture is preserved rather than clobbered by a stale write.
+    def _apply_bv(r: RunRecord):
+        apply_ui_browser_verification_to_record(r, result)
+        r.browser_verification_state = result.status
+        if visual_review is not None:
+            r.visual_review = visual_review
+        return r
+
+    updated = run_store.mutate_run_json(project_id, run_id, _apply_bv)
+    if updated is not None:
+        record = updated
     run_store.rerender_result_md(project_id, run_id, record)
     run_store.append_event(
         project_id,
@@ -1681,6 +1788,7 @@ def _require_project_or_general(project_id: str) -> None:
 
 
 def _load_run_record(project_id: str, run_id: str) -> RunRecord:
+    _safe_id(run_id, kind="run id")
     raw = run_store.read_run_json(project_id, run_id)
     if raw is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -2306,29 +2414,37 @@ def _finalize_vercel_deploy(
             error = g.error or error
         log_lines.append(f"poll +{elapsed}s: state={state} url={url or '-'}")
 
-    record = _read_record_safe(project_id, run_id)
-    if record is None:
-        return
-    record.deploy_state = None
-    record.external_state = None
+    # Compute the deploy-owned outcome, then fold ONLY those fields onto a fresh
+    # record under the per-run lock — so a git commit/push the user made on this
+    # run during the (up to 300s) poll is preserved, not clobbered by a stale
+    # write. Clearing deploy_state/external_state in every branch keeps the run
+    # from sticking 'deploying'.
     blocker_msg: str | None = None
     if dep_id and state == "READY":
-        record.deployment_id = dep_id
-        record.deployment_url = url
-        record.deployment_target = target
+        pass
     elif error or state in ("ERROR", "CANCELED", "DELETED"):
         blocker_msg = credentials.redact(f"Vercel {kind} failed: {error or state}", project_id)
     elif dep_id:
         # Created but not confirmed READY before the cap — record it, flag verify.
-        record.deployment_id = dep_id
-        record.deployment_url = url
-        record.deployment_target = target
         blocker_msg = f"Vercel {kind} did not reach READY before timeout — verify in the Vercel dashboard"
     else:
         blocker_msg = credentials.redact(f"Vercel {kind} failed: {error or 'no deployment id returned'}", project_id)
-    if blocker_msg and blocker_msg not in record.blockers:
-        record.blockers = list(record.blockers) + [blocker_msg]
-    run_store.write_run_json(project_id, run_id, record)
+    stamp_dep = bool(dep_id and (state == "READY" or (not error and state not in ("ERROR", "CANCELED", "DELETED"))))
+
+    def _settle(r: RunRecord):
+        r.deploy_state = None
+        r.external_state = None
+        if stamp_dep:
+            r.deployment_id = dep_id
+            r.deployment_url = url
+            r.deployment_target = target
+        if blocker_msg and blocker_msg not in r.blockers:
+            r.blockers = list(r.blockers) + [blocker_msg]
+        return r
+
+    record = run_store.mutate_run_json(project_id, run_id, _settle)
+    if record is None:
+        return
     run_store.write_deploy_log(project_id, run_id, credentials.redact("\n".join(log_lines), project_id))
     run_store.write_deployment_json(
         project_id, run_id,
@@ -2433,6 +2549,40 @@ class VercelDeployRequest(BaseModel):
     confirm: bool = False
 
 
+def _claim_deploy(
+    project_id: str,
+    run_id: str,
+    state: str,
+    *,
+    allow_existing_deployment: bool = False,
+) -> dict:
+    """Atomically set ``deploy_state``/``external_state`` under the per-run lock.
+
+    Returns ``{"record": RunRecord}`` on a successful claim or
+    ``{"error": <message>}`` if a deploy is already in flight (or the run already
+    has a deployment and that isn't allowed). Serializing the read-check-set
+    stops two concurrent confirms from both launching a real Vercel deployment.
+    """
+    outcome: dict = {}
+
+    def _apply(r: RunRecord):
+        if r.deploy_state:
+            outcome["error"] = "a deploy is already in flight for this run"
+            return r
+        if r.deployment_id and not allow_existing_deployment:
+            outcome["error"] = "this run already has a deployment; use redeploy or rollback"
+            return r
+        r.deploy_state = state
+        r.external_state = state
+        outcome["record"] = r
+        return r
+
+    updated = run_store.mutate_run_json(project_id, run_id, _apply)
+    if updated is None and "error" not in outcome:
+        outcome["error"] = "run record is unavailable"
+    return outcome
+
+
 @app.post("/api/projects/{project_id}/execution/runs/{run_id}/vercel/deploy")
 def api_vercel_deploy(project_id: str, run_id: str, req: VercelDeployRequest):
     _require_workspace(project_id)
@@ -2461,13 +2611,13 @@ def api_vercel_deploy(project_id: str, run_id: str, req: VercelDeployRequest):
         raise HTTPException(status_code=400, detail="no Vercel project linked (set project_id in the Vercel connector)")
     if not (record.commit_sha or record.head_commit or record.pushed):
         raise HTTPException(status_code=409, detail="push the commit to GitHub before deploying (gitSource deploy)")
-    if record.deploy_state:
-        raise HTTPException(status_code=409, detail="a deploy is already in flight for this run")
-    if record.deployment_id:
-        raise HTTPException(status_code=409, detail="this run already has a deployment; use redeploy or rollback")
-    record.deploy_state = "deploying"
-    record.external_state = "deploying"
-    run_store.write_run_json(project_id, run_id, record)
+    # Atomically claim the deploy under the per-run lock so two concurrent
+    # confirms (double-click / retry) can't both pass the guard and launch two
+    # real (billable) Vercel deployments. Only the winner submits the finalizer.
+    claim = _claim_deploy(project_id, run_id, "deploying")
+    if claim.get("error"):
+        raise HTTPException(status_code=409, detail=claim["error"])
+    record = claim["record"]
     run_store.append_event(project_id, run_id, {"type": "deploy_started", "target": target})
     get_default_manager().submit(
         _finalize_vercel_deploy, project_id, run_id, target, git_ref=git_ref, kind="deploy"
@@ -2505,11 +2655,12 @@ def api_vercel_redeploy(project_id: str, run_id: str, req: VercelRedeployRequest
         return {"contract": contract, "applied": False, "run": record.model_dump()}
     if not vstatus.configured or not vstatus.project_id:
         raise HTTPException(status_code=400, detail="Vercel not configured/linked")
-    if record.deploy_state:
-        raise HTTPException(status_code=409, detail="a deploy is already in flight for this run")
-    record.deploy_state = "redeploying"
-    record.external_state = "redeploying"
-    run_store.write_run_json(project_id, run_id, record)
+    # Atomically claim (same race guard as deploy). Redeploy tolerates an
+    # existing deployment_id (that's its input), so only deploy_state is checked.
+    claim = _claim_deploy(project_id, run_id, "redeploying", allow_existing_deployment=True)
+    if claim.get("error"):
+        raise HTTPException(status_code=409, detail=claim["error"])
+    record = claim["record"]
     run_store.append_event(project_id, run_id, {"type": "redeploy_started", "source": req.deployment_id})
     get_default_manager().submit(
         _finalize_vercel_deploy, project_id, run_id, target,
@@ -2971,6 +3122,16 @@ def api_confirm_pending_execution(
             detail=f"Pending execution is {row['status']!r}; cannot dispatch.",
         )
 
+    # Atomically claim the plan (pending -> dispatching) BEFORE dispatching, so
+    # two concurrent confirms (double-click / two tabs) can't both start a run
+    # against the same live repo/ tree. Only the claim winner proceeds; the loser
+    # gets a 409 and no run is dispatched for it.
+    if not claim_pending_execution(pending_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Pending execution is already being dispatched.",
+        )
+
     plan = serialize_pending(row)
     spec = TaskSpec(
         title=plan.title,
@@ -2979,15 +3140,20 @@ def api_confirm_pending_execution(
     )
     # Clamp the user-approved recovery budget at the trust boundary (0..2).
     recovery_budget = max(0, min(2, (req.recovery_budget if req else 0) or 0))
-    record = get_default_manager().dispatch(
-        project_id, spec, recovery_budget=recovery_budget
-    )
+    try:
+        record = get_default_manager().dispatch(
+            project_id, spec, recovery_budget=recovery_budget
+        )
+    except Exception:
+        # Dispatch failed after we claimed — release the claim so the button
+        # doesn't dead-end, then surface the failure.
+        revert_pending_execution_to_pending(pending_id)
+        raise
 
     marked = mark_pending_execution_dispatched(pending_id, record.run_id)
     if not marked:
-        # Lost a race with a concurrent confirm; the run is already in flight
-        # but our pending row didn't update. Surface clearly rather than
-        # silently leaving the row in an inconsistent state.
+        # Should not happen (we hold the 'dispatching' claim), but keep the
+        # row honest if it changed underneath us.
         raise HTTPException(
             status_code=409,
             detail=(

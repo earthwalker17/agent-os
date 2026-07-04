@@ -393,6 +393,79 @@ def test_gemini_parsing_and_role_mapping():
         assert seen["payload"]["system_instruction"]["parts"][0]["text"] == "sys"
 
 
+def test_gemini_key_rides_header_not_url():
+    """T1.8: the Gemini API key must be in the x-goog-api-key HEADER, never the
+    URL query string (URLs get echoed into error messages / logs)."""
+    with _Keys(GOOGLE_API_KEY="g-secret-123"):
+        seen = {}
+
+        def fake_post(url, headers, payload):
+            seen["url"] = url
+            seen["headers"] = headers
+            return {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+
+        prev = providers._http_post_json
+        providers._http_post_json = fake_post
+        try:
+            providers.complete("gemini", "sys", [{"role": "user", "content": "hi"}])
+        finally:
+            providers._http_post_json = prev
+        assert "g-secret-123" not in seen["url"]
+        assert "key=" not in seen["url"]
+        assert seen["headers"].get("x-goog-api-key") == "g-secret-123"
+
+
+def test_safe_url_redacts_key_query_param():
+    """T1.8: _safe_url strips a key= / api_key= query secret before it can be
+    echoed into a ProviderError message."""
+    assert "SECRET" not in providers._safe_url("https://x/y?key=SECRET")
+    assert "SECRET" not in providers._safe_url("https://x/y?a=1&api_key=SECRET&b=2")
+    assert "[REDACTED]" in providers._safe_url("https://x/y?key=SECRET")
+    # a normal URL is unchanged
+    assert providers._safe_url("https://x/y?z=1") == "https://x/y?z=1"
+
+
+def test_http_post_json_error_does_not_leak_key(monkeypatch=None):
+    """A real HTTPError from a key-bearing URL must not put the key in the
+    ProviderError message (defense in depth behind the header move)."""
+    import urllib.request
+    import urllib.error
+    import io
+
+    def boom_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 401, "Unauthorized", {}, io.BytesIO(b"nope")
+        )
+
+    prev = urllib.request.urlopen
+    urllib.request.urlopen = boom_urlopen
+    try:
+        providers._http_post_json("https://api/x?key=TOPSECRET", {}, {"a": 1})
+        raise AssertionError("expected ProviderError")
+    except providers.ProviderError as e:
+        assert "TOPSECRET" not in str(e)
+        assert "[REDACTED]" in str(e)
+    finally:
+        urllib.request.urlopen = prev
+
+
+def test_llm_timeout_is_finite_and_env_overridable():
+    """T2.2: the per-request LLM timeout is a finite positive number and honors
+    AGENT_OS_LLM_TIMEOUT so a hung provider call can't wedge a wave forever."""
+    import os as _os
+    default = providers._llm_timeout()
+    assert 0 < default < 100000
+    prev = _os.environ.get("AGENT_OS_LLM_TIMEOUT")
+    _os.environ["AGENT_OS_LLM_TIMEOUT"] = "42"
+    try:
+        assert providers._llm_timeout() == 42.0
+    finally:
+        if prev is None:
+            _os.environ.pop("AGENT_OS_LLM_TIMEOUT", None)
+        else:
+            _os.environ["AGENT_OS_LLM_TIMEOUT"] = prev
+
+
 def test_http_error_surfaces_as_provider_error():
     with _Keys(OPENAI_API_KEY="sk-x"):
         def boom(url, headers, payload):

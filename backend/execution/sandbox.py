@@ -26,6 +26,29 @@ class SandboxViolation(Exception):
 _SENSITIVE_BASENAMES = {".env", ".env.local", ".env.production"}
 _SENSITIVE_SUFFIXES = (".key", ".pem")
 
+# Windows reserved device names. A path component equal to one of these (with or
+# without an extension, any case) does NOT create a file — it opens the DOS
+# device, so a "write" silently succeeds against nothing. Screening them keeps
+# integration/manifest "applied" claims honest and avoids blocking device I/O.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _normalize_component(part: str) -> str:
+    """Return a path component as Windows actually resolves it for name checks.
+
+    Windows strips trailing dots and spaces from each path component at the
+    Win32 layer, so ``".git."`` / ``".git "`` / ``".env."`` open the real
+    ``.git`` / ``.env``. Our sensitive-name / ``.git`` guards compare the raw
+    component, so without this normalization those variants slip through and the
+    resolved path still hits the real target. Strip trailing dots/spaces here so
+    the guards see what the OS will open.
+    """
+    return part.rstrip(" .")
+
 _BLOCKED_COMMAND_PATTERNS = (
     "rm -rf /",
     "rm -rf *",
@@ -208,7 +231,12 @@ class ProjectSandbox:
                 f"path traversal '..' is not allowed: {relative_path!r}"
             )
 
-        for part in candidate.parts:
+        for raw_part in candidate.parts:
+            # Compare against the name Windows will actually open: trailing dots
+            # and spaces are stripped by the OS, so ``.git.`` -> ``.git``,
+            # ``.env.`` -> ``.env``. Without this, those variants bypass every
+            # check below yet still resolve to the real sensitive target.
+            part = _normalize_component(raw_part)
             lowered_part = part.lower()
             if part in _SENSITIVE_BASENAMES:
                 raise SandboxViolation(
@@ -230,6 +258,15 @@ class ProjectSandbox:
             if lowered_part == ".git":
                 raise SandboxViolation(
                     f"sensitive path is not accessible: {relative_path!r}"
+                )
+            # Windows reserved device names (NUL/CON/PRN/AUX/COM1-9/LPT1-9) — the
+            # base name before any extension, any case. Writing ``NUL`` or
+            # ``sub/aux.txt`` opens a device (the write vanishes) rather than
+            # creating a file, which would let a run claim "applied" output that
+            # does not exist on disk.
+            if lowered_part.split(".", 1)[0] in _WINDOWS_RESERVED_NAMES:
+                raise SandboxViolation(
+                    f"reserved device name is not accessible: {relative_path!r}"
                 )
 
         base = root.resolve()
