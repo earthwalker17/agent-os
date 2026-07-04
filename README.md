@@ -270,14 +270,13 @@ agent-os/
 | 5 | Execution orchestration — plan → task graph → execute, live trace, run control | ✅ |
 | 6 / 6.1 | Main Agent v2 — memory engine, intent router, confirmable recovery + budget | ✅ |
 | 7 | Project Ops — Git/GitHub lifecycle (checkpoint, diff, commit, push, PR, rollback) | ✅ |
-| 8 | **Production Path** — multi-provider connectors + env/secret registry + Vercel deploy/redeploy/rollback + Supabase migrations + Stripe test-mode checkout/webhooks, all preview→confirm contracts (golden path code-complete; live E2E next) | 🚧 |
+| 8 | **Production Path** — multi-provider connectors + env/secret registry + Vercel deploy/redeploy/rollback + Supabase migrations + Stripe test-mode checkout/webhooks, all preview→confirm contracts (validated live end-to-end: a real SaaS with DB, auth, and test payments) | ✅ |
+| 9 | **Agent Teams** — role registry (coder / reviewer / inspector), wave-scheduled parallel execution in isolated patch workspaces, deterministic integration with surfaced conflicts, and a global verification gate over the integrated result | ✅ |
 
 **Planned — the long-term blueprint** (direction, not yet built; see [`BLUEPRINT.md`](./BLUEPRINT.md)):
 
 | Phase | Direction |
 |------:|-----------|
-| 8.8 | **Ships a minimal SaaS** — drive the full golden path live (DB + Supabase Auth/RLS + Stripe test checkout + Vercel preview URL + webhook tested local & deployed), then pressure-test on real full-stack apps |
-| 9 | **Agent Teams** — role registry, parallel read-only agents, isolated patch workspaces, an integration/merge agent, a global verification gate |
 | 10 | **Research / RAG / Skills** — bounded local project + repo + run indexes, user-approved URL/web reading, a reusable skills registry |
 | 11 | **Evaluation & reliability loops** — a typed recovery matrix, visual-repair loop, failure-pattern memory, run-health dashboard |
 | 12 | **Launch / Growth Studio** — architecture diagrams, demo scripts, release notes, and launch-kit generation from run artifacts |

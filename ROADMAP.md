@@ -1,14 +1,14 @@
 # Agent OS — Roadmap & Implementation Status
 
 > **Read order for a new session:** `CLAUDE.md` (stable rules) →
-> `ARCHITECTURE.md` (the system's shape — files, pipelines, invariants) → this
-> file (how it got here + what's next). `README.md` is the public landing page.
+> `ARCHITECTURE.md` (the system's current shape — files, pipelines, invariants,
+> lessons) → this file (how it got here + what's next). `README.md` is the
+> public landing page.
 
 A compressed evolution log: what landed, in what order, plus current constraints
-and next steps. Deep implementation detail and the hard-won gotchas live in
-`ARCHITECTURE.md` (see its §10 "Lessons worth keeping"); this file does not
-duplicate them. Phase numbers are historical labels — sections are grouped by
-theme (foundation → execution → interface), newest work last.
+and next steps. **How each piece works now lives in `ARCHITECTURE.md`** — this
+file records the history and doesn't duplicate the module/pipeline detail. Phase
+numbers are historical labels, newest work last.
 
 ---
 
@@ -16,560 +16,323 @@ theme (foundation → execution → interface), newest work last.
 
 Four docs, each with one job. Never duplicate content across them.
 
-| File              | Audience                      | Job                                            |
-|-------------------|-------------------------------|------------------------------------------------|
-| `README.md`       | Public visitors on GitHub     | Short pitch + setup. Bump only on user-visible change. |
-| `ARCHITECTURE.md` | Any agent picking up the repo | The whole picture: files, pipelines, invariants, lessons. |
-| `ROADMAP.md`      | The builder + future sessions | Evolution log, constraints, next steps.        |
-| `CLAUDE.md`       | Any coding agent here         | Stable operating rules. Phase-independent.     |
+| File | Audience | Job |
+|------|----------|-----|
+| `README.md` | Public visitors | Short pitch + setup. Bump only on user-visible change. |
+| `ARCHITECTURE.md` | Any agent picking up the repo | Current shape: files, pipelines, invariants, lessons. |
+| `ROADMAP.md` | The builder + future sessions | Evolution log, constraints, next steps. |
+| `CLAUDE.md` | Any coding agent here | Stable operating rules. Phase-independent. |
 
-When a task lands: README gets a 1–2 line bump (only if user-visible); ROADMAP
-gets a compressed entry under the right phase; ARCHITECTURE is updated if a
-module / pipeline / invariant / lesson changed; CLAUDE.md only if a
-constitutional rule changed.
-
----
-
-## Phase 1 & 2 — Foundation (stable, unchanged since)
-
-- **Workspace + project/conversation management.** Local filesystem layout
-  (`memory/`, `projects/{id}/`), FastAPI backend, React three-column UI
-  (projects / chat / context). Project + conversation CRUD, auto-titling.
-- **Markdown memory.** Global (`SOUL.md`, `USER.md`, `WORKSTYLE.md`, `MEMORY.md`)
-  + per-project (`PROJECT.md`, `STATUS.md`, `TASK_QUEUE.md`, `DECISIONS.md`,
-  `RESEARCH.md`). UI-editable; `SOUL.md` is read-only + hidden, loaded every turn.
-- **LLM orchestration + semantic memory writeback.** Each turn assembles memory
-  context (`orchestrator.py` + `llm.py`); a second LLM call proposes structured
-  JSON memory updates that the backend policy-filters before writing
-  (`SOUL.md` always excluded).
+When a task lands: README gets a 1–2 line bump (if user-visible); ROADMAP gets a
+compressed history entry; ARCHITECTURE is updated if a module / pipeline /
+invariant / lesson changed; CLAUDE.md only if a constitutional rule changed.
 
 ---
+
+## Phase 1 & 2 — Foundation (stable)
+
+Workspace + project/conversation management (local FS layout, FastAPI backend,
+React three-column UI, CRUD + auto-titling). Markdown memory — global (`SOUL`,
+`USER`, `WORKSTYLE`, `MEMORY`) + per-project (`PROJECT`, `STATUS`, `TASK_QUEUE`,
+`DECISIONS`, `RESEARCH`); UI-editable; `SOUL.md` read-only + hidden, loaded every
+turn. LLM orchestration with semantic memory writeback (a second LLM call
+proposes structured updates that the backend policy-filters before writing).
 
 ## Phase 3 — Execution Layer (complete through 06.2E)
 
-The arc: a sandboxed Coding Agent the main agent can delegate to → make
-delegation safe + explicit → surface runs in the UI → close the loop with
-automatic verification and a live preview.
+The arc: a sandboxed Coding Agent to delegate to → make delegation safe +
+explicit → surface runs in the UI → close the loop with verification + preview.
 
-- **Sandboxed execution (05.1–05.3).** Per-project `execution_workspaces/{id}/`
-  (`repo/`, `runs/`, `logs/`, `AGENT.md`, `TASK.md`), idempotent init.
-  **`ProjectSandbox` + `ToolRuntime` are the single chokepoint** — path +
-  command validation; six file/shell tools with output caps; nothing touches
-  repo paths or the shell except through here. `CodingAgentRunner` drives a
-  bounded JSON tool loop, emitting `task_card.md` / `events.jsonl` / `run.json` /
-  `result.md`.
-- **Triggering + surfacing (05.4–05.7).** `@code <task>` dispatches a run
-  (rejected in GENERAL). `BackgroundRunManager` (`ThreadPoolExecutor`) returns a
-  `running` record immediately and finalizes off-thread; a crashed worker →
-  `failed`. Runs panel (newest first, polls 2s while active) + `RunDetailModal`;
-  a run-id in chat renders a "View Run" button.
-- **Safe, explicit delegation (05.8–05.9.5).** A small LLM **delegation judge**
-  classifies each non-`@code` message (`dispatch_suggested` / `discussion` /
-  `memory_only`) and **never dispatches — only proposes**; a rule-based
-  heuristic is the fallback. `dispatch_suggested` → a **confirmable pending
-  plan** (PM-tone reply + **OK, run this** / **Revise plan**); only a user click
-  dispatches (same path as `@code`).
-- **Closing the loop (06.0–06.2E).** Terminal runs run a bounded, best-effort
-  **memory reconciliation** (`STATUS`/`TASK_QUEUE`/`DECISIONS`/`RESEARCH` only,
-  at most once, never fails the run). The main agent can **inspect specific
-  `repo/` files on demand** (bounded read-only loop, max 3/turn — no
-  auto-injection). **Command verification is automatic + multi-command**: a
-  manual `## Verification` block else inferred (`npm install`+`build`, `pytest`
-  iff importable, else a `compileall` syntax check); failures get a **bounded
-  iterative repair pass**; `completed` requires a pass (or safe skip).
-  **Browser verification** evolved MVP → user-triggered → **chat-first**: a run
-  posts a running note then a summary with **Run browser verification**, which
-  installs deps, starts a dev server on **port 5174**, captures a screenshot, and
-  hands the server to a per-project **preview registry** so the URL stays live
-  (Runs panel **Start / Stop preview**).
-- **Housekeeping.** Delete-path FK cleanup + Windows-safe workspace `rmtree`
-  (opt-in via "Delete its workspace too"); `.gitignore` ships public
-  `*.example.md` templates while keeping private contents out.
-
----
+- **Sandboxed execution.** Per-project `execution_workspaces/{id}/`;
+  `ProjectSandbox` + `ToolRuntime` as the single chokepoint (six file/shell tools
+  with output caps); `CodingAgentRunner` drives a bounded JSON tool loop emitting
+  run artifacts.
+- **Triggering + surfacing.** `@code <task>` dispatches (rejected in GENERAL);
+  `BackgroundRunManager` returns a `running` record and finalizes off-thread
+  (crash → `failed`). Runs panel + `RunDetailModal`.
+- **Safe, explicit delegation.** An LLM **delegation judge** classifies each
+  non-`@code` message and only *proposes* (heuristic fallback); a
+  `dispatch_suggested` becomes a **confirmable pending plan** — only a user click
+  dispatches.
+- **Closing the loop.** Best-effort post-run **memory reconciliation**;
+  main-agent **on-demand file inspection** (bounded, no auto-injection);
+  automatic **command verification** (manual block or inferred) + bounded repair
+  gating `completed`; **browser verification** (chat-first: install → dev server
+  on 5174 → screenshot → handed to a per-project preview registry).
 
 ## Phase 5 — Execution Orchestration (plan → tasks → execute)
 
-Upgraded the Coding Agent from one flat loop into a phased, inspectable
-orchestration. Additive — run record, role separation, sandbox chokepoint,
-explicit-dispatch contract, and the verification/browser/preview/reconciliation
-tail are unchanged.
+Upgraded the Coding Agent from a flat loop into a phased, inspectable run.
+Additive — the run record, role separation, sandbox chokepoint, and
+verification/browser tail are unchanged.
 
-- **Plan → tasks → finalize.** A cheap pure heuristic (`looks_complex`) gates
-  cost: simple cards skip the planner (legacy path, byte-identical); complex
-  cards run a **bounded read-only inspection loop** ending in a `plan` action.
-  The plan (`ExecutionPlan` of `ExecutionTask` units with `depends_on`, persisted
-  as `plan.json`) **always falls back to a single task** on any failure. The
-  runner executes units in topological order, skips dependents of failed deps,
-  records per-task status/files/commands/blockers, and aggregates a run status.
-  Single-threaded — `depends_on` leaves room for future parallel execution.
-  Richer `events.jsonl` (`phase` tags + plan/task events); `GET …/runs/{id}/plan`;
-  a read-only "Plan & Tasks" UI block. Design refs (architecture only):
-  OpenHarness / openclaude / opencode.
+- **Plan → tasks → finalize.** `looks_complex` gates cost (simple cards skip the
+  planner, byte-identical); complex cards run a read-only inspection loop → an
+  `ExecutionPlan` (`plan.json`), always falling back to a single task on failure.
+  The runner executes units in topological order, skips dependents of failed
+  deps, aggregates a status. Single-threaded (`depends_on` left room for
+  Phase 9's parallelism).
+- **Live timeline + run control.** Settled `RunTimeline` + a live phase badge /
+  task checklist; **Cancel** (cooperative → terminal `cancelled`) and **Retry**
+  (fresh linked run). Polling only (no SSE).
+- **Real-time trace + progressive metrics.** Live `RunTrace` modal streams the
+  activity thread (raw `llm_response` dropped); counts climb live during a run.
+- **Browser verification v2 + AI visual judgment.** Render-readiness-gated,
+  multi-page capture; a vision model gives a diagnostic-only verdict
+  (`visual_review.json`), skipping gracefully without a vision model.
+- **Hardening (Windows + autonomous build "Aegis").** Two adversarial-review +
+  real-build passes hardened the layer; builds now complete autonomously
+  end-to-end (the committed **Aegis Launch Control** showcase). Durable gotchas →
+  `ARCHITECTURE.md §10`.
 
-- **Live timeline + run control.** `GET …/runs/{id}/events` (tolerant parse,
-  optional `since` cursor) feeds a **settled** `RunTimeline` (start/settle pairs
-  collapsed, no stale spinners) and a live **phase badge + task checklist** in
-  the chat card. **Cancel** → cooperative at step boundaries → terminal
-  `cancelled` (runner-set only, never reconciled); orphaned runs finalized by the
-  endpoint under a re-read guard. **Retry** → a fresh **linked** run
-  (`retry_of` / `retried_by`), terminal-only, explicit. Polling only (no SSE).
+## Phase 4 — Interface & UX
 
-- **Real-time trace + progressive metrics.** The runner flushes observed
-  file/command activity to `run.json` *during* a run (counts climb live; finalize
-  still owns the authoritative lists). A dedicated **Live Trace** modal
-  (`RunTrace.tsx`) streams the chronological activity thread (raw `llm_response`
-  dropped — no chain-of-thought), polling the `since` cursor.
+- **07.0 — Multi-modal composer.** Auto-growing textarea (`Ctrl/Cmd+Enter`),
+  voice dictation, file attachments with "add to workspace" (sanitized + deduped;
+  storage + UX only, no RAG). New dep: `python-multipart`.
+- **07.1–07.3 — Provider Registry 2.0.** Six providers (Claude / GPT / Gemini /
+  DeepSeek / Kimi / GLM), key-presence availability, a per-provider model registry
+  with per-model `vision` flags + env-overridable defaults (Claude
+  `claude-opus-4-8`), capability gating (image upload + visual judgment only for
+  vision-capable selections). Anthropic via SDK, others via `urllib` (no new
+  deps). Header provider selector + a compact `ModelPicker`. Light/Dark theme via
+  `data-theme` + CSS variables. *Out of scope:* per-project model memory, provider
+  fallback, cost tracking, streaming, image generation.
 
-- **Browser verification readiness + multi-page + AI visual judgment.** Capture
-  now **waits for a genuine render** (networkidle + DOM-populated + body-text
-  stability, not just `load`) and marks `readiness="unconfirmed"` on timeout
-  rather than failing. It **discovers + captures a few views** (tabs / route
-  links / nav buttons; `MAX_BROWSER_PAGES=4`; stable `browser.png` + `page-NN.png`).
-  Then a vision model runs an **AI visual judgment** over the screenshots
-  (`passed`/`warning`/`failed`/`inconclusive` + concise rationale, persisted as
-  `visual_review.json`). **Diagnostic-only** — never changes run status — and
-  **skips gracefully** without a vision-capable model. Vision support landed in
-  `providers.py` (`complete_vision`) + `llm.chat_vision`.
+## Phase 6 / 6.1 — Main Agent Orchestration & Memory v2
 
-- **Hardening passes (Windows readiness + autonomous-build "Aegis").** Two
-  adversarial review + real-build passes hardened the execution layer
-  (UTF-8 subprocess decoding + whole-tree kill, atomic artifact writes, planning
-  fidelity, transient-LLM retry, progress-aware dependency skip, iterative
-  repair, truthful-completion prompt rules, big-file write budget,
-  previewable-architecture guidance). Outcome: builds now complete autonomously
-  end-to-end (the committed **Aegis Launch Control** showcase). The durable
-  gotchas from these passes are recorded in **`ARCHITECTURE.md §10`**.
+Rebalanced toward the Main Agent. Additive; every invariant unchanged. Recovery
+is confirmable-only (no auto-dispatch, except the scoped recovery budget below).
 
----
-
-## Phase 4 — Interface & UX (newest)
-
-- **07.0 — Multi-modal composer** (`ChatPanel.tsx` + `uploads.py`). Auto-growing
-  multiline textarea (`Enter` = newline, `Ctrl/Cmd+Enter` = send), Web Speech
-  voice dictation, and file attachments (images + `.txt`/`.md`/`.pdf`/`.doc`/
-  `.docx`) with an "add to workspace too" toggle. `POST /api/chat/upload`
-  sanitizes + de-dupes files (chat-only, or copied into `repo/uploads/` via the
-  sandbox); metadata rides the message so chips re-hydrate. Storage + UX only —
-  no parsing / RAG. New dep: `python-multipart`.
-- **07.1 — Pluggable model providers** (`providers.py`). Claude / GPT / Gemini /
-  DeepSeek in a key-presence registry; Anthropic via SDK, the rest via `urllib`
-  (no new deps). `GET /api/providers` + a `provider` field on `/api/chat` route
-  the main response; a header dropdown lists providers (missing-key → disabled).
-- **07.2 — Light theme.** A `:root[data-theme='light']` token block + a Dark/Light
-  switcher (top-right header), persisted to `localStorage`; the whole UI
-  re-themes via cascading CSS variables.
-- **07.3 — Provider Registry 2.0** (six providers, model picker, vision gating).
-  Upgraded 07.1 into a **capability-aware provider/model registry**:
-  - **Six providers** — added **Kimi (Moonshot)** and **Zhipu GLM** (both
-    OpenAI-compatible HTTPS; base URLs env-overridable for region hosts;
-    `ZAI_API_KEY` / `KIMI_API_KEY` / `GEMINI_API_KEY` accepted as aliases).
-  - **Per-provider model registry** with a per-model `vision` flag and an
-    env-overridable default. Default ids refreshed to current, **doc-verified**
-    models — Claude **Opus 4.8**, GPT **5.5**, Gemini **3.5 Flash**, DeepSeek
-    **V4 Flash**, Kimi **K2.6**, GLM **5.2** (the Claude bump also lifts internal
-    subsystem calls; override via `AGENT_OS_CLAUDE_MODEL`).
-  - **Capability gating.** Chat image upload is offered only for vision-capable
-    selections; the AI browser visual judgment prefers the selected vision-capable
-    model, falls back to any available vision model, and skips otherwise.
-    `/api/chat` validates the provider/model combo (accepting env-pinned
-    defaults); `orchestrate(..., model=)` threads the selection.
-  - **UI.** Provider selector stays in the header (07.1 behavior preserved); a
-    compact upward-opening **model picker** (`ModelPicker.tsx`) sits above the
-    composer with vision/text tags.
-  - **Out of scope (per task):** per-project model memory, provider fallback,
-    cost tracking, streaming, image generation.
-
----
-
-## Phase 6 — Main Agent Orchestration & Memory v2
-
-Rebalanced the system back toward the **Main Agent** (the execution layer had
-outgrown it). Additive — every constitutional invariant is unchanged: SOUL.md
-read-only, explicit-dispatch-only, no repo auto-injection, best-effort post-run
-steps. Recovery is **confirmable-only** (no auto-dispatch).
-
-- **Memory Engine v2.** New leaf module `memory_engine.py` (stdlib-only) owns the
-  single markdown write path: a policy-filtered, **atomic** (temp + `os.replace`),
-  OSError-guarded, append-deduped `apply_update(base_dir, allow=…)`, shared
-  canonical section names + default-section map, and the structured
-  `MemoryDecision`. `orchestrator.apply_memory_update` / `apply_global_memory_update`
-  and `memory_reconciliation._apply_update` now all delegate to it (killed the
-  duplicated, non-atomic writers). `ensure_memory_scaffold()` idempotently
-  backfills missing project-memory files/sections (at project-create + a one-time
-  startup migration; never from `load_memory`).
-- **Memory Intake v2.** The two bare-array chat-turn judges collapsed into one
-  structured `judge_memory_intake(scope, …) -> MemoryDecision` (should_update +
-  reason + updates) that runs every meaningful turn; the **reason** is surfaced to
-  the UI. Fixed an active bug: the main-agent system prompt no longer claims
-  "no delegation path exists yet" (it shipped phases ago).
-- **Intent Router v2.** The delegation judge now also emits a richer `intent`
-  label (planning / design / build / debug / inspect / memory / docs /
-  retrospective / research / discussion) — informational, routing still keys off
-  the 3 dispatch decisions. New deterministic mode commands `@plan` / `@design` /
-  `@debug` / `@review` / `@inspect` / `@memory` shape the response via
-  `orchestrate(mode=…)` (e.g. `@debug` folds in the latest non-green run summary;
-  `@inspect`/`@review` nudge the bounded inspection channel). **None dispatch** —
-  only `@code` / confirm do.
-- **Confirmable recovery.** New `execution/recovery.py` `assess_run()` (best-effort,
-  never raises, mirrors reconciliation skip rules) interprets a non-green terminal
-  run — `partial`/`failed`/`blocked`, plus the signals a `completed` status hides
-  (failed command/browser verification, failed visual review) — and recommends
-  one bounded next step (`inspect`/`repair`/`split`/`reverify`/`report`). Persisted
-  to `RunRecord.recovery_assessment`; triggered in `runner._finalize` after
-  reconciliation. A `needs_recovery` assessment becomes a **confirmable pending
-  card** via `POST …/runs/{id}/propose-recovery` (reuses the existing pending-plan
-  dispatch — the user still clicks **OK, run this**).
-- **UI.** Run cards show a memory-reconciliation line + a "Next steps" recovery
-  block with a **Run suggested fix** button; chat turns carry an intent badge +
-  a "🧠 Memory updated — <reason>" chip (both persisted on the message so they
-  survive reload). `types.ts` gained the 3 already-shipped reconciliation fields +
-  `recovery_assessment`.
-
-## Phase 6.1 — Orchestration Polish, Recovery UX & Context Loader v2
-
-A polish pass over Phase 6 — additive, suite-green throughout.
-
-- **Recovery + memory now auditable everywhere.** `RunDetailModal` gained a
-  Recovery section (verdict / action / diagnosis / proposed fix + a settle-poll so
-  late-written fields appear) and a memory-reconciliation line. Reconciliation now
-  persists its **reason** (`RunRecord.memory_reconciliation_reason`) + a
-  content-stripped applied list on the `memory_reconciled` event; chat turns store
-  a stripped `memory_applied` list so the "🧠 Memory updated" chip **expands** to
-  show which file › section changed.
-- **Context Loader v2.** `orchestrator._compact_memory` keeps the main-agent
-  prompt compact as memory grows: STATUS.md / PROJECT.md (and SOUL.md) stay whole;
-  the append-growth files (TASK_QUEUE "Done", DECISIONS, RESEARCH) trim to their
-  newest entries + an elision note once over a threshold (byte-identical below it,
-  so young projects + tests are unaffected). Scoped to the main prompt only — the
-  delegation + reconciliation snapshots are separate, already-bounded paths.
-- **Intent → workflow routing.** The judged intent label now also routes to the
-  matching `orchestrate(mode=…)` (e.g. a natural debugging question folds in the
-  latest non-green run), not just the badge; `docs` / `research` modes added.
-  Still conservative — never dispatches.
-- **User-approved recovery budget.** Confirming a pending plan can now grant a
-  bounded auto-recovery allowance (none / 1 / 2). A non-green run with remaining
-  budget auto-dispatches **one** linked, audited recovery run from the Main Agent's
-  follow-up task card (`background._maybe_auto_recover`, clean-finalize path only,
-  decrementing budget, hard cap 2, idempotent via `recovered_by`). The budget is
-  clamped at the confirm endpoint (the explicit-approval boundary); `@code` /
-  retry / manual propose stay budget 0; the manual `propose-recovery` 409s once a
-  recovery exists. **Invariant extension (documented):** a user-set budget on an
-  explicitly-confirmed task authorizes that many bounded auto-dispatches — inferred
-  intent still never runs code.
+- **Memory Engine v2.** New `memory_engine.py` owns the single atomic markdown
+  write path; `orchestrator` + `memory_reconciliation` delegate to it (killed the
+  duplicated writers). Idempotent `ensure_memory_scaffold`.
+- **Memory Intake v2.** One structured `judge_memory_intake → MemoryDecision`
+  every meaningful turn; the reason is surfaced to the UI.
+- **Intent Router v2.** The judge emits a richer informational `intent`; new
+  deterministic mode commands `@plan`/`@design`/`@debug`/`@review`/`@inspect`/
+  `@memory` shape the response (a non-dispatch intent also routes to the matching
+  mode). None dispatch.
+- **Confirmable recovery.** `recovery.assess_run` interprets a non-green run and
+  recommends one bounded step (`RecoveryAssessment`), surfaced as a confirmable
+  pending card — the user still clicks OK.
+- **Context Loader v2 (6.1).** `_compact_memory` keeps the main prompt compact as
+  memory grows (STATUS/PROJECT/SOUL whole; append-growth files tail-trimmed over a
+  threshold; byte-identical below it).
+- **User-approved recovery budget (6.1).** Confirming a plan can grant a bounded
+  auto-recovery allowance (none/1/2): a non-green run auto-dispatches ONE linked,
+  audited recovery run (clean-finalize only, decrementing budget, hard cap 2,
+  idempotent). Clamped at the confirm endpoint — the explicit-approval boundary.
+  Inferred intent still never runs code.
 
 ## Phase 7 — Project Ops & GitHub Lifecycle
 
-Turned Agent OS from a build/verify system into a **project-lifecycle** system:
-a finished run becomes a traceable, user-approved Git/GitHub delivery —
-`generated files → verified run → safe checkpoint → reviewed diff → commit →
-branch/push → PR`, every external/destructive step behind an explicit approval
-gate. Additive; every constitutional invariant preserved. (BLUEPRINT Pillar 1.)
+Turned Agent OS into a **project-lifecycle** system: a finished run becomes a
+traceable, user-approved Git/GitHub delivery — checkpoint → reviewed diff →
+commit → branch/push → PR — every external/destructive step behind an approval
+gate. Additive; invariants preserved. (BLUEPRINT Pillar 1.)
 
-- **One Git executor + typed sandbox surface.** New `ToolRuntime.run_git`
-  (`shell=False` argv) routed through `ProjectSandbox.validate_git` (subcommand
-  allow-list + destructive gating behind `allow_destructive`). The Coding Agent's
-  free-form `run_shell` is *strengthened* — the destructive-Git guards CLAUDE.md
-  §3 always claimed (`git reset --hard`, force-push, `clean`, …) now exist — and
-  `run_git` is **not** an agent tool (only `git_ops`/`github_connector` call it).
-- **`git_ops`** — sandboxed local ops: idempotent `ensure_repo` (lazy `git init` +
-  safe `.gitignore` + identity), an **out-of-branch tagged checkpoint** (via
-  `write-tree`/`commit-tree` on a throwaway index, so the working branch is never
-  polluted and a dirty tree is captured intact), redacted+bounded `capture_diff`
-  (includes new files), secret-refusing `commit`, and a clean-/dirty-tree-safe
-  `rollback`.
-- **Checkpoint + diff in the run lifecycle.** `background.dispatch` captures a
-  pre-run checkpoint (recovery children inherit the parent's anchor);
-  `runner._finalize` captures the post-run diff to a `diff.patch` artifact — both
-  best-effort, **never auto-commit/push**, never fail finalization. `RunRecord`
-  gains scalar linkage fields (`pre_run_checkpoint`/`base_commit`/`commit_sha`/
-  `branch`/`pushed`/`pr_url`/… + transient `git_state`).
-- **Credentials foundation.** `credentials.py` — the single secret reader: global
-  env (`GITHUB_TOKEN`) + per-project gitignored store (project overrides global),
-  `status` presence-only, `redact()` for egress. The token reaches git only via a
-  generated `GIT_ASKPASS` env at push time (tokenless remote) — never argv,
-  `.git/config`, commits, logs, events, memory, prompts, or UI.
-- **GitHub connector** (`github_connector.py`) — REST over `urllib` (no `gh` CLI,
-  no new deps): token validation (`GET /user`), tokenless `ensure_remote`,
-  `push_branch`, `create_pull_request`. All output redacted.
-- **Explicit two-phase action endpoints.** `…/git/commit|git/push|github/pr|
-  git/rollback` each return an **External Action Contract** on `confirm:false` and
-  execute only on `confirm:true`; `…/runs/{id}/diff` + `…/git/status` +
-  `…/credentials/github` + `…/github/connector` round out the surface. No
-  inferred-intent Git path; no Git auto-dispatch.
-- **Frontend.** A reusable `GitOpsPanel` (run chat card + detail modal) drives the
-  contracts (review-diff / commit / push / PR / rollback with confirm gates);
-  `ConnectorModal` (Runs panel) enters the token; a project-level git/connector
-  strip shows branch/dirty/connection. `ConfirmDialog` gained a `confirmLabel`.
-- **Brain awareness.** `orchestrator._latest_git_state_context` folds a compact
-  branch/commit/PR/diff-stat summary into `@review`/`@debug` — never the raw diff.
-- **Validated end-to-end (live).** A brand-new project ran the full lifecycle on a
-  real Coding Agent build + real git + real GitHub: task → build → pytest verify →
-  checkpoint → diff review → commit → branch → push (`main` + feature) → **PR #1** →
-  full run↔PR traceability → rollback to the checkpoint. The E2E caught one real
-  bug — `validate_git` rejected newlines, breaking multi-line (LLM-generated) commit
-  messages; now only NUL is rejected (`shell=False` makes newlines safe), with
-  regression tests. Secret-leak audit clean: no token in events/run.json/result.md
-  and a tokenless `.git/config` remote.
+- One Git executor (`ToolRuntime.run_git`); `run_shell` strengthened to block
+  destructive Git; `run_git` is not an agent tool.
+- `git_ops` (checkpoint, redacted diff, secret-refusing commit, gated rollback);
+  `credentials.py` as the single secret reader (token → git only via
+  `GIT_ASKPASS`); `github_connector` (REST, no `gh` CLI).
+- Explicit two-phase External Action Contracts for commit/push/PR/rollback;
+  `GitOpsPanel` drives them. The brain sees a compact git-state summary in
+  `@review`/`@debug`, never the raw diff.
+- **Validated live end-to-end:** build → verify → checkpoint → commit → branch →
+  push (main + feature) → **PR #1** → rollback. Caught + fixed one real bug
+  (`validate_git` rejected newlines, breaking multi-line commit messages; now only
+  NUL is rejected). Secret-leak audit clean.
 
-## Phase 8 — Production Path Foundation (in progress)
+## Phase 8 — Production Path (validated live)
 
-Moves what Agent OS can deliver from local preview-only demos toward shipping a
-minimal real SaaS through one golden path: **Vercel (deploy) + Supabase
-(Postgres/Auth/migrations) + Stripe (test-mode checkout/webhooks)**. Built on the
-Phase 7 rails — two-phase External Action Contracts, `credentials.py` as the sole
-secret reader, the single sandboxed-executor pattern, best-effort run linkage.
-Additive; every constitutional invariant preserved. (BLUEPRINT Pillar 2.)
+Moved what Agent OS can deliver from local preview to shipping a minimal real
+SaaS through one golden path: **Vercel (deploy) + Supabase (Postgres/Auth/
+migrations) + Stripe (test-mode checkout/webhooks)**. Built on the Phase 7 rails
+(two-phase contracts, `credentials.py` sole secret reader, sandboxed executors,
+best-effort run linkage). Additive; invariants preserved. (BLUEPRINT Pillar 2.)
 
-**First increment landed — "Spine + Vercel proof" (8.1–8.4 + memory ledger):**
+- **Credential spine + app-env registry.** `credentials.py` generalized to a
+  provider registry (`github|vercel|supabase|stripe`) with a Stripe live-gate and
+  hardened redaction; `app_env.py` holds the built app's env vars (presence-only).
+- **Connectors + contracts.** `vercel_connector` (async deploy: confirm returns
+  immediately, finalizes off-thread polling `READY`, writes `deployment.json`/
+  `deploy.log` + an `OPS.md` ledger entry via the one deterministic `ops_ledger`
+  writer). `supabase_connector` + `run_supabase` (scrubbed-env CLI executor;
+  destructive-by-subcommand gating; migration preview/apply contracts).
+  `stripe_connector` (form-encoded, per-request test-gate; provision + webhook
+  register, the returned `whsec_` stored but never echoed).
+- **Startup reconciliation (8.7).** `reconcile_stuck_external_actions` clears a
+  crash-left transient deploy state by querying the provider — never auto-retries
+  a partially-applied external action.
+- **Validated live end-to-end (8.8).** Drove the full path on `agent-os-phase8-e2e`:
+  the Coding Agent built **"CloudNotes"** (Next.js 14 SaaS, Supabase Auth/RLS +
+  Stripe test checkout + webhook) from an empty repo → build → commit → push →
+  **Vercel production deploy (READY)** → Supabase `link` + migration
+  (`db push --linked`, verified live) → Stripe test Product+Price → deployed
+  webhook → env pushed. Proven at the live URL: a signed
+  `checkout.session.completed` → deployed webhook → 200 + a row persisted in
+  Supabase (full payment→persistence loop). Secret-leak audit clean. Caught +
+  fixed real bugs (Vercel rejects a Sensitive var targeting `development`; the
+  generated app needed `vercel.json {"framework":"nextjs"}`; a follow-up migration
+  added a diverged column). Operational findings (not code-changed): cold Next.js
+  `npm install` can exceed the 600 s `run_shell` ceiling; the connectors don't
+  retry transient network errors (`deployment.json` is the source of truth).
 
-- **8.1 — Multi-provider credential spine.** `credentials.py` generalized from
-  GitHub-only to a provider registry (`github | vercel | supabase | stripe`) with
-  typed secret + non-secret fields: generic `get_token` / `get_secret` /
-  `get_metadata` / `status` / `status_all` / `set_credential` / `update_metadata`
-  / `delete_credential` (the GitHub helpers stay as thin aliases). **Stripe
-  live-gate at the store boundary** (a non-`*_test_` key is refused unless an
-  explicit `allow_live`). **Redaction hardened**: `sk_`/`rk_`/`whsec_`/`sbp_`
-  shapes + a Postgres connection-string password regex + `_all_known_tokens`
-  iterating every provider's stored secret — but **no bare-JWT regex** (the
-  Supabase anon key is a public JWT; the secret `service_role` is caught by exact
-  value, classified by field name not shape). Generic
-  `GET|POST|DELETE /api/projects/{id}/credentials/{provider}` + `GET …/connectors`
-  routes; multi-provider `ConnectorsModal.tsx`.
-- **8.2 — App-env registry.** New `execution/app_env.py` (`credentials/env/{id}.json`,
-  presence-only `list_env` — never a value); the single value reader is
-  `credentials.get_env_value`; app-env secret values register into the redactor.
-  `…/env` routes + `EnvRegistryPanel.tsx` (write-only inputs, per-key "Push to
-  Vercel").
-- **8.3 — Contract driver + run record/artifacts.** Run-scoped deploy fields on
-  `RunRecord` (`deployment_id`/`url`/`target`, transient `deploy_state` /
-  `external_state`); `run_store` `_deployment_section` + `deployment.json` +
-  `deploy.log` artifacts; generic `ExternalActionPanel.tsx` two-phase driver.
-- **8.4 — Vercel connector + contracts + OPS ledger.** New
-  `execution/vercel_connector.py` (REST-over-urllib, gitSource deploy, token in
-  the `Authorization` header only, every returned string redacted, no project
-  auto-create). **Async deploy**: confirm returns immediately with
-  `deploy_state` set and finalizes off-thread (polls `READY`) via the background
-  manager's new `submit`. New `execution/ops_ledger.py` — the one writer of
-  `projects/{id}/OPS.md` (deterministic, redacted at the call site; OPS.md is
-  scaffolded but excluded from every LLM-judge writable set + `DEFAULT_SECTION`).
-  Routes: deploy/redeploy/rollback (run-scoped), env-set/status/deployments
-  (project-scoped), every mutating route GENERAL-rejected; `DeployOpsPanel.tsx`.
-- **Adversarial-review fixes folded in**: token never on argv (env/header only);
-  service_role a first-class secret; mandatory-`project_id` redaction; deploy URL
-  normalized to strip a protection-bypass token; orchestrator imports no connector
-  (asserted by a test); secret app-env vars forced Vercel `type:"sensitive"`.
+## Phase 9 — Agent Teams & Parallel Execution
 
-**Validated end-to-end (live).** A brand-new project (`agent-os-phase8-vercel-e2e`)
-ran the full Production Path on a real Coding Agent build + real GitHub + real
-Vercel: task → **build** a Vite/React/TS app → **verify** (`npm install && npm run
-build`) → **commit** → **push** → **Vercel deploy** (gitSource) → polled
-`INITIALIZING → BUILDING → READY` off-thread → a live preview URL, recorded in
-`OPS.md`. The E2E caught + fixed two real bugs: (1) Vercel's `gitSource` requires
-`repoId`/`org+repo` (a bare `{type,ref}` is rejected) and `target` must be omitted
-for preview — the connector now resolves the repo from the project link; (2) a
-**friction win** — the push now **auto-derives the GitHub repo from the linked
-Vercel project**, so a Vercel-connected project pushes with zero extra input. Secret
-audit clean: the Vercel + GitHub token values appear in **no** run.json / events /
-result.md / **deploy.log** / deployment.json / OPS.md. The push also auto-triggered
-Vercel's own production deploy (native git integration). Only manual/privacy step:
-the preview URL sits behind **Vercel Deployment Protection** (302→SSO) until the user
-toggles it off in the Vercel dashboard.
+Turned the single-threaded execution layer into a **team runtime**: a complex
+task decomposes into role-assigned units, independent work runs in parallel in
+isolated patch workspaces, a deterministic integration step merges the outputs
+(conflicts surfaced, never silent), and the existing verification tail becomes a
+**global gate over the integrated tree**. Additive — the sequential/simple paths
+are byte-identical (all pre-existing tests unchanged); every invariant holds.
+(BLUEPRINT Pillar 3. Module/pipeline detail: `ARCHITECTURE.md §5–§9`.)
 
-**Second increment landed — "Supabase" (8.5):**
-- **Sandboxed CLI executor.** New `ToolRuntime.run_supabase` joins `run_git` as a
-  typed executor (`shell=False` argv, not an agent tool) — but with a **scrubbed
-  allow-listed env** (`_scrubbed_cli_env`: only PATH/HOME/Docker-ish keys +
-  `env_extra`, NOT `os.environ.copy()`), so Agent OS's own provider keys are never
-  exposed to the third-party CLI (C5). `sandbox.validate_supabase` +
-  **hand-written `_is_destructive_supabase`** gate by SUBCOMMAND, not a flag: a
-  bare `db push` (remote DB), `db reset`, `migration up --linked`, `db remote
-  commit`, `branches delete` are destructive-by-default; `db push --dry-run` /
-  `db diff` / `migration new` / `status` are safe (C1/H1).
-- **Connector + contracts.** New `supabase_connector.py`: Management REST for
-  `status` (validates the `sbp_` token) + sandboxed CLI for `link` / migration.
-  The migration **preview** runs `db push --dry-run --linked` (Docker-optional,
-  required) + best-effort `db diff` (Docker-gated enrichment, soft note if Docker
-  is down); **apply** runs `db push --linked` with `allow_destructive` + the
-  access-token/DB-password via env only. The connector **redacts CLI stdout/stderr
-  before any artifact** (H7); Docker-not-running surfaces as a clear blocker.
-  Routes: `supabase/status`, `supabase/link`, `runs/{id}/supabase/migration`
-  (GENERAL-rejected). RLS ships as migration SQL; Auth provider config is a
-  documented manual dashboard step this pass. `MigrationPanel.tsx` drives it.
-- **Secret-in-repo guard (H8):** `git_ops` now refuses to commit
-  `supabase/config.toml` / `supabase/.temp` / `.branches` and seeds them into the
-  default `.gitignore`.
+- **Role registry** (`roles.py`) — execution roles coder (default, empty overlay)
+  / reviewer / inspector (read-only, deliverable = findings); system stages
+  integrator / verifier; the chat `@`-mode ↔ role map. Enforced `allowed_tools`;
+  unknown role → coder.
+- **Isolated patch workspaces** (`patch_workspace.py`) — `PatchToolRuntime`:
+  overlay writes, fall-through reads, blocked shell/git/supabase, all paths via
+  the new `sandbox.resolve_under`; per-task `manifest.json`.
+- **Team planning** — plan schema gains per-task `role`/`parallel` (conservative
+  rules); `compute_waves` (Kahn layering, cycles forced sequential) +
+  `plan_is_team_eligible` (the gate: an LLM-planned plan with a wave of ≥2
+  parallel-eligible tasks).
+- **Deterministic integration** (`integration.py`) — per-wave, first-writer-wins,
+  identical content de-dupes, conflicting content + apply-errors surfaced and cap
+  the run at `partial`; detail in `integration.json`.
+- **Wave scheduler** (`runner._run_execution_phase_team`) — bounded parallel pool
+  (`MAX_PARALLEL_AGENTS=3`, never the shared dispatch pool), coders in patch
+  workspaces + read-only roles on the shared repo with tools enforced in-loop;
+  the coordinator is the sole run.json/plan.json writer (workers append
+  `task_id`-tagged, per-run-locked events); read-only findings flow into
+  later-wave prompts.
+- **Team trace** — new events (`team_execution_started`, `wave_started`,
+  `integration_*`), transient `integration_state`, wave-grouped checklist with
+  role chips, a Team Integration detail section, and interleaving-safe Live-Trace
+  pairing. result.md gains role/wave + `## Integration` (sequential runs
+  byte-identical).
 
-**Third increment landed — "Stripe + reconciliation" (8.6–8.7):**
-- **Stripe connector** (`stripe_connector.py`): REST over urllib but
-  **form-encoded** (`application/x-www-form-urlencoded` + bracket notation —
-  Stripe is NOT JSON) with an **`Idempotency-Key`** on every create. **Test-mode
-  gate per request** at the executor boundary (a non-`sk_test_`/`rk_test_` key
-  and any `livemode:true` response are refused — no import-time route theater).
-  Provisions a test Product+Price (returns a `price_id`), registers a deployed
-  webhook endpoint (GET-then-create idempotent; the returned `whsec_` is **stored
-  via credentials and never echoed** into a contract/event/log), deletes a
-  webhook (rollback), and surfaces the `stripe listen` local-test command.
-  Routes: `stripe/status`, `stripe/checkout-test`, `stripe/webhook/register`,
-  `stripe/webhook/{id}` (delete), `stripe/webhook/local-command`.
-  `StripePanel.tsx` drives it (mandatory TEST badge). The per-purchase checkout
-  session + signature verification are app-runtime code in the BUILT app (reads
-  its own `process.env`, never `credentials.py`).
-- **Startup reconciliation (8.7):** `reconcile_stuck_external_actions()` runs in
-  `startup()` beside `sweep_stuck_runs` — for a run left mid-deploy it queries
-  Vercel for the true state and stamps the URL if it actually reached READY,
-  otherwise clears the transient `deploy_state`/`external_state` and records a
-  "verify remote state" blocker. It **never auto-retries** an external action
-  that may have partially applied (consistent with "a crashed run never
-  auto-recovers").
+**Validated live end-to-end.** Drove a real team run on `phase9-team-e2e` with
+live Claude: "build a dependency-free `textkit` package (3 independent modules +
+wiring + review)" planned as a **5-task team run**. **Wave 1** ran three coders
+**concurrently in isolated patch workspaces** (each overlay held only its own
+file — isolation proven); **integration** applied all three, 0 conflicts;
+**wave 2** wired `__init__.py`; **wave 3** ran the **reviewer**. The **global
+gate** (`compileall` over the integrated tree) passed → `completed`, and the real
+package imports and handles every edge case the planner flagged. Team-trace
+events + patch manifests all present; secret-leak audit clean. Conflict/
+apply-error handling (surface + blocker + cap at `partial`) is proven
+deterministically by `test_integration` / `test_team_runner` (the live golden
+path is disjoint, as correct decomposition should be). **Adversarial review
+before the E2E caught + fixed 6 real defects:** a critical **task-id path-escape**
+(unsanitized id as a patch-dir segment → sanitized at plan parse + a layout
+containment guard), a widened **`.git` write guard** (was `.git/config`-only),
+**integration apply-errors now degrade status**, the crash handler now **clears
+every transient sub-status**, and the **cyclic-wave dependency gate** re-checks
+just-in-time to match sequential skip semantics.
 
-**The minimal golden path is now code-complete** (connect → build → verify →
-commit → push → Vercel deploy → Supabase migrate → Stripe test checkout/webhook,
-every external step a preview→confirm contract, every secret leak-audited).
-
-**8.8 — Full golden-path E2E (validated live).** Drove the complete Production
-Path through Agent OS itself on a dedicated project (`agent-os-phase8-e2e`,
-repo `earthwalker17/agent-os-phase8-e2e`): the Coding Agent built **"CloudNotes"**
-— a Next.js 14 App-Router SaaS (Supabase Auth/RLS + Stripe test checkout +
-webhook) from an empty repo → local build green → commit → push → **Vercel
-production deploy (READY)** → Supabase `link` + migration `db push --linked`
-(profiles + orders + RLS, verified live via PostgREST) → Stripe test
-Product+Price → deployed webhook registered → env pushed to Vercel. Live proof at
-`https://agent-os-phase8-e2e.vercel.app`: landing/login/dashboard 200,
-`POST /api/checkout` returns a real `cs_test_…` Checkout Session, and a
-**properly-signed `checkout.session.completed` event → the deployed webhook →
-200 + a row persisted in Supabase `orders`** (full payment→persistence loop).
-Secret-leak audit clean (no token value or shape in any run/ops/deploy artifact,
-`OPS.md`, `diff.patch`, backend logs, or the pushed repo; tokenless git remote).
-
-  - **Bugs found + fixed.** (1) Vercel connector `set_env_var` sent a Sensitive
-    var with `target:["…","development"]`, which Vercel rejects
-    ("cannot set a Sensitive Environment Variable's target to development") —
-    now drops `development` for `sensitive` vars (regression tests added to
-    `test_vercel_connector`). (2) The generated app deployed as framework
-    "Other" (Vercel linked an empty repo) and failed the build with "No Output
-    Directory named public" despite a green `next build`; fixed in-repo by
-    committing `vercel.json {"framework":"nextjs"}`. (3) A follow-up migration
-    added the `customer_email` column the webhook expected (two Coding-Agent
-    tasks had diverged on it).
-  - **Operational findings (not code-changed).** The inferred `npm install`
-    verification is bounded by the 600 s `run_shell` ceiling — a cold Next.js
-    install can exceed it (pre-warming `node_modules` makes verification skip
-    install and run only `next build`); the Vercel/GitHub connectors don't retry
-    transient network errors (intermittent SSL EOF surfaced as a redeploy
-    blocker even though the deployment reached READY — see `deployment.json` as
-    the source of truth); the "push auto-derives the GitHub repo from the linked
-    Vercel project" path returned no owner/repo here (fell back to explicit
-    owner/repo); the deployed `whsec_` is never readable via HTTP (wire it into
-    the app-env registry server-side from the credential store, then push). A
-    real webhook always carries a non-null `status`, so the app's `orders.status
-    not null` + `status ?? null` insert only fails for synthetic events.
-
-**Next — pressure-test on more apps + the operational hardening above.** See
-`BLUEPRINT.md` Pillar 2 + the approved Phase 8 plan §7.
+---
 
 ## Current Constraints
 
-- **Explicit dispatch only.** `@code <task>` runs immediately; inferred coding
-  intent only ever produces a **confirmable pending plan** — a user click (OK,
-  run this) is the sole path to a run. The judge / confirm endpoint reject
-  GENERAL. (Invariant; see `ARCHITECTURE.md §9` / `CLAUDE.md §5`.)
+- **Explicit dispatch only.** `@code` runs immediately; inferred intent only ever
+  produces a confirmable pending plan (the judge / confirm endpoint reject
+  GENERAL). See `ARCHITECTURE.md §9` / `CLAUDE.md §5`.
+- **Execution is wave-scheduled with bounded parallelism.** A team-eligible plan
+  runs ≤3 concurrent units/wave (write tasks isolated + integrated); everything
+  else runs the legacy single-threaded loop byte-identical. No unbounded spawning;
+  parallel units never run shell; conflicts/apply-errors cap a run at `partial`.
 - **No streaming** on `/api/chat` — full response in one shot.
-- **Verification.** Automatic command verification (manual block or inferred) +
-  bounded repair gates `completed`; an opt-in `## Browser Verification` block (or
-  the chat button) adds a render-gated, multi-page headless capture + a
-  **diagnostic-only** AI visual judgment that **skips without a vision-capable
-  model**.
-- **Up to 3–4 LLM calls per non-`@code` turn** (delegation judge + optional
-  inspection + chat response + memory judge); repair adds a bounded loop only on
-  a failed `completed` run.
-- **Main agent never auto-reads repo contents** — only the bounded inspection
-  loop (max 3 reads/turn).
-- **Execution is single-threaded** in topological order; `depends_on` is recorded
-  but not yet parallelized.
+- **Verification.** Automatic command verification + bounded repair gates
+  `completed`; an opt-in `## Browser Verification` block (or the chat button) adds
+  a render-gated multi-page capture + a diagnostic-only visual judgment (skips
+  without a vision model).
+- **3–4 LLM calls per non-`@code` turn** (delegation judge + optional inspection +
+  chat response + memory judge).
+- **Main agent never auto-reads repo contents** — only the bounded inspection loop
+  (max 3 reads/turn).
 - **Single-user, single-process.** No auth, no shared deploy.
 
 ---
 
 ## Test Coverage
 
-Backend tests live under `backend/tests/`, stub the LLM caller (no API key
-needed), and are each runnable standalone (`python tests/<file>.py`).
+Backend tests live under `backend/tests/`, stub `llm.chat` (no API key needed),
+and are each runnable standalone (`python tests/<file>.py`). **604 total**;
+`npm run build` (tsc + vite) green.
 
-| File                              | Tests | Covers                                                  |
-|-----------------------------------|------:|---------------------------------------------------------|
-| `test_delegation_judge.py`        |    15 | 05.9 judge decisions, fallbacks, parsing                |
-| `test_pending_execution.py`       |    17 | 05.9.5 serialization, revision LLM, renderers           |
-| `test_pending_execution_db.py`    |     6 | 05.9.5 SQLite lifecycle + delete-path FK cleanup        |
-| `test_memory_reconciliation.py`   |    26 | 06.0 parser, skip rules, e2e pipeline                   |
-| `test_inspect.py`                 |    29 | 06.1 sandbox, parser, orchestrator loop                 |
-| `test_verification.py`            |    21 | 06.2A parser, runner integration, sandbox path          |
-| `test_verification_inference.py`  |    23 | 06.2E inference, multi-command, pytest probe, repair    |
-| `test_browser_verification.py`    |    29 | 06.2B lifecycle, drainer, Playwright; multi-page capture |
-| `test_runner_diagnostics.py`      |     9 | observed activity, `sweep_stuck_runs`                   |
-| `test_ui_browser_verification.py` |    15 | 06.2C UI flow + visual review (diagnostic-only + skip)  |
-| `test_preview.py`                 |    12 | 06.2D preview registry; 06.2E `deps_installed`          |
-| `test_chat_first_endpoints.py`    |     3 | 06.2D browser-verify sub-status, preview start/stop     |
-| `test_uploads.py`                 |    14 | 07.0 sanitize/dedup/storage, workspace copy, upload     |
-| `test_providers.py`               |    40 | 07.1 + Registry 2.0: six-provider order, model registry + `is_known_model`, Kimi/GLM dispatch + vision, capability gating, env aliases/base-URL override, chat routing |
-| `test_planner.py`                 |    28 | Phase 5 heuristic gate, plan parse/fallback, graph       |
-| `test_runner_planning.py`         |     7 | Phase 5 plan→tasks integration: decompose, skip, gate    |
-| `test_run_control.py`             |    16 | events/task-card readers, cancel/retry, orphan guard, `since` cursor |
-| `test_llm_retry.py`               |     4 | transient-vs-permanent LLM error classification + retry  |
-| `test_autonomy_hardening.py`      |    11 | dependency skip, productive continuation, iterative repair |
-| `test_live_metrics.py`            |     5 | progressive run-level + per-task metrics                 |
-| `test_visual_judge.py`            |    16 | gate/skip rules, JSON parse, never-raises, image cap; selected-model resolution + fallback/skip |
-| `test_memory_engine.py`           |    13 | Phase 6 apply_update policy/atomic/dedup/replace; scaffold; orchestrator write-path |
-| `test_memory_intake.py`           |    10 | Phase 6 structured intake judge: parse, policy filter, reason, no-op, apply |
-| `test_intent_router.py`           |    18 | Phase 6 mode `@`-command parser, `intent` field, mode→prompt shaping; 6.1 intent→mode map |
-| `test_recovery.py`                |     8 | Phase 6 assess_run: non-green/green/cancelled/idempotent/visual-failed, never-raises |
-| `test_context_loader.py`          |     8 | 6.1 `_compact_memory`: below-threshold identity, STATUS/PROJECT untrimmed, archive tail-trim |
-| `test_recovery_budget.py`         |     9 | 6.1 `_maybe_auto_recover` gating: budget/green/idempotent/cap/no-card; budget decrement |
-| `test_sandbox_git.py`             |    12 | 7.1 run_shell destructive-git block, validate_git allow/deny + gating, run_git e2e |
-| `test_git_ops.py`                 |    12 | 7.2 ensure_repo/checkpoint/diff+redact/commit-refusal/branch/rollback (real git) |
-| `test_git_store.py`               |    12 | 7.3 + 8.3 git/deploy RunRecord round-trip, diff.patch + deployment.json/deploy.log artifacts, result.md sections |
-| `test_checkpoint_diff.py`         |     4 | 7.4 dispatch checkpoint + inherit, finalize diff capture (idempotent/no-op) |
-| `test_credentials.py`             |    16 | 7.5 + 8.1 multi-provider registry, redaction hardening (conn-string/`sk_`/`whsec_`/`sbp_`), Stripe live-gate |
-| `test_github_connector.py`        |    11 | 7.6 remote parse/tokenless, status validate, push token-only-in-env, PR REST |
-| `test_git_endpoints.py`           |    10 | 7.7 status/diff/commit/push (incl. real local-bare push)/PR/rollback/credentials |
-| `test_git_context.py`             |     5 | 7.9 `_latest_git_state_context` summary-only + mode folding (review/debug) |
-| `test_app_env.py`                 |     5 | 8.2 app-env set/list/delete presence-only, single value reader, redaction |
-| `test_vercel_connector.py`        |    11 | 8.4 token-in-header-only, redacted errors, deploy(gitSource repoId)/get/list/promote/env, url normalize, unlinked-error |
-| `test_vercel_endpoints.py`        |     8 | 8.4 credential/connector/env routes, deploy preview→confirm→ledger; 8.7 stuck-action reconciliation |
-| `test_ops_ledger.py`              |     5 | 8.4 OPS.md ledger write + no-leak + idempotency + judge-write rejection |
-| `test_phase8_invariants.py`       |     2 | 8.x orchestrator imports no connector; OPS.md excluded from judge sets |
-| `test_sandbox_supabase.py`        |     4 | 8.5 validate_supabase allow-list + destructive-by-subcommand + scrubbed env |
-| `test_supabase_connector.py`      |     5 | 8.5 migration apply secrets-in-env/destructive, redaction, Docker-missing, status |
-| `test_stripe_connector.py`        |     7 | 8.6 form-encoding+Idempotency-Key, test-mode/livemode gate, provision, webhook-secret-never-returned |
-| **Total**                         | **541** | (8.1 lifted `test_credentials` 8→16; 8.3 lifted `test_git_store` 7→12; 8.7 lifted `test_vercel_endpoints` 6→8) |
-
-Frontend: `npm run build` (tsc + vite) green.
+| File | Tests | Covers |
+|------|------:|--------|
+| `test_delegation_judge` | 15 | judge decisions, fallbacks, parsing |
+| `test_pending_execution` (+`_db`) | 17 / 6 | serialization, revision LLM, renderers; SQLite lifecycle + FK cleanup |
+| `test_memory_reconciliation` | 26 | parser, skip rules, e2e pipeline |
+| `test_inspect` | 29 | sandbox, parser, orchestrator loop |
+| `test_verification` (+`_inference`) | 21 / 23 | parser, runner integration; inference, multi-command, pytest probe, repair |
+| `test_browser_verification` | 29 | lifecycle, drainer, Playwright, multi-page capture |
+| `test_runner_diagnostics` | 9 | observed activity, `sweep_stuck_runs` |
+| `test_ui_browser_verification` | 15 | UI flow + visual review (diagnostic-only + skip) |
+| `test_preview` | 12 | preview registry, `deps_installed` |
+| `test_chat_first_endpoints` | 3 | browser-verify sub-status, preview start/stop |
+| `test_uploads` | 14 | sanitize/dedup/storage, workspace copy |
+| `test_providers` | 40 | six-provider registry, model/vision gating, env aliases, chat routing |
+| `test_planner` | 28 | heuristic gate, plan parse/fallback, graph |
+| `test_runner_planning` | 7 | plan→tasks integration: decompose, skip, gate |
+| `test_run_control` | 16 | events/task-card readers, cancel/retry, orphan guard, `since` cursor |
+| `test_llm_retry` | 4 | transient-vs-permanent LLM error classification |
+| `test_autonomy_hardening` | 11 | dependency skip, productive continuation, iterative repair |
+| `test_live_metrics` | 5 | progressive run-level + per-task metrics |
+| `test_visual_judge` | 16 | gate/skip, JSON parse, never-raises, model resolution |
+| `test_memory_engine` | 13 | apply_update policy/atomic/dedup; scaffold; write-path |
+| `test_memory_intake` | 10 | structured intake judge: parse, filter, reason, apply |
+| `test_intent_router` | 18 | mode `@`-command parser, `intent`, mode→prompt shaping |
+| `test_recovery` (+`_budget`) | 8 / 9 | assess_run non-green/idempotent; auto-recover gating/cap/decrement |
+| `test_context_loader` | 8 | `_compact_memory` identity/trim behavior |
+| `test_sandbox_git` (+`_supabase`) | 12 / 4 | run_shell block, validate_git/_supabase allow/deny + gating + scrubbed env |
+| `test_git_ops` | 12 | ensure_repo/checkpoint/diff+redact/commit-refusal/branch/rollback |
+| `test_git_store` | 12 | git/deploy RunRecord round-trip, artifacts, result.md sections |
+| `test_checkpoint_diff` | 4 | dispatch checkpoint + inherit, finalize diff capture |
+| `test_credentials` | 16 | multi-provider registry, redaction hardening, Stripe live-gate |
+| `test_github_connector` | 11 | remote parse/tokenless, status validate, push token-in-env, PR REST |
+| `test_git_endpoints` | 10 | status/diff/commit/push/PR/rollback/credentials routes |
+| `test_git_context` | 5 | `_latest_git_state_context` summary-only + mode folding |
+| `test_app_env` | 5 | app-env set/list/delete presence-only, value reader, redaction |
+| `test_vercel_connector` (+`_endpoints`) | 11 / 8 | token-in-header, redacted, deploy/get/list/promote/env, url normalize; routes + stuck-action reconcile |
+| `test_ops_ledger` | 5 | OPS.md ledger write + no-leak + idempotency + judge-write rejection |
+| `test_phase8_invariants` | 2 | orchestrator imports no connector; OPS.md excluded from judge sets |
+| `test_supabase_connector` | 5 | migration apply secrets-in-env/destructive, redaction, Docker-missing |
+| `test_stripe_connector` | 7 | form-encoding+Idempotency-Key, test/livemode gate, webhook-secret-never-returned |
+| `test_roles` | 11 | role registry contracts, tool sets, mode↔role map, coder fallback |
+| `test_patch_workspace` | 13 | overlay read/write/append/list/search, `.git` guard, unsafe-id containment, blocked executors |
+| `test_team_planner` | 18 | role/parallel parsing, wave layering, cycle handling, eligibility gate, id sanitization |
+| `test_integration` | 7 | clean apply, dedupe, first-writer-wins conflict, sandbox re-validation, failed-task output |
+| `test_team_runner` | 9 | end-to-end team path: parallel-overlap proof, isolation+integration, conflicts/apply-errors→partial, read-only bounce, findings flow, cancel mid-wave, sequential gate, one-unit-crash survival |
 
 ---
 
 ## Recommended Next Steps
 
 **Next up.**
-- **Auto-repair on a failed visual verdict.** Visual judgment is diagnostic-only
-  today; feed a `failed` verdict + evidence back as one bounded repair pass (reuse
-  the `_verify_with_repair` shape), then re-capture + re-judge once. Tightly
-  capped + opt-in.
-- **Per-view targeting.** Let a `## Browser Verification` block list explicit
-  views/paths to capture for apps whose nav isn't auto-discoverable.
+- **Auto-repair on a failed visual verdict** — feed a `failed` verdict + evidence
+  back as one bounded repair pass (reuse `_verify_with_repair`), then re-capture +
+  re-judge once. Capped + opt-in.
+- **Per-view targeting** — let a `## Browser Verification` block list explicit
+  views/paths for apps whose nav isn't auto-discoverable.
 
 **After that.**
-- **Streaming** (SSE on `/api/chat`) → touches `llm.py`, `orchestrator.py`, the
-  chat endpoint, `ChatPanel.tsx`.
-- **Run event stream** — replace 2s polling with a per-project SSE stream (shares
-  plumbing with streaming).
+- **Streaming** (SSE on `/api/chat`) → `llm.py`, `orchestrator.py`, the chat
+  endpoint, `ChatPanel.tsx`; then a **run event stream** replacing 2s polling.
 - **Cost / latency** — the 3–4 LLM calls/turn is the lever (cache the judge, merge
-  the memory judge into the main response via structured output, gate inspection).
+  the memory judge into the main response, gate inspection).
 
-**Longer-term, not committed.** Parallel / subagent task execution (`depends_on`
-is recorded but the runner is single-threaded); hard cancellation that kills the
-in-flight subprocess (today's is cooperative); cross-project memory linking;
-multi-user / shared deploy (needs auth + per-user workspaces + a different DB
-story).
+**Longer-term, not committed.** Deeper team parallelism (LLM-assisted conflict
+resolution beyond first-writer-wins; per-view preview servers per parallel unit);
+hard cancellation that kills the in-flight subprocess; cross-project memory
+linking; multi-user / shared deploy (needs auth + per-user workspaces + a
+different DB story).
 
 ---
 
