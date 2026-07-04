@@ -1332,6 +1332,7 @@ def api_cancel_run(project_id: str, run_id: str):
             orphan.status = RunStatus.CANCELLED
             orphan.completed_at = datetime.utcnow()
             orphan.cancel_requested = False
+            orphan.integration_state = None
             orphan.summary = "Run cancelled by user."
             blocker = "run cancelled by user (no active worker)"
             if blocker not in orphan.blockers:

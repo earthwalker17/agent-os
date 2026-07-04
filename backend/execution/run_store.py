@@ -7,6 +7,7 @@ Layout under `execution_workspaces/{project_id}/runs/{run_id}/`:
     run.json       — structured RunRecord serialization
     result.md      — human-readable result summary
     plan.json      — Phase 5 execution plan / task graph
+    integration.json — Phase 9 team-run integration detail (read on demand)
     diff.patch     — Phase 7 post-run diff (redacted, read on demand)
     deployment.json— Phase 8 redacted deploy contract + result (read on demand)
     deploy.log     — Phase 8 redacted build/CLI log (bounded, read on demand)
@@ -20,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -92,8 +94,23 @@ def read_task_card(project_id: str, run_id: str) -> tuple[str, str]:
     return title.strip(), rest.strip("\n")
 
 
+# Phase 9 — per-run append locks. A team run's parallel task units all append
+# to the SAME events.jsonl from different threads; bare `open("a")` appends can
+# tear a line if a write splits across syscalls, so every append takes the
+# run's lock. Negligible cost for the single-writer (sequential) case. The
+# registry grows one small Lock per run touched in this process — bounded in
+# practice and reclaimed on restart.
+_EVENT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_EVENT_LOCKS_GUARD = threading.Lock()
+
+
+def _event_lock(project_id: str, run_id: str) -> threading.Lock:
+    with _EVENT_LOCKS_GUARD:
+        return _EVENT_LOCKS.setdefault((project_id, run_id), threading.Lock())
+
+
 def append_event(project_id: str, run_id: str, event: dict[str, Any]) -> None:
-    """Append one JSON event line to events.jsonl.
+    """Append one JSON event line to events.jsonl (thread-safe per run).
 
     Caller is responsible for bounding the size of `event` — never dump full
     file contents or full stdout/stderr here.
@@ -101,8 +118,9 @@ def append_event(project_id: str, run_id: str, event: dict[str, Any]) -> None:
     payload = dict(event)
     payload.setdefault("timestamp", datetime.utcnow().isoformat() + "Z")
     line = json.dumps(payload, ensure_ascii=False, default=str)
-    with (get_run_dir(project_id, run_id) / "events.jsonl").open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    with _event_lock(project_id, run_id):
+        with (get_run_dir(project_id, run_id) / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def read_events(project_id: str, run_id: str) -> list[dict]:
@@ -223,6 +241,27 @@ def read_deployment_json(project_id: str, run_id: str) -> dict | None:
         return None
 
 
+# Phase 9 — the team run's integration detail (per-wave applied files,
+# conflicts, per-task decisions). The compact aggregate lives on
+# ``RunRecord.integration``; this artifact holds the full breakdown, read on
+# demand (never inlined into the main-agent context, §6).
+
+
+def write_integration_json(project_id: str, run_id: str, data: dict) -> None:
+    path = get_run_dir(project_id, run_id) / "integration.json"
+    _atomic_write_text(path, json.dumps(data, indent=2, default=str))
+
+
+def read_integration_json(project_id: str, run_id: str) -> dict | None:
+    path = get_run_dir(project_id, run_id) / "integration.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
 def write_deploy_log(project_id: str, run_id: str, content: str) -> None:
     text = content or ""
     if len(text) > _DEPLOY_LOG_MAX_CHARS:
@@ -311,6 +350,10 @@ def sweep_stuck_runs() -> list[str]:
                 )
             record.status = RunStatus.FAILED
             record.completed_at = datetime.utcnow()
+            # Phase 9 — settle the transient integration sub-status so a crash
+            # mid-integration can't leave the UI poll gates reading the run as
+            # active forever.
+            record.integration_state = None
             interrupted_msg = "run interrupted before finalize (server restart or crash)"
             if interrupted_msg not in record.blockers:
                 record.blockers = list(record.blockers) + [interrupted_msg]
@@ -397,8 +440,20 @@ def _render_plan_section(plan: Optional[ExecutionPlan]) -> str:
         lines.extend(f"- {r}" for r in plan.risks)
     lines.append("")
     lines.append("## Tasks")
+    # Phase 9 — team runs annotate each task with its role / wave / workspace
+    # so the trace reads at a glance; sequential runs render the legacy line
+    # byte-identical.
+    team = getattr(plan, "execution_mode", "sequential") == "team"
     for i, t in enumerate(plan.tasks, start=1):
-        lines.append(f"{i}. [{t.status.value}] {t.id} — {t.title}")
+        line = f"{i}. [{t.status.value}] {t.id} — {t.title}"
+        if team:
+            tags = [f"role: {t.role}"]
+            if t.wave is not None:
+                tags.append(f"wave {t.wave}")
+            if t.workspace == "patch":
+                tags.append("patch workspace")
+            line += f" ({', '.join(tags)})"
+        lines.append(line)
         if t.summary:
             lines.append(f"   - {t.summary}")
         if t.files_changed:
@@ -425,10 +480,37 @@ def render_result_md(record: RunRecord, summary: str, notes: str = "") -> str:
         f"{render_browser_verification_section(record.browser_verification)}\n"
         f"{_visual_review_block(record.visual_review)}"
         f"{_render_plan_section(record.plan)}"
+        f"{_integration_section(record)}"
         f"{_git_section(record)}"
         f"{_deployment_section(record)}"
         f"## Notes for Main Agent\n{notes.strip() or '_(none)_'}\n"
     )
+
+
+def _integration_section(record: RunRecord) -> str:
+    """Render the Phase 9 team-integration section for result.md.
+
+    Returns ``""`` for sequential runs (no ``integration`` on the record), so
+    legacy result.md output stays byte-identical. Compact aggregate only —
+    the per-wave / per-task breakdown lives in ``integration.json``.
+    """
+    integ = record.integration
+    if integ is None or not integ.enabled:
+        return ""
+    lines: list[str] = ["## Integration"]
+    lines.append(f"- waves: {integ.waves}")
+    lines.append(f"- files applied: {len(integ.files_applied)}")
+    if integ.conflicts:
+        lines.append(f"- conflicts: {len(integ.conflicts)}")
+        for c in integ.conflicts:
+            lines.append(
+                f"  - `{c.path}` — applied {c.applied_task}, rejected {c.rejected_task} (wave {c.wave})"
+            )
+    else:
+        lines.append("- conflicts: none")
+    if integ.notes:
+        lines.append(f"- notes: {integ.notes}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _git_section(record: RunRecord) -> str:

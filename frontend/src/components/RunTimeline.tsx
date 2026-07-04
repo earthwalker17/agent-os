@@ -77,9 +77,14 @@ function buildMilestones(events: RunEvent[]): Milestone[] {
 
       case 'task_started': {
         const id = str(e.task_id)
+        const role = str(e.role)
+        const wave = typeof e.wave === 'number' ? `wave ${e.wave}` : ''
+        const tags = [role && role !== 'coder' ? role : '', wave, e.parallel === true ? 'parallel' : '']
+          .filter(Boolean)
+          .join(' · ')
         upsert(`task:${id}`, {
           label: str(e.title) || `Task ${id}`,
-          detail: 'in progress…',
+          detail: tags ? `${tags} — in progress…` : 'in progress…',
           kind: 'running',
           time,
         })
@@ -97,6 +102,62 @@ function buildMilestones(events: RunEvent[]): Milestone[] {
         })
         break
       }
+
+      // Phase 9 — team execution milestones.
+      case 'team_execution_started': {
+        const waves = Array.isArray(e.waves) ? e.waves.length : undefined
+        upsert(`evt:${discreteSeq++}`, {
+          label: 'Team execution',
+          detail: waves != null ? `${waves} wave${waves === 1 ? '' : 's'}` : '',
+          kind: 'info',
+          time,
+        })
+        break
+      }
+      case 'wave_started': {
+        const n = typeof e.wave === 'number' ? e.wave : '?'
+        const par = Array.isArray(e.parallel) ? e.parallel.length : 0
+        upsert(`evt:${discreteSeq++}`, {
+          label: `Wave ${n} started`,
+          detail: par > 0 ? `${par} task${par === 1 ? '' : 's'} in parallel` : '',
+          kind: 'info',
+          time,
+        })
+        break
+      }
+      case 'integration_started': {
+        const n = typeof e.wave === 'number' ? e.wave : '?'
+        const tasks = Array.isArray(e.tasks) ? e.tasks.join(', ') : ''
+        upsert(`integration:${n}`, {
+          label: `Integrating wave ${n}`,
+          detail: tasks,
+          kind: 'running',
+          time,
+        })
+        break
+      }
+      case 'integration_completed': {
+        const n = typeof e.wave === 'number' ? e.wave : '?'
+        const applied = typeof e.applied === 'number' ? e.applied : 0
+        const conflicts = typeof e.conflicts === 'number' ? e.conflicts : 0
+        upsert(`integration:${n}`, {
+          label: `Wave ${n} integrated`,
+          detail: `${applied} file${applied === 1 ? '' : 's'} applied${
+            conflicts > 0 ? `, ${conflicts} conflict${conflicts === 1 ? '' : 's'}` : ''
+          }`,
+          kind: conflicts > 0 ? 'warning' : 'completed',
+          time,
+        })
+        break
+      }
+      case 'integration_conflict':
+        upsert(`evt:${discreteSeq++}`, {
+          label: 'Integration conflict',
+          detail: `${str(e.path)} — kept ${str(e.applied_task)}, rejected ${str(e.rejected_task)}`,
+          kind: 'failed',
+          time,
+        })
+        break
 
       case 'verification_started': {
         const n = typeof e.commands === 'number' ? e.commands : undefined

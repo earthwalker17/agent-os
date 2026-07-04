@@ -30,7 +30,8 @@ function isActive(r: RunRecord | null): boolean {
     r.verification_state === 'verifying' ||
     r.verification_state === 'repairing' ||
     r.browser_verification_state === 'running' ||
-    r.git_state != null
+    r.git_state != null ||
+    r.integration_state != null
   )
 }
 
@@ -312,6 +313,9 @@ function PlanBlock({ plan }: { plan: ExecutionPlan | null | undefined }): JSX.El
       )}
       <div>
         {plan.mode && <span className="run-detail-verify-meta">{plan.mode}</span>}
+        {plan.execution_mode === 'team' && (
+          <span className="run-detail-verify-meta">team execution</span>
+        )}
         <span className="run-detail-verify-meta">
           {tasks.length} task{tasks.length === 1 ? '' : 's'}
         </span>
@@ -326,7 +330,16 @@ function PlanBlock({ plan }: { plan: ExecutionPlan | null | undefined }): JSX.El
         {tasks.map((t) => (
           <li key={t.id}>
             <span className={`run-verify-status status-${t.status}`}>{t.status}</span>
+            {plan.execution_mode === 'team' && t.role && (
+              <span className={`run-detail-task-role role-${t.role}`}>{t.role}</span>
+            )}
             <span className="run-detail-task-title">{t.title}</span>
+            {plan.execution_mode === 'team' && t.wave != null && (
+              <span className="run-detail-verify-meta">wave {t.wave}</span>
+            )}
+            {plan.execution_mode === 'team' && t.workspace === 'patch' && (
+              <span className="run-detail-verify-meta">patch workspace</span>
+            )}
             {t.depends_on && t.depends_on.length > 0 && (
               <span className="run-detail-verify-meta">after {t.depends_on.join(', ')}</span>
             )}
@@ -337,6 +350,53 @@ function PlanBlock({ plan }: { plan: ExecutionPlan | null | undefined }): JSX.El
           </li>
         ))}
       </ol>
+    </div>
+  )
+}
+
+/** Phase 9 — the team run's integration outcome (roster + merge decisions). */
+function IntegrationBlock({ record }: { record: RunRecord }): JSX.Element | null {
+  const integ = record.integration
+  if (!integ || !integ.enabled) return null
+  const conflicts = integ.conflicts ?? []
+  const applied = integ.files_applied ?? []
+  return (
+    <div className="run-detail-plan">
+      <div>
+        <span className="run-detail-verify-meta">
+          {integ.waves ?? 0} wave{(integ.waves ?? 0) === 1 ? '' : 's'} integrated
+        </span>
+        <span className="run-detail-verify-meta">
+          {applied.length} file{applied.length === 1 ? '' : 's'} applied
+        </span>
+        <span
+          className={`run-verify-status status-${conflicts.length > 0 ? 'failed' : 'passed'}`}
+        >
+          {conflicts.length > 0
+            ? `${conflicts.length} conflict${conflicts.length === 1 ? '' : 's'}`
+            : 'no conflicts'}
+        </span>
+      </div>
+      {applied.length > 0 && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Files applied</span>
+          {bullets(applied)}
+        </div>
+      )}
+      {conflicts.length > 0 && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">Conflicts</span>
+          <ul className="run-detail-list">
+            {conflicts.map((c, i) => (
+              <li key={i}>
+                <code>{c.path}</code> — applied {c.applied_task}, rejected {c.rejected_task}
+                {c.wave != null ? ` (wave ${c.wave})` : ''}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {integ.notes && <div className="run-detail-task-blockers">{integ.notes}</div>}
     </div>
   )
 }
@@ -559,6 +619,13 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
                 <section className="run-detail-result">
                   <h4>Plan &amp; Tasks</h4>
                   <PlanBlock plan={record.plan} />
+                </section>
+              )}
+
+              {record.integration?.enabled && (
+                <section className="run-detail-result">
+                  <h4>Team Integration</h4>
+                  <IntegrationBlock record={record} />
                 </section>
               )}
 

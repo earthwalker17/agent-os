@@ -73,15 +73,28 @@ class TaskStatus(str, Enum):
 
 
 class ExecutionTask(BaseModel):
-    """One unit of work in a run's execution plan (Phase 5).
+    """One unit of work in a run's execution plan (Phase 5, team-aware in 9).
 
     The planner breaks a complex task card into an ordered, optionally
-    dependency-linked list of these. The runner executes them one at a time
-    (single-threaded this phase) and mutates each task's ``status`` + result
-    fields in place as it goes, so a poll of run.json shows live progress.
+    dependency-linked list of these. The runner executes them wave by wave
+    (Phase 9: independent parallel-safe tasks in a wave may run concurrently;
+    everything else stays sequential) and mutates each task's ``status`` +
+    result fields in place as it goes, so a poll of run.json shows live
+    progress.
 
-    ``depends_on`` references other tasks by ``id``; it is honored for ordering
-    and skip-on-failure today and leaves room for future parallel execution.
+    ``depends_on`` references other tasks by ``id`` and is honored for
+    ordering and skip-on-failure.
+
+    Phase 9 team fields (all defaulted so old plan.json round-trips):
+
+    - ``role`` — the agent role executing this task (see ``roles.py``;
+      normalized to a registry-known execution role at plan parse).
+    - ``parallel_safe`` — the planner marked this task safe to run
+      concurrently with independent siblings in the same wave.
+    - ``wave`` — the topological wave index the runner scheduled this task
+      into (stamped at team-execution start; ``None`` for sequential runs).
+    - ``workspace`` — where the task executed: ``"main"`` (the shared repo)
+      or ``"patch"`` (an isolated patch workspace, integrated afterwards).
     """
 
     id: str
@@ -94,6 +107,11 @@ class ExecutionTask(BaseModel):
     commands_run: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     steps_used: int = 0
+    # Phase 9 — team execution.
+    role: str = "coder"
+    parallel_safe: bool = False
+    wave: Optional[int] = None
+    workspace: str = "main"  # "main" | "patch"
 
 
 class ExecutionPlan(BaseModel):
@@ -111,6 +129,11 @@ class ExecutionPlan(BaseModel):
         single-task plan covering the whole card was substituted.
 
     ``tasks`` carries the live task statuses, mutated in place during execution.
+
+    **Phase 9:** ``execution_mode`` records how the runner executed the plan —
+    ``"sequential"`` (the legacy one-task-at-a-time loop) or ``"team"`` (wave
+    scheduling with bounded parallel execution + integration). Distinct from
+    ``mode`` (how the plan was *formed*); defaulted so old artifacts round-trip.
     """
 
     goal: str = ""
@@ -119,6 +142,8 @@ class ExecutionPlan(BaseModel):
     tasks: list[ExecutionTask] = Field(default_factory=list)
     mode: str = "simple"  # "planned" | "simple" | "fallback"
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # Phase 9 — how the plan was executed.
+    execution_mode: str = "sequential"  # "sequential" | "team"
 
 
 class VerificationCommandResult(BaseModel):
@@ -288,6 +313,39 @@ class VisualReviewResult(BaseModel):
     model: Optional[str] = None
     duration_ms: Optional[int] = None
     skipped_reason: str = ""
+
+
+class IntegrationConflict(BaseModel):
+    """One file two same-wave tasks both wrote with different content (Phase 9).
+
+    Integration is deterministic and never silent: the first task in plan
+    order wins (``applied_task``), the other version is NOT applied
+    (``rejected_task`` — its full output remains inspectable in its patch
+    workspace), and the conflict is surfaced as a blocker on the run. A run
+    with conflicts can never finish better than ``partial``.
+    """
+
+    path: str
+    applied_task: str
+    rejected_task: str
+    wave: int = 0
+
+
+class IntegrationResult(BaseModel):
+    """Aggregate outcome of the team run's integration stages (Phase 9).
+
+    Compact, record-level view (mirrored into run.json). The per-wave /
+    per-task detail lives in the standalone ``integration.json`` artifact and
+    each task's patch-workspace ``manifest.json`` — never inlined here (§6
+    context hygiene). ``enabled`` is False for sequential runs (the field is
+    then omitted from result.md, keeping legacy output byte-identical).
+    """
+
+    enabled: bool = False
+    waves: int = 0
+    files_applied: list[str] = Field(default_factory=list)
+    conflicts: list[IntegrationConflict] = Field(default_factory=list)
+    notes: str = ""
 
 
 class RecoveryAssessment(BaseModel):
@@ -468,6 +526,14 @@ class RunRecord(BaseModel):
     deployment_target: Optional[str] = None
     deploy_state: Optional[str] = None
     external_state: Optional[str] = None
+    # Phase 9 — team execution. ``integration`` is the compact aggregate of the
+    # run's integration stages (``None`` for sequential runs and older records;
+    # detail lives in the ``integration.json`` artifact + per-task patch
+    # manifests). ``integration_state`` is the transient sub-status while a
+    # wave's patches merge into the shared repo ("integrating"); ``None`` at
+    # rest. Mirrors ``verification_state``/``git_state``; NOT a RunStatus.
+    integration: Optional[IntegrationResult] = None
+    integration_state: Optional[str] = None
 
 
 class ResultSummary(BaseModel):

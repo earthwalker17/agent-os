@@ -182,7 +182,15 @@ class ProjectSandbox:
     def repo_dir(self) -> Path:
         return self.workspace_dir / "repo"
 
-    def resolve_repo_path(self, relative_path: str) -> Path:
+    def resolve_under(self, root: Path, relative_path: str) -> Path:
+        """Validate ``relative_path`` and resolve it under ``root``.
+
+        The single path-validation chokepoint: rejects absolute paths, ``..``
+        traversal, sensitive names, and anything that escapes ``root``.
+        ``resolve_repo_path`` delegates here with the canonical repo root;
+        the Phase 9 patch-workspace runtime passes its isolated overlay root
+        so patch workspaces inherit the exact same rules.
+        """
         if relative_path is None or not isinstance(relative_path, str):
             raise SandboxViolation("path must be a non-empty string")
 
@@ -214,21 +222,28 @@ class ProjectSandbox:
                 raise SandboxViolation(
                     f"sensitive path is not accessible: {relative_path!r}"
                 )
+            # The whole ``.git`` directory is off-limits to the file tools — not
+            # just ``.git/config``. Writing e.g. ``.git/hooks/pre-commit`` would
+            # let a repo write run arbitrary code at the next commit, and the
+            # audited Git surface (`run_git`) never routes through here. (Widened
+            # from the old ``.git/config``-substring check.)
+            if lowered_part == ".git":
+                raise SandboxViolation(
+                    f"sensitive path is not accessible: {relative_path!r}"
+                )
 
-        if ".git/config" in normalized.lower():
-            raise SandboxViolation(
-                f"sensitive path is not accessible: {relative_path!r}"
-            )
-
-        repo = self.repo_dir.resolve()
-        target = (repo / candidate).resolve()
+        base = root.resolve()
+        target = (base / candidate).resolve()
         try:
-            target.relative_to(repo)
+            target.relative_to(base)
         except ValueError:
             raise SandboxViolation(
                 f"path escapes repo sandbox: {relative_path!r}"
             )
         return target
+
+    def resolve_repo_path(self, relative_path: str) -> Path:
+        return self.resolve_under(self.repo_dir, relative_path)
 
     def validate_command(self, command: str) -> None:
         if command is None or not isinstance(command, str) or not command.strip():

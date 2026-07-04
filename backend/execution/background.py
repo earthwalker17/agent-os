@@ -361,6 +361,16 @@ class BackgroundRunManager:
         record.status = RunStatus.FAILED
         record.completed_at = datetime.utcnow()
         record.blockers = list(record.blockers) + [error_line]
+        # Settle every transient sub-status so a crash mid-phase can't leave the
+        # UI poll gates treating a terminal run as active forever (the other
+        # settle paths — _finalize_cancelled / sweep_stuck_runs / orphan-cancel —
+        # already clear these; the in-process crash handler must too).
+        record.verification_state = None
+        record.browser_verification_state = None
+        record.integration_state = None
+        record.git_state = None
+        record.deploy_state = None
+        record.external_state = None
         run_store.write_run_json(project_id, run_id, record)
         run_store.append_event(
             project_id,

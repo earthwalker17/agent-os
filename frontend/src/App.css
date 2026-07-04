@@ -2393,6 +2393,69 @@ html, body, #root {
   color: var(--text);
 }
 
+/* Phase 9 — team execution: integrating phase, wave headers, role chips. */
+.run-chat-phase.phase-integrating {
+  color: #d8b46a;
+  border-color: #7a5f2a;
+  background: rgba(216, 180, 106, 0.08);
+}
+
+.run-chat-wave-header {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted, #8a93a6);
+  margin-top: 4px;
+}
+
+.run-chat-task-role,
+.run-detail-task-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid #2a4a7a;
+  color: #6ab3ff;
+  background: rgba(106, 179, 255, 0.08);
+  white-space: nowrap;
+}
+
+.run-chat-task-role.role-reviewer,
+.run-detail-task-role.role-reviewer {
+  color: #d8b46a;
+  border-color: #7a5f2a;
+  background: rgba(216, 180, 106, 0.08);
+}
+
+.run-chat-task-role.role-inspector,
+.run-detail-task-role.role-inspector {
+  color: #9bd86a;
+  border-color: #4f7a2a;
+  background: rgba(155, 216, 106, 0.08);
+}
+
+.run-chat-task-ws {
+  font-size: 10px;
+  color: var(--text-muted, #8a93a6);
+  border: 1px dashed var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  white-space: nowrap;
+}
+
+.run-trace-task-chip {
+  font-size: 10px;
+  color: #6ab3ff;
+  border: 1px solid #2a4a7a;
+  border-radius: 3px;
+  padding: 0 4px;
+  white-space: nowrap;
+  align-self: center;
+}
+
 .run-detail-actions {
   display: flex;
   align-items: center;

@@ -184,6 +184,14 @@ export interface ExecutionTask {
   commands_run?: string[]
   blockers?: string[]
   steps_used?: number
+  /** Phase 9 — the agent role executing this task ('coder' | 'reviewer' | 'inspector'). */
+  role?: string
+  /** Phase 9 — the planner marked this task safe to run beside independent siblings. */
+  parallel_safe?: boolean
+  /** Phase 9 — the topological wave the runner scheduled this task into (team runs). */
+  wave?: number | null
+  /** Phase 9 — where the task executed: the shared repo or an isolated patch workspace. */
+  workspace?: 'main' | 'patch'
 }
 
 /** Phase 6 — Main-Agent recovery assessment of a non-green run. */
@@ -210,6 +218,25 @@ export interface ExecutionPlan {
   /** 'planned' (LLM-decomposed), 'simple' (single task), 'fallback' (planning failed). */
   mode?: 'planned' | 'simple' | 'fallback'
   created_at?: string
+  /** Phase 9 — how the runner executed the plan: legacy sequential loop or team waves. */
+  execution_mode?: 'sequential' | 'team'
+}
+
+/** Phase 9 — one integration conflict (two tasks wrote the same path differently). */
+export interface IntegrationConflict {
+  path: string
+  applied_task: string
+  rejected_task: string
+  wave?: number
+}
+
+/** Phase 9 — compact aggregate of a team run's integration stages. */
+export interface IntegrationResult {
+  enabled: boolean
+  waves?: number
+  files_applied?: string[]
+  conflicts?: IntegrationConflict[]
+  notes?: string
 }
 
 export interface RunRecord {
@@ -300,6 +327,10 @@ export interface RunRecord {
   deploy_state?: 'deploying' | 'building' | 'redeploying' | 'rolling_back' | null
   /** Umbrella transient sub-status for any in-flight external action (UI poll gate). */
   external_state?: string | null
+  /** Phase 9 — compact team-run integration aggregate (null for sequential runs). */
+  integration?: IntegrationResult | null
+  /** Phase 9 — transient sub-status while a wave's patches merge; null at rest. */
+  integration_state?: 'integrating' | null
 }
 
 /** Task 06.2D — managed preview dev-server status. */

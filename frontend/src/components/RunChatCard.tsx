@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { RunRecord } from '../types'
 import GitOpsPanel from './GitOpsPanel'
 import DeployOpsPanel from './DeployOpsPanel'
@@ -42,6 +42,8 @@ const RETRYABLE = new Set(['partial', 'blocked', 'failed', 'cancelled'])
 function derivePhase(r: RunRecord): string | null {
   if (r.status !== 'running') return null
   if (r.cancel_requested) return 'cancelling'
+  // Phase 9 — a wave's patch workspaces are merging into the shared repo.
+  if (r.integration_state === 'integrating') return 'integrating'
   if (r.verification_state === 'repairing') return 'repairing'
   if (r.verification_state === 'verifying') return 'verifying'
   if (r.browser_verification_state === 'running') return 'browser verification'
@@ -134,6 +136,8 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
   // Phase 8 — a deploy/redeploy finalizes off-thread; keep polling so the card
   // reflects the settled deployment URL when it lands.
   const deployInFlight = record?.deploy_state != null || record?.external_state != null
+  // Phase 9 — a team run's integration window sets a transient sub-status.
+  const integrationInFlight = record?.integration_state != null
   const shouldPoll =
     isRunning ||
     commandVerifyingState ||
@@ -141,7 +145,8 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
     verifying ||
     needsSettle ||
     gitInFlight ||
-    deployInFlight
+    deployInFlight ||
+    integrationInFlight
   useEffect(() => {
     if (!shouldPoll) return
     const id = window.setInterval(() => {
@@ -291,6 +296,11 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
   const phase = derivePhase(record)
   const tasks = record.plan?.tasks ?? []
   const isMultiTask = tasks.length > 1
+  // Phase 9 — team runs group the checklist by wave (stable within a wave).
+  const isTeam = record.plan?.execution_mode === 'team'
+  const displayTasks = isTeam
+    ? [...tasks].sort((a, b) => (a.wave ?? 999) - (b.wave ?? 999))
+    : tasks
   const bv = record.browser_verification
   const cv = record.verification
   const verifyingNow = verifying || record.browser_verification_state === 'running'
@@ -400,14 +410,34 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
         </div>
       )}
 
-      {/* --- task checklist for multi-task runs (live, from run.json) --- */}
+      {/* --- task checklist for multi-task runs (live, from run.json).
+           Phase 9 team runs group tasks by wave and tag each with its role. --- */}
       {isMultiTask && (
         <ul className="run-chat-tasklist">
-          {tasks.map((t) => (
-            <li key={t.id} className="run-chat-task">
-              <span className={`run-verify-status status-${t.status}`}>{t.status}</span>
-              <span className="run-chat-task-title">{t.title}</span>
-            </li>
+          {displayTasks.map((t, i) => (
+            <Fragment key={t.id}>
+              {isTeam && t.wave != null && (i === 0 || displayTasks[i - 1].wave !== t.wave) && (
+                <li className="run-chat-wave-header">
+                  wave {t.wave}
+                  {displayTasks.filter((x) => x.wave === t.wave).length > 1 ? ' · parallel' : ''}
+                </li>
+              )}
+              <li className="run-chat-task">
+                <span className={`run-verify-status status-${t.status}`}>{t.status}</span>
+                {isTeam && t.role && (
+                  <span className={`run-chat-task-role role-${t.role}`}>{t.role}</span>
+                )}
+                <span className="run-chat-task-title">{t.title}</span>
+                {isTeam && t.workspace === 'patch' && (
+                  <span
+                    className="run-chat-task-ws"
+                    title="Ran in an isolated patch workspace, integrated afterwards"
+                  >
+                    patch
+                  </span>
+                )}
+              </li>
+            </Fragment>
           ))}
         </ul>
       )}
@@ -441,6 +471,19 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
           )}
           {canVerify && !verifyingNow && !hadVerifyAttempt && (
             <p className="run-chat-muted">Browser verification has not been run yet.</p>
+          )}
+          {/* Phase 9 — team-run integration outcome. */}
+          {record.integration?.enabled && (
+            <p className="run-chat-muted run-chat-integration">
+              🧩 Integration: {record.integration.files_applied?.length ?? 0} file
+              {(record.integration.files_applied?.length ?? 0) === 1 ? '' : 's'} merged
+              {(record.integration.conflicts?.length ?? 0) > 0
+                ? `, ${record.integration.conflicts!.length} conflict${
+                    record.integration.conflicts!.length === 1 ? '' : 's'
+                  } — see Details`
+                : ', no conflicts'}
+              .
+            </p>
           )}
           {/* Phase 6 — Main Agent memory reconciliation outcome. */}
           {memTag && (

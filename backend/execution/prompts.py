@@ -312,7 +312,9 @@ No prose, no markdown fences, no commentary. Two action types:
       "id": "t1",
       "title": "<short imperative title>",
       "description": "<concretely, what this task does>",
-      "depends_on": []
+      "depends_on": [],
+      "role": "coder",
+      "parallel": false
     }}
   ]
 }}
@@ -327,6 +329,20 @@ Planning rules:
 - Each task's description must be concrete enough to execute on its own.
 - You have a small planning budget ({max_plan_steps} steps). Inspect only what
   you need, then emit the `plan` action.
+
+Team fields (optional — omit them for simple sequential plans):
+- `role`: who executes the task. `"coder"` (default) writes code and files;
+  `"reviewer"` READS the workspace and reports defects (writes nothing);
+  `"inspector"` READS the workspace and gathers facts for later tasks
+  (writes nothing).
+- `parallel`: set `true` ONLY for a coder task that (a) shares no
+  `depends_on` ordering with the other parallel tasks it would run beside,
+  (b) touches files NO other task touches (disjoint file sets — e.g.
+  separate modules/components), and (c) needs no shell commands (parallel
+  tasks run in isolated patch workspaces where `run_shell` is unavailable;
+  installs/builds/tests belong to the automatic verification step instead).
+  When in doubt, leave it `false` — sequential is always safe. Reviewer and
+  inspector tasks are read-only and may run in parallel automatically.
 """
 
 
@@ -374,12 +390,24 @@ Respond with one JSON action only.
 """
 
 
-def build_system_prompt(agent_md: str, project_id: str, max_steps: int) -> str:
-    return SYSTEM_PROMPT_TEMPLATE.format(
+def build_system_prompt(
+    agent_md: str, project_id: str, max_steps: int, role_block: str = ""
+) -> str:
+    """Build the Coding Agent system prompt.
+
+    ``role_block`` (Phase 9) is an optional role-contract overlay (from
+    ``roles.py``) appended for task units running under a non-default agent
+    role. Empty (the default, and always for the coder) keeps the prompt
+    byte-identical to the legacy output.
+    """
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(
         agent_md=agent_md.strip() or "(AGENT.md is empty)",
         project_id=project_id,
         max_steps=max_steps,
     )
+    if role_block.strip():
+        prompt += f"\n# Your role in this run\n{role_block.strip()}\n"
+    return prompt
 
 
 def build_initial_user_prompt(title: str, task_card: str, task_md: str) -> str:
@@ -465,6 +493,7 @@ def build_task_unit_user_prompt(
     prior_context: str,
     task_md: str,
     degraded_dependencies: list[str] | None = None,
+    role_note: str = "",
 ) -> str:
     deps = [d for d in (degraded_dependencies or []) if d and d.strip()]
     if deps:
@@ -480,6 +509,12 @@ def build_task_unit_user_prompt(
         )
     else:
         degraded_note = ""
+    # Phase 9 — fold an optional role / isolation note (from roles.py) into
+    # the degraded-note slot so the template itself stays unchanged. Empty
+    # (the default, and always on the sequential path) keeps the prompt
+    # byte-identical to the legacy output.
+    if role_note.strip():
+        degraded_note = f"\n# Your role for this task\n{role_note.strip()}\n" + degraded_note
     return TASK_UNIT_USER_PROMPT_TEMPLATE.format(
         goal=goal.strip() or "(no goal stated)",
         task_no=task_no,

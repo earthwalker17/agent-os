@@ -27,6 +27,7 @@ import re
 from typing import Any, Optional
 
 from .models import ExecutionPlan, ExecutionTask, TaskSpec, TaskStatus
+from .roles import get_role, normalize_role_id
 
 
 # Upper bound on tasks in a single plan. The planning prompt asks for a small
@@ -48,6 +49,20 @@ _COMPLEX_CLAUSE_THRESHOLD = 3
 _LIST_ITEM_REGEX = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", re.MULTILINE)
 _SENTENCE_SPLIT_REGEX = re.compile(r"[.!?]+")
 _CLAUSE_SPLIT_REGEX = re.compile(r",|\band\b|&|;", re.IGNORECASE)
+
+# A task id is used verbatim as a filesystem path segment for its Phase 9 patch
+# workspace (``patches/{run_id}/{task_id}/``), so it MUST be a safe single
+# segment. The LLM emits ids freely, so anything with a path separator, ``..``,
+# or exotic characters is rejected at parse time and replaced with ``t{idx}``
+# (see ``_safe_task_id``) — closing an out-of-sandbox-write path escape.
+_SAFE_TASK_ID_REGEX = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def is_safe_task_id(tid: str) -> bool:
+    """Whether ``tid`` is a safe single path segment (no separators / traversal)."""
+    if not isinstance(tid, str) or not _SAFE_TASK_ID_REGEX.match(tid):
+        return False
+    return tid not in (".", "..")
 
 
 class PlanParseError(Exception):
@@ -150,7 +165,11 @@ def plan_from_dict(data: dict[str, Any], task: TaskSpec) -> ExecutionPlan:
         if not isinstance(raw, dict):
             continue
         tid = str(raw.get("id") or "").strip()
-        if not tid or tid in used_ids:
+        # Reject unsafe ids (path separators / traversal / exotic chars) — the id
+        # becomes a filesystem path segment for the task's patch workspace, so an
+        # unsanitized id could escape the sandbox. Unsafe / empty / duplicate ids
+        # fall back to the positional ``t{idx}``.
+        if not is_safe_task_id(tid) or tid in used_ids:
             tid = f"t{idx}"
         # Guard against a generated id colliding with a later explicit one.
         while tid in used_ids:
@@ -163,6 +182,14 @@ def plan_from_dict(data: dict[str, Any], task: TaskSpec) -> ExecutionPlan:
             for d in (raw.get("depends_on") or [])
             if isinstance(d, (str, int)) and str(d).strip()
         ]
+        # Phase 9 — team fields, parsed tolerantly. Unknown/absent role falls
+        # back to the coder; ``parallel`` accepts a bool or a truthy string.
+        role = normalize_role_id(raw.get("role"))
+        parallel_raw = raw.get("parallel", raw.get("parallel_safe", False))
+        if isinstance(parallel_raw, bool):
+            parallel_safe = parallel_raw
+        else:
+            parallel_safe = str(parallel_raw).strip().lower() in ("true", "1", "yes")
         tasks.append(
             ExecutionTask(
                 id=tid,
@@ -170,6 +197,8 @@ def plan_from_dict(data: dict[str, Any], task: TaskSpec) -> ExecutionPlan:
                 description=description,
                 depends_on=depends_on,
                 status=TaskStatus.PENDING,
+                role=role,
+                parallel_safe=parallel_safe,
             )
         )
 
@@ -358,6 +387,88 @@ def degraded_dependencies(
             state = dep.status.value
         notes.append(f"{dep.id} ({dep.title}): {state}")
     return notes
+
+
+# ---------- Phase 9 — team scheduling helpers ----------
+
+# Bounded parallelism: at most this many agents run concurrently inside one
+# team run. Deliberately small — correctness and auditability over maximum
+# parallelism (BLUEPRINT Pillar 3); the per-run scheduler chunks larger waves.
+MAX_PARALLEL_AGENTS = 3
+
+
+def compute_waves(
+    tasks: list[ExecutionTask],
+) -> tuple[list[list[ExecutionTask]], set[str]]:
+    """Layer the task graph into topological waves (Kahn layering).
+
+    Wave N contains every task whose dependencies all sit in waves < N, so
+    tasks within one wave never depend on each other. Returns
+    ``(waves, cyclic_ids)`` — tasks caught in a dependency cycle are appended
+    as one final wave in original order and reported in ``cyclic_ids`` so the
+    scheduler can force them sequential (a cycle means the planner's ordering
+    intent is unknowable; running them concurrently would be a guess).
+    Dependency ids no task provides are ignored (already pruned by
+    ``plan_from_dict``).
+    """
+    by_id = {t.id: t for t in tasks}
+    deps: dict[str, set[str]] = {
+        t.id: {d for d in t.depends_on if d in by_id and d != t.id} for t in tasks
+    }
+    order_index = {t.id: i for i, t in enumerate(tasks)}
+
+    waves: list[list[ExecutionTask]] = []
+    placed: set[str] = set()
+    remaining = [t.id for t in tasks]
+    while remaining:
+        ready = [tid for tid in remaining if deps[tid] <= placed]
+        if not ready:
+            break  # cycle remainder
+        ready.sort(key=order_index.get)
+        waves.append([by_id[tid] for tid in ready])
+        placed.update(ready)
+        remaining = [tid for tid in remaining if tid not in placed]
+
+    cyclic: set[str] = set(remaining)
+    if remaining:
+        remaining.sort(key=order_index.get)
+        waves.append([by_id[tid] for tid in remaining])
+    return waves, cyclic
+
+
+def task_parallel_eligible(task: ExecutionTask) -> bool:
+    """Whether a task may run concurrently with siblings in its wave.
+
+    Read-only roles (reviewer / inspector) are inherently parallel-safe —
+    they cannot mutate anything. Write tasks are eligible only when the
+    planner explicitly marked them ``parallel_safe`` (conservative default:
+    sequential).
+    """
+    if get_role(task.role).read_only:
+        return True
+    return bool(task.parallel_safe)
+
+
+def plan_is_team_eligible(plan: ExecutionPlan) -> bool:
+    """Whether the runner should use the team (wave / parallel) path.
+
+    Conservative gate: only an LLM-planned multi-task plan where at least one
+    wave holds two or more runnable, parallel-eligible tasks. Everything else
+    keeps the legacy sequential loop byte-identical.
+    """
+    if plan.mode != "planned":
+        return False
+    runnable = [t for t in plan.tasks if t.status != TaskStatus.SKIPPED]
+    if len(runnable) < 2:
+        return False
+    waves, cyclic = compute_waves(runnable)
+    for wave in waves:
+        eligible = [
+            t for t in wave if t.id not in cyclic and task_parallel_eligible(t)
+        ]
+        if len(eligible) >= 2:
+            return True
+    return False
 
 
 def task_status_from_final(final_status: str) -> TaskStatus:

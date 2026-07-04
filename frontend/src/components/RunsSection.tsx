@@ -35,7 +35,8 @@ function isActive(run: RunRecord): boolean {
     run.browser_verification_state === 'running' ||
     run.git_state != null ||
     run.deploy_state != null ||
-    run.external_state != null
+    run.external_state != null ||
+    run.integration_state != null
   )
 }
 
@@ -50,6 +51,8 @@ function phaseLabel(run: RunRecord): string | null {
   if (run.browser_verification_state === 'running') return 'verifying'
   if (run.status !== 'running') return null
   if (run.cancel_requested) return 'cancelling'
+  // Phase 9 — a team wave's patches are merging into the shared repo.
+  if (run.integration_state === 'integrating') return 'integrating'
   if (run.verification_state === 'repairing') return 'repairing'
   if (run.verification_state === 'verifying') return 'verifying'
   // (browser_verification_state === 'running' is handled above the status guard,

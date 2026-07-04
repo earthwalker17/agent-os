@@ -26,6 +26,7 @@ import json
 import logging
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ from .manager import get_execution_workspace, read_task_state, update_task_state
 from .models import (
     ExecutionPlan,
     ExecutionTask,
+    IntegrationResult,
     RunRecord,
     RunStatus,
     ResultSummary,
@@ -45,18 +47,31 @@ from .models import (
 )
 from .memory_reconciliation import reconcile_run_memory
 from .recovery import assess_run
+from .integration import integrate_wave
+from .patch_workspace import (
+    PatchToolRuntime,
+    collect_patch_files,
+    get_overlay_root,
+    init_patch_workspace,
+    write_patch_manifest,
+)
 from .planner import (
+    MAX_PARALLEL_AGENTS,
     MAX_TASKS,
     PlanParseError,
     aggregate_run_status,
+    compute_waves,
     degraded_dependencies,
     dependency_failed,
     fallback_plan,
     looks_complex,
     plan_from_dict,
+    plan_is_team_eligible,
+    task_parallel_eligible,
     task_status_from_final,
     topological_order,
 )
+from .roles import allowed_tools_for, get_role, patch_coder_prompt
 from .prompts import (
     build_continuation_prompt,
     build_correction_prompt,
@@ -191,6 +206,49 @@ class _RunCancelled(Exception):
     ``_llm_step`` / ``_dispatch_tool``, whose broad ``except`` clauses would
     otherwise swallow it).
     """
+
+
+class _UnitContext:
+    """Per-task-unit execution state for parallel (team) units (Phase 9).
+
+    The runner instance is stateful (observed lists, the live-metrics record,
+    ``_active_unit``) and those fields assume ONE active unit at a time. A
+    parallel unit therefore carries its own runtime + observation lists in
+    one of these; the coordinator thread merges them into the run-scoped
+    state as each unit settles, and remains the sole writer of run.json /
+    plan.json. ``ctx=None`` everywhere means "sequential unit" and preserves
+    the legacy self-backed behavior byte-identically.
+
+    ``allowed_tools`` (when set) is enforced in the tool loop — a call
+    outside the set is bounced back to the model with an explanation, the
+    same mechanism the planning loop uses for its read-only gate.
+    """
+
+    def __init__(
+        self,
+        runtime,
+        *,
+        task_id: str = "",
+        role: str = "",
+        allowed_tools: frozenset[str] | None = None,
+    ):
+        self.runtime = runtime
+        self.task_id = task_id
+        self.role = role
+        self.allowed_tools = allowed_tools
+        self.observed_files: list[str] = []
+        self.observed_cmds: list[str] = []
+        self.write_ops: int = 0
+
+    def event_extra(self) -> dict:
+        """Extra fields stamped onto this unit's events so a concurrent trace
+        can attribute every tool call / LLM step to its task + role."""
+        extra: dict = {}
+        if self.task_id:
+            extra["task_id"] = self.task_id
+        if self.role:
+            extra["role"] = self.role
+        return extra
 
 
 # ---------- public entry point ----------
@@ -546,6 +604,13 @@ class CodingAgentRunner:
             # Pass the raw final action through unchanged (incl. task_md_update).
             return final_action, loop_failed_reason
 
+        # --- team path (Phase 9): wave scheduling + bounded parallel execution
+        # + patch-workspace integration. Conservative gate — only LLM-planned
+        # multi-task plans with a wave of >= 2 parallel-eligible tasks; every
+        # other plan keeps the sequential loop below byte-identical.
+        if plan_is_team_eligible(plan):
+            return self._run_execution_phase_team(run_id, record, task, plan, task_md)
+
         # --- multi-task path
         by_id = {t.id: t for t in tasks}
         for idx, unit in enumerate(topological_order(tasks), start=1):
@@ -643,6 +708,581 @@ class CodingAgentRunner:
         }
         return synthetic, None
 
+    # ---------- team execution phase (Phase 9) ----------
+
+    def _run_execution_phase_team(
+        self,
+        run_id: str,
+        record: RunRecord,
+        task: TaskSpec,
+        plan: ExecutionPlan,
+        task_md: str,
+    ) -> tuple[dict | None, str | None]:
+        """Wave-scheduled team execution with bounded parallelism (Phase 9).
+
+        The plan's task graph is layered into topological *waves* (tasks in
+        one wave never depend on each other). Within a wave, parallel-eligible
+        tasks run concurrently on a dedicated bounded pool — coders inside
+        isolated patch workspaces, read-only roles (reviewer / inspector)
+        against the shared repo — then the wave's patches are integrated into
+        the shared repo deterministically (conflicts surfaced, never silent),
+        and any remaining wave tasks run sequentially in the main workspace
+        with the full tool set. The coordinator (this thread) is the ONLY
+        writer of run.json / plan.json / integration state; workers only
+        append (locked) attributed events.
+
+        The global verification gate is unchanged: the synthetic aggregate
+        final action flows into ``_finalize``, whose command/browser/visual
+        verification now runs over the *integrated* tree — a team run can
+        only be ``completed`` when the integrated result passes. Unresolved
+        integration conflicts cap the aggregate at ``partial``.
+        """
+        tasks = plan.tasks
+        by_id = {t.id: t for t in tasks}
+        idx_map = {t.id: i for i, t in enumerate(tasks, start=1)}
+        total = len(tasks)
+
+        # Surface pre-skipped (plan-cap overflow) tasks, mirroring the
+        # sequential path.
+        for unit in tasks:
+            if unit.status == TaskStatus.SKIPPED:
+                reason = unit.blockers[0] if unit.blockers else "skipped"
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {"type": "task_status", "task_id": unit.id, "status": "skipped", "reason": reason},
+                )
+
+        runnable = [t for t in tasks if t.status != TaskStatus.SKIPPED]
+        waves, cyclic = compute_waves(runnable)
+        plan.execution_mode = "team"
+        for wave_no, wave in enumerate(waves, start=1):
+            for t in wave:
+                t.wave = wave_no
+
+        integration_agg = IntegrationResult(enabled=True)
+        record.integration = integration_agg
+        wave_details: list[dict] = []
+        # Files that failed to APPLY at integration (distinct from a conflict —
+        # here NO version landed anywhere). Tracked so the aggregate never
+        # finishes green with silently dropped work.
+        integration_errors: list[str] = []
+        self._persist_progress(run_id, record, plan)
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {
+                "type": "team_execution_started",
+                "waves": [[t.id for t in w] for w in waves],
+                "max_parallel": MAX_PARALLEL_AGENTS,
+            },
+        )
+
+        for wave_no, wave in enumerate(waves, start=1):
+            if self._cancelled():
+                raise _RunCancelled()
+
+            # Dependency gate for this wave (deps settled in earlier waves).
+            ready: list[ExecutionTask] = []
+            for unit in wave:
+                dep_reason = dependency_failed(unit, by_id)
+                if dep_reason:
+                    unit.status = TaskStatus.SKIPPED
+                    if dep_reason not in unit.blockers:
+                        unit.blockers.append(dep_reason)
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {
+                            "type": "task_status",
+                            "task_id": unit.id,
+                            "status": "skipped",
+                            "reason": dep_reason,
+                            "role": unit.role,
+                            "wave": unit.wave,
+                        },
+                    )
+                    self._persist_progress(run_id, record, plan)
+                    continue
+                ready.append(unit)
+            if not ready:
+                continue
+
+            batch = [
+                u for u in ready if u.id not in cyclic and task_parallel_eligible(u)
+            ]
+            if len(batch) < 2:
+                batch = []  # a lone task gains nothing from a pool — run it inline
+            rest = [u for u in ready if u not in batch]
+
+            if batch:
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {
+                        "type": "wave_started",
+                        "wave": wave_no,
+                        "parallel": [u.id for u in batch],
+                        "sequential": [u.id for u in rest],
+                    },
+                )
+                self._run_parallel_batch(
+                    run_id, record, plan, batch, idx_map, total, task_md, by_id
+                )
+
+                # Integration: apply the wave's patch workspaces into the
+                # shared repo before any dependent work runs.
+                patch_units = [u for u in batch if u.workspace == "patch"]
+                if patch_units:
+                    record.integration_state = "integrating"
+                    self._persist_progress(run_id, record, plan)
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {
+                            "type": "integration_started",
+                            "wave": wave_no,
+                            "tasks": [u.id for u in patch_units],
+                        },
+                    )
+                    wave_integ = integrate_wave(
+                        self.project_id, run_id, wave_no, patch_units, self.runtime
+                    )
+                    integration_agg.waves += 1
+                    for p in wave_integ.applied:
+                        if p not in integration_agg.files_applied:
+                            integration_agg.files_applied.append(p)
+                    integration_agg.conflicts.extend(wave_integ.conflicts)
+                    if wave_integ.errors:
+                        integration_errors.extend(wave_integ.errors)
+                        note = f"{len(wave_integ.errors)} file(s) failed to apply"
+                        integration_agg.notes = (
+                            f"{integration_agg.notes}; {note}".strip("; ")
+                            if integration_agg.notes
+                            else note
+                        )
+                    wave_details.append(wave_integ.to_dict())
+                    try:
+                        run_store.write_integration_json(
+                            self.project_id, run_id, {"waves": wave_details}
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception("integration.json write failed for run %s", run_id)
+                    for c in wave_integ.conflicts:
+                        run_store.append_event(
+                            self.project_id,
+                            run_id,
+                            {
+                                "type": "integration_conflict",
+                                "wave": wave_no,
+                                "path": c.path,
+                                "applied_task": c.applied_task,
+                                "rejected_task": c.rejected_task,
+                            },
+                        )
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {
+                            "type": "integration_completed",
+                            "wave": wave_no,
+                            "applied": len(wave_integ.applied),
+                            "conflicts": len(wave_integ.conflicts),
+                            "errors": len(wave_integ.errors),
+                        },
+                    )
+                    record.integration_state = None
+                    self._persist_progress(run_id, record, plan)
+                if self._cancelled():
+                    raise _RunCancelled()
+
+            for unit in rest:
+                if self._cancelled():
+                    raise _RunCancelled()
+                # Re-check dependencies just-in-time (not only at wave entry): a
+                # cyclic-wave sibling may have just failed without output, in
+                # which case this task must skip exactly as the sequential path
+                # would — the wave-entry gate saw the sibling still PENDING.
+                dep_reason = dependency_failed(unit, by_id)
+                if dep_reason:
+                    unit.status = TaskStatus.SKIPPED
+                    if dep_reason not in unit.blockers:
+                        unit.blockers.append(dep_reason)
+                    run_store.append_event(
+                        self.project_id,
+                        run_id,
+                        {
+                            "type": "task_status",
+                            "task_id": unit.id,
+                            "status": "skipped",
+                            "reason": dep_reason,
+                            "role": unit.role,
+                            "wave": unit.wave,
+                        },
+                    )
+                    self._persist_progress(run_id, record, plan)
+                    continue
+                self._run_wave_unit_sequential(
+                    run_id, record, plan, unit, idx_map[unit.id], total, task_md, by_id
+                )
+
+        status, summary, blockers = aggregate_run_status(tasks)
+        summary += (
+            f" Team execution: {len(waves)} wave(s), "
+            f"{integration_agg.waves} integrated, "
+            f"{len(integration_agg.files_applied)} file(s) applied, "
+            f"{len(integration_agg.conflicts)} conflict(s)."
+        )
+        if integration_agg.conflicts or integration_errors:
+            # A conflicted OR error-hit integration is never silently green — an
+            # apply error means NO version of a file landed, which is strictly
+            # worse than a conflict, so it degrades status the same way.
+            if status == "completed":
+                status = "partial"
+            for c in integration_agg.conflicts:
+                line = (
+                    f"integration conflict on {c.path!r}: applied {c.applied_task}, "
+                    f"rejected {c.rejected_task} (wave {c.wave})"
+                )
+                if line not in blockers:
+                    blockers.append(line)
+            for err in integration_errors:
+                line = f"integration failed to apply a file: {err}"
+                if line not in blockers:
+                    blockers.append(line)
+        synthetic = {
+            "action": "final",
+            "status": status,
+            "summary": summary,
+            "files_changed": _dedup([f for t in tasks for f in t.files_changed]),
+            "commands_run": _dedup([c for t in tasks for c in t.commands_run]),
+            "blockers": blockers,
+            "task_md_update": "",
+        }
+        return synthetic, None
+
+    def _run_parallel_batch(
+        self,
+        run_id: str,
+        record: RunRecord,
+        plan: ExecutionPlan,
+        batch: list[ExecutionTask],
+        idx_map: dict[str, int],
+        total: int,
+        task_md: str,
+        by_id: dict[str, ExecutionTask],
+    ) -> None:
+        """Run one wave's parallel-eligible units concurrently (bounded).
+
+        A dedicated per-batch pool (NEVER the shared BackgroundRunManager
+        pool — a run occupying a shared worker that then blocks on futures in
+        the same pool can deadlock it). Prompts are snapshotted on the
+        coordinator thread before submission so workers never read mutating
+        plan state; each unit gets its own `_UnitContext` (runtime + activity
+        lists + enforced tool set); the coordinator settles results with
+        ``as_completed`` and remains the sole run.json/plan.json writer.
+        """
+        contexts: dict[str, _UnitContext] = {}
+        prompts: dict[str, tuple[str, str]] = {}
+
+        for unit in batch:
+            role = get_role(unit.role)
+            if role.read_only:
+                unit.workspace = "main"
+                runtime = self.runtime  # ToolRuntime is stateless; reads are safe
+            else:
+                unit.workspace = "patch"
+                overlay = init_patch_workspace(self.project_id, run_id, unit.id)
+                runtime = PatchToolRuntime(self.project_id, overlay)
+            contexts[unit.id] = _UnitContext(
+                runtime,
+                task_id=unit.id,
+                role=unit.role,
+                allowed_tools=allowed_tools_for(
+                    unit.role, in_patch_workspace=(unit.workspace == "patch")
+                ),
+            )
+            unit.status = TaskStatus.RUNNING
+            run_store.append_event(
+                self.project_id,
+                run_id,
+                {
+                    "type": "task_started",
+                    "task_id": unit.id,
+                    "title": unit.title,
+                    "role": unit.role,
+                    "wave": unit.wave,
+                    "workspace": unit.workspace,
+                    "parallel": True,
+                },
+            )
+
+        # Snapshot prompts AFTER all batch units are marked RUNNING so each
+        # unit's plan outline shows its siblings in flight.
+        for unit in batch:
+            role = get_role(unit.role)
+            degraded = degraded_dependencies(unit, by_id)
+            system_prompt = build_system_prompt(
+                self._agent_md, self.project_id, MAX_TASK_STEPS, role_block=role.prompt
+            )
+            role_note = patch_coder_prompt() if unit.workspace == "patch" else ""
+            initial = build_task_unit_user_prompt(
+                goal=plan.goal,
+                task_no=idx_map[unit.id],
+                task_total=total,
+                task_id=unit.id,
+                title=unit.title,
+                description=unit.description,
+                plan_outline=_render_plan_outline(plan.tasks, current_id=unit.id),
+                prior_context=_render_prior_context(plan.tasks),
+                task_md=task_md,
+                degraded_dependencies=degraded,
+                role_note=role_note,
+            )
+            prompts[unit.id] = (system_prompt, initial)
+
+        self._persist_progress(run_id, record, plan)
+
+        cancelled = False
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_PARALLEL_AGENTS, len(batch)),
+            thread_name_prefix=f"team-{run_id[-8:]}",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._run_parallel_unit,
+                    run_id,
+                    prompts[unit.id][0],
+                    prompts[unit.id][1],
+                    contexts[unit.id],
+                ): unit
+                for unit in batch
+            }
+            for fut in as_completed(futures):
+                unit = futures[fut]
+                ctx = contexts[unit.id]
+                try:
+                    final_action, fail_reason, unit_cancelled = fut.result()
+                except Exception as exc:  # noqa: BLE001 — defensive; worker catches its own
+                    final_action, fail_reason, unit_cancelled = (
+                        None,
+                        f"parallel unit crashed: {type(exc).__name__}: {exc}",
+                        False,
+                    )
+                if unit_cancelled:
+                    # Leave the unit RUNNING — _finalize_cancelled settles every
+                    # in-flight task to SKIPPED with a clear reason.
+                    cancelled = True
+                    continue
+                self._apply_unit_result_from_lists(
+                    unit,
+                    final_action,
+                    fail_reason,
+                    list(ctx.observed_files),
+                    list(ctx.observed_cmds),
+                )
+                # Merge the unit's activity into the run-scoped observation
+                # lists (coordinator thread only) + live record counts.
+                for p in ctx.observed_files:
+                    if p not in self._observed_files_changed:
+                        self._observed_files_changed.append(p)
+                for c in ctx.observed_cmds:
+                    if c not in self._observed_commands_run:
+                        self._observed_commands_run.append(c)
+                self._observed_write_ops += ctx.write_ops
+                if record.status == RunStatus.RUNNING:
+                    record.files_changed = list(self._observed_files_changed)
+                    record.commands_run = list(self._observed_commands_run)
+                run_store.append_event(
+                    self.project_id,
+                    run_id,
+                    {
+                        "type": "task_status",
+                        "task_id": unit.id,
+                        "status": unit.status.value,
+                        "summary": _truncate(unit.summary, 200),
+                        "files_changed": unit.files_changed,
+                        "commands_run": unit.commands_run,
+                        "blockers": unit.blockers,
+                        "role": unit.role,
+                        "wave": unit.wave,
+                        "workspace": unit.workspace,
+                    },
+                )
+                if unit.workspace == "patch":
+                    try:
+                        overlay = get_overlay_root(self.project_id, run_id, unit.id)
+                        write_patch_manifest(
+                            self.project_id,
+                            run_id,
+                            unit.id,
+                            {
+                                "run_id": run_id,
+                                "task_id": unit.id,
+                                "title": unit.title,
+                                "role": unit.role,
+                                "wave": unit.wave,
+                                "status": unit.status.value,
+                                "summary": unit.summary,
+                                "files": collect_patch_files(overlay),
+                                "commands_run": unit.commands_run,
+                                "blockers": unit.blockers,
+                            },
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "patch manifest write failed for %s/%s", run_id, unit.id
+                        )
+                self._persist_progress(run_id, record, plan)
+
+        if cancelled or self._cancelled():
+            raise _RunCancelled()
+
+    def _run_parallel_unit(
+        self,
+        run_id: str,
+        system_prompt: str,
+        initial_user_prompt: str,
+        ctx: _UnitContext,
+    ) -> tuple[dict | None, str | None, bool]:
+        """One parallel unit, executed on a pool worker thread.
+
+        Fully self-contained via ``ctx`` and never raises: exceptions fold
+        into a failed outcome (one crashing agent must not kill the run), and
+        a cooperative cancel returns a ``cancelled`` marker for the
+        coordinator to act on. Returns ``(final_action, fail_reason,
+        cancelled)``.
+        """
+        try:
+            final_action, fail_reason = self._run_task_unit(
+                run_id,
+                system_prompt,
+                initial_user_prompt,
+                MAX_TASK_STEPS,
+                phase="execution",
+                max_continuations=MAX_TASK_CONTINUATIONS,
+                continuation_steps=TASK_CONTINUATION_STEPS,
+                ctx=ctx,
+            )
+            return final_action, fail_reason, False
+        except _RunCancelled:
+            return None, "run cancelled by user", True
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "Parallel unit %s crashed for run %s", ctx.task_id or "?", run_id
+            )
+            return None, f"parallel unit crashed: {type(exc).__name__}: {exc}", False
+
+    def _run_wave_unit_sequential(
+        self,
+        run_id: str,
+        record: RunRecord,
+        plan: ExecutionPlan,
+        unit: ExecutionTask,
+        task_no: int,
+        total: int,
+        task_md: str,
+        by_id: dict[str, ExecutionTask],
+    ) -> None:
+        """Run one team-wave task sequentially in the main workspace.
+
+        Mirrors the legacy multi-task loop body (full tool set for coders,
+        live metrics attribution), plus role awareness: a read-only role gets
+        its tool set enforced through a `_UnitContext` even though it runs on
+        the coordinator thread.
+        """
+        unit.status = TaskStatus.RUNNING
+        unit.workspace = "main"
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {
+                "type": "task_started",
+                "task_id": unit.id,
+                "title": unit.title,
+                "role": unit.role,
+                "wave": unit.wave,
+                "workspace": unit.workspace,
+            },
+        )
+        self._persist_progress(run_id, record, plan)
+
+        role = get_role(unit.role)
+        degraded = degraded_dependencies(unit, by_id)
+        system_prompt = build_system_prompt(
+            self._agent_md, self.project_id, MAX_TASK_STEPS, role_block=role.prompt
+        )
+        initial = build_task_unit_user_prompt(
+            goal=plan.goal,
+            task_no=task_no,
+            task_total=total,
+            task_id=unit.id,
+            title=unit.title,
+            description=unit.description,
+            plan_outline=_render_plan_outline(plan.tasks, current_id=unit.id),
+            prior_context=_render_prior_context(plan.tasks),
+            task_md=task_md,
+            degraded_dependencies=degraded,
+        )
+        before_f = len(self._observed_files_changed)
+        before_c = len(self._observed_commands_run)
+        self._begin_unit(unit, before_f, before_c)
+        try:
+            if role.read_only:
+                ctx = _UnitContext(
+                    self.runtime,
+                    task_id=unit.id,
+                    role=unit.role,
+                    allowed_tools=allowed_tools_for(unit.role),
+                )
+                final_action, fail_reason = self._run_task_unit(
+                    run_id,
+                    system_prompt,
+                    initial,
+                    MAX_TASK_STEPS,
+                    phase="execution",
+                    max_continuations=MAX_TASK_CONTINUATIONS,
+                    continuation_steps=TASK_CONTINUATION_STEPS,
+                    ctx=ctx,
+                )
+                unit_files = list(ctx.observed_files)
+                unit_cmds = list(ctx.observed_cmds)
+            else:
+                final_action, fail_reason = self._run_task_unit(
+                    run_id,
+                    system_prompt,
+                    initial,
+                    MAX_TASK_STEPS,
+                    phase="execution",
+                    max_continuations=MAX_TASK_CONTINUATIONS,
+                    continuation_steps=TASK_CONTINUATION_STEPS,
+                    event_extra={"task_id": unit.id, "role": unit.role},
+                )
+                unit_files = self._observed_files_changed[before_f:]
+                unit_cmds = self._observed_commands_run[before_c:]
+        finally:
+            self._active_unit = None
+        self._apply_unit_result_from_lists(
+            unit, final_action, fail_reason, unit_files, unit_cmds
+        )
+        run_store.append_event(
+            self.project_id,
+            run_id,
+            {
+                "type": "task_status",
+                "task_id": unit.id,
+                "status": unit.status.value,
+                "summary": _truncate(unit.summary, 200),
+                "files_changed": unit.files_changed,
+                "commands_run": unit.commands_run,
+                "blockers": unit.blockers,
+                "role": unit.role,
+                "wave": unit.wave,
+                "workspace": unit.workspace,
+            },
+        )
+        self._persist_progress(run_id, record, plan)
+
     def _run_task_unit(
         self,
         run_id: str,
@@ -653,6 +1293,8 @@ class CodingAgentRunner:
         phase: str = "execution",
         max_continuations: int = 0,
         continuation_steps: int | None = None,
+        ctx: _UnitContext | None = None,
+        event_extra: dict | None = None,
     ) -> tuple[dict | None, str | None]:
         """One bounded JSON tool loop. Returns (final_action, fail_reason).
 
@@ -671,10 +1313,29 @@ class CodingAgentRunner:
         dependents. A unit that has stopped producing files gets no extension.
         ``max_continuations=0`` (the default, used by the single-task path)
         preserves the legacy exhaustion behavior + its regression tests.
+
+        Phase 9: a non-``None`` ``ctx`` makes this unit self-contained for
+        parallel execution — tools dispatch through ``ctx.runtime``, activity
+        accumulates in ``ctx``'s lists, ``ctx.allowed_tools`` is enforced,
+        events carry the task id/role, and the loop never writes run.json
+        (the coordinator owns all record writes).
         """
         messages: list[dict[str, str]] = [{"role": "user", "content": initial_user_prompt}]
         final_action: dict | None = None
         loop_failed_reason: str | None = None
+        # Event attribution: a parallel unit derives it from its ctx; a
+        # sequential team unit passes it explicitly (``event_extra``) so the
+        # team trace attributes EVERY unit's activity. Legacy callers pass
+        # neither and their events stay byte-identical.
+        if ctx is not None:
+            event_extra = ctx.event_extra()
+        elif event_extra:
+            event_extra = dict(event_extra)
+        else:
+            event_extra = None
+
+        def _writes_so_far() -> int:
+            return ctx.write_ops if ctx is not None else self._observed_write_ops
 
         cont_steps = continuation_steps if continuation_steps is not None else max_steps
         budget = max_steps
@@ -682,7 +1343,7 @@ class CodingAgentRunner:
         # Progress is measured in successful WRITE OPERATIONS (incl. overwrites),
         # not unique file paths — a polish/refactor unit that rewrites existing
         # files is making progress even though it adds no new paths.
-        writes_at_checkpoint = self._observed_write_ops
+        writes_at_checkpoint = _writes_so_far()
         step = 0
 
         while True:
@@ -690,10 +1351,10 @@ class CodingAgentRunner:
             if step > budget:
                 # Budget exhausted without a final action. Grant a bounded
                 # continuation only while the unit is still productive.
-                progressed = self._observed_write_ops > writes_at_checkpoint
+                progressed = _writes_so_far() > writes_at_checkpoint
                 if continuations_used < max_continuations and progressed:
                     continuations_used += 1
-                    writes_at_checkpoint = self._observed_write_ops
+                    writes_at_checkpoint = _writes_so_far()
                     budget += cont_steps
                     run_store.append_event(
                         self.project_id,
@@ -704,6 +1365,7 @@ class CodingAgentRunner:
                             "phase": phase,
                             "granted_steps": cont_steps,
                             "continuation": continuations_used,
+                            **(event_extra or {}),
                         },
                     )
                     messages.append(
@@ -715,20 +1377,22 @@ class CodingAgentRunner:
                     run_store.append_event(
                         self.project_id,
                         run_id,
-                        {"type": "run_failed", "step": budget, "phase": phase, "error": loop_failed_reason},
+                        {"type": "run_failed", "step": budget, "phase": phase, "error": loop_failed_reason, **(event_extra or {})},
                     )
                     break
 
             if self._cancelled():
                 raise _RunCancelled()
             try:
-                action = self._llm_step(run_id, step, system_prompt, messages, phase=phase)
+                action = self._llm_step(
+                    run_id, step, system_prompt, messages, phase=phase, event_extra=event_extra
+                )
             except _LLMProtocolError as e:
                 loop_failed_reason = f"LLM protocol error after retry: {e}"
                 run_store.append_event(
                     self.project_id,
                     run_id,
-                    {"type": "run_failed", "step": step, "phase": phase, "error": loop_failed_reason},
+                    {"type": "run_failed", "step": step, "phase": phase, "error": loop_failed_reason, **(event_extra or {})},
                 )
                 break
 
@@ -742,6 +1406,7 @@ class CodingAgentRunner:
                         "step": step,
                         "phase": phase,
                         "status": action.get("status"),
+                        **(event_extra or {}),
                     },
                 )
                 break
@@ -751,10 +1416,48 @@ class CodingAgentRunner:
                 # (blocking) LLM call before we spend a tool dispatch on it.
                 if self._cancelled():
                     raise _RunCancelled()
-                tool_result, dispatched = self._dispatch_tool(run_id, step, action, phase=phase)
-                self._observe_tool_result(action, tool_result)
+                # Phase 9 — role tool gate (enforced, not prompt-only): bounce a
+                # call outside the unit's allowed set back to the model, the
+                # same way the planning loop guards its read-only tools.
+                if ctx is not None and ctx.allowed_tools is not None:
+                    gate_tool = (action.get("tool_name") or "").strip()
+                    if gate_tool not in ctx.allowed_tools:
+                        msg = (
+                            f"Tool {gate_tool!r} is not available to the "
+                            f"{ctx.role or 'assigned'} role for this task. Allowed tools: "
+                            f"{', '.join(sorted(ctx.allowed_tools))}. Adapt your approach "
+                            "or finalize."
+                        )
+                        run_store.append_event(
+                            self.project_id,
+                            run_id,
+                            {
+                                "type": "tool_result",
+                                "step": step,
+                                "phase": phase,
+                                "tool_name": gate_tool or "unknown",
+                                "success": False,
+                                "error": msg,
+                                **(event_extra or {}),
+                            },
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": build_tool_result_prompt(
+                                    gate_tool or "unknown", False, msg
+                                ),
+                            }
+                        )
+                        continue
+                tool_result, dispatched = self._dispatch_tool(
+                    run_id, step, action, phase=phase, ctx=ctx, event_extra=event_extra
+                )
+                self._observe_tool_result(action, tool_result, ctx=ctx)
                 # Flush progressive metrics so pollers see counts climb live.
-                self._persist_live_metrics()
+                # Parallel units skip this — the coordinator owns run.json.
+                if ctx is None:
+                    self._persist_live_metrics()
                 run_store.append_event(
                     self.project_id,
                     run_id,
@@ -766,6 +1469,7 @@ class CodingAgentRunner:
                         "success": tool_result.success,
                         "preview": _truncate(tool_result.output, _EVENT_PREVIEW_CHARS),
                         "error": _truncate(tool_result.error, _EVENT_PREVIEW_CHARS),
+                        **(event_extra or {}),
                     },
                 )
                 # Feed result back into the conversation
@@ -785,7 +1489,7 @@ class CodingAgentRunner:
             run_store.append_event(
                 self.project_id,
                 run_id,
-                {"type": "run_failed", "step": step, "phase": phase, "error": loop_failed_reason},
+                {"type": "run_failed", "step": step, "phase": phase, "error": loop_failed_reason, **(event_extra or {})},
             )
             break
 
@@ -805,8 +1509,24 @@ class CodingAgentRunner:
         run-scoped observed lists (the lists themselves are NOT reset per task).
         The agent's explicit final-action lists win when present.
         """
-        unit_files = self._observed_files_changed[before_f:]
-        unit_cmds = self._observed_commands_run[before_c:]
+        self._apply_unit_result_from_lists(
+            unit,
+            final_action,
+            loop_failed_reason,
+            self._observed_files_changed[before_f:],
+            self._observed_commands_run[before_c:],
+        )
+
+    def _apply_unit_result_from_lists(
+        self,
+        unit: "ExecutionTask",
+        final_action: dict | None,
+        loop_failed_reason: str | None,
+        unit_files: list[str],
+        unit_cmds: list[str],
+    ) -> None:
+        """Core of :meth:`_apply_unit_result` with explicit activity lists —
+        parallel units pass their own ``_UnitContext`` lists (Phase 9)."""
         if final_action is not None:
             raw_status = final_action.get("status", "")
             if raw_status not in _ALLOWED_STATUS:
@@ -911,6 +1631,7 @@ class CodingAgentRunner:
         *,
         allowed_actions: frozenset[str] = frozenset({"tool_call", "final"}),
         phase: str = "execution",
+        event_extra: dict | None = None,
     ) -> dict:
         """One LLM call with a single correction retry. Mutates `messages` in place.
 
@@ -918,6 +1639,8 @@ class CodingAgentRunner:
         accepts — the execution/repair loops allow ``tool_call`` / ``final``;
         the planning loop allows ``tool_call`` / ``plan``. This keeps the
         ``plan`` action from ever being accepted by the execution loop.
+        ``event_extra`` (Phase 9) stamps parallel-unit attribution fields
+        (task_id / role) onto the emitted events.
         """
         kwargs: dict[str, Any] = {
             "system": system_prompt,
@@ -940,6 +1663,7 @@ class CodingAgentRunner:
                 "step": step,
                 "phase": phase,
                 "preview": _truncate(raw, _EVENT_PREVIEW_CHARS),
+                **(event_extra or {}),
             },
         )
 
@@ -963,6 +1687,7 @@ class CodingAgentRunner:
                     "phase": phase,
                     "retry": True,
                     "preview": _truncate(retry_raw, _EVENT_PREVIEW_CHARS),
+                    **(event_extra or {}),
                 },
             )
             action = _parse_action(retry_raw, allowed_actions)
@@ -972,34 +1697,55 @@ class CodingAgentRunner:
         messages.append({"role": "assistant", "content": raw})
         return action
 
-    def _observe_tool_result(self, action: dict, result: ToolResult) -> None:
+    def _observe_tool_result(
+        self, action: dict, result: ToolResult, *, ctx: _UnitContext | None = None
+    ) -> None:
         """Record successful side-effecting tool calls for the diagnostic fallback.
 
         We only count operations that actually changed state: write_file,
         append_file, and run_shell (when sandbox-accepted). Reads are
-        ignored. Lists stay ordered and deduplicated.
+        ignored. Lists stay ordered and deduplicated. A parallel unit's
+        activity accumulates in its own ``ctx`` (merged by the coordinator
+        when the unit settles) instead of the shared run-scoped lists.
         """
         if not result.success:
             return
+        if ctx is not None:
+            files, cmds = ctx.observed_files, ctx.observed_cmds
+        else:
+            files, cmds = self._observed_files_changed, self._observed_commands_run
         tool_name = (action.get("tool_name") or "").strip()
         arguments = action.get("arguments") or {}
         if tool_name in {"write_file", "append_file"}:
             # Count every successful write (incl. overwrites) for the
             # continuation progress signal.
-            self._observed_write_ops += 1
+            if ctx is not None:
+                ctx.write_ops += 1
+            else:
+                self._observed_write_ops += 1
             path = arguments.get("path") if isinstance(arguments, dict) else None
-            if isinstance(path, str) and path and path not in self._observed_files_changed:
-                self._observed_files_changed.append(path)
+            if isinstance(path, str) and path and path not in files:
+                files.append(path)
         elif tool_name == "run_shell":
             command = arguments.get("command") if isinstance(arguments, dict) else None
-            if isinstance(command, str) and command and command not in self._observed_commands_run:
-                self._observed_commands_run.append(command)
+            if isinstance(command, str) and command and command not in cmds:
+                cmds.append(command)
 
     def _dispatch_tool(
-        self, run_id: str, step: int, action: dict, *, phase: str = "execution"
+        self,
+        run_id: str,
+        step: int,
+        action: dict,
+        *,
+        phase: str = "execution",
+        ctx: _UnitContext | None = None,
+        event_extra: dict | None = None,
     ) -> tuple[ToolResult, dict]:
         tool_name = action.get("tool_name") or ""
         arguments = action.get("arguments") or {}
+        runtime = ctx.runtime if ctx is not None else self.runtime
+        if event_extra is None and ctx is not None:
+            event_extra = ctx.event_extra()
         run_store.append_event(
             self.project_id,
             run_id,
@@ -1010,28 +1756,29 @@ class CodingAgentRunner:
                 "tool_name": tool_name,
                 "arguments": _bound_args(arguments),
                 "reason": _truncate(str(action.get("reason", "")), 200),
+                **(event_extra or {}),
             },
         )
 
         try:
             if tool_name == "list_files":
                 args = ListFilesRequest(**arguments)
-                return self.runtime.list_files(args.path), {"tool_name": tool_name}
+                return runtime.list_files(args.path), {"tool_name": tool_name}
             if tool_name == "read_file":
                 args = ReadFileRequest(**arguments)
-                return self.runtime.read_file(args.path), {"tool_name": tool_name}
+                return runtime.read_file(args.path), {"tool_name": tool_name}
             if tool_name == "write_file":
                 args = WriteFileRequest(**arguments)
-                return self.runtime.write_file(args.path, args.content), {"tool_name": tool_name}
+                return runtime.write_file(args.path, args.content), {"tool_name": tool_name}
             if tool_name == "append_file":
                 args = AppendFileRequest(**arguments)
-                return self.runtime.append_file(args.path, args.content), {"tool_name": tool_name}
+                return runtime.append_file(args.path, args.content), {"tool_name": tool_name}
             if tool_name == "search_files":
                 args = SearchFilesRequest(**arguments)
-                return self.runtime.search_files(args.query, args.path), {"tool_name": tool_name}
+                return runtime.search_files(args.query, args.path), {"tool_name": tool_name}
             if tool_name == "run_shell":
                 args = RunShellRequest(**arguments)
-                return self.runtime.run_shell(args.command, args.timeout_seconds), {"tool_name": tool_name}
+                return runtime.run_shell(args.command, args.timeout_seconds), {"tool_name": tool_name}
         except Exception as e:
             return (
                 ToolResult(
@@ -1092,6 +1839,7 @@ class CodingAgentRunner:
         # Settle transient sub-status + the cancel-request flag.
         record.cancel_requested = False
         record.verification_state = None
+        record.integration_state = None
         # Mark any in-flight task skipped so the task graph reads cleanly.
         if record.plan is not None:
             for unit in record.plan.tasks:
@@ -1799,7 +2547,12 @@ def _render_plan_outline(tasks: list["ExecutionTask"], current_id: str) -> str:
 
 
 def _render_prior_context(tasks: list["ExecutionTask"]) -> str:
-    """Summarize what earlier tasks already wrote, for the next task's prompt."""
+    """Summarize what earlier tasks already wrote, for the next task's prompt.
+
+    Phase 9: completed read-only tasks (reviewer / inspector) contribute their
+    findings too — that summary IS their deliverable, and later tasks should
+    build on it. Sequential all-coder plans render byte-identical to before.
+    """
     files = _dedup(
         [
             f
@@ -1808,13 +2561,28 @@ def _render_prior_context(tasks: list["ExecutionTask"]) -> str:
             for f in t.files_changed
         ]
     )
-    if not files:
+    findings = [
+        t
+        for t in tasks
+        if t.status == TaskStatus.COMPLETED
+        and t.summary
+        and get_role(t.role).read_only
+    ]
+    if not files and not findings:
         return "(nothing written yet)"
-    shown = files[:40]
-    body = "\n".join(f"- {f}" for f in shown)
-    if len(files) > len(shown):
-        body += f"\n- … (+{len(files) - len(shown)} more)"
-    return "Files written by earlier tasks:\n" + body
+    parts: list[str] = []
+    if files:
+        shown = files[:40]
+        body = "\n".join(f"- {f}" for f in shown)
+        if len(files) > len(shown):
+            body += f"\n- … (+{len(files) - len(shown)} more)"
+        parts.append("Files written by earlier tasks:\n" + body)
+    if findings:
+        body = "\n".join(
+            f"- {t.id} ({t.role}): {_truncate(t.summary, 400)}" for t in findings
+        )
+        parts.append("Findings from earlier read-only tasks:\n" + body)
+    return "\n\n".join(parts)
 
 
 def _parse_action(
