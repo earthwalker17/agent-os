@@ -46,14 +46,17 @@ log = logging.getLogger(__name__)
 WRITABLE_GLOBAL: frozenset[str] = frozenset({"USER.md", "WORKSTYLE.md", "MEMORY.md"})
 
 # Project memory files the chat-turn intake judge may write in a project chat.
+# Phase 10.2 — TASK_QUEUE.md was merged into STATUS.md's ``## Task Queue``
+# section (no longer a standalone file); LESSONS.md was added for durable
+# project lessons the Main Agent captures from builds/failures/fixes/research.
 WRITABLE_PROJECT: frozenset[str] = frozenset(
-    {"PROJECT.md", "STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RESEARCH.md"}
+    {"PROJECT.md", "STATUS.md", "DECISIONS.md", "RESEARCH.md", "LESSONS.md"}
 )
 
 # Post-run reconciliation writes a tighter set — PROJECT.md is intentionally
 # excluded (a Coding Agent run summary shouldn't rewrite the project definition).
 RECONCILIATION_WRITABLE: frozenset[str] = frozenset(
-    {"STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RESEARCH.md"}
+    {"STATUS.md", "DECISIONS.md", "RESEARCH.md", "LESSONS.md"}
 )
 
 # Phase 8 — the deployment ledger. Written ONLY by the deterministic
@@ -72,12 +75,21 @@ OPS_WRITABLE: frozenset[str] = frozenset({"OPS.md"})
 # ---------------------------------------------------------------------------
 
 # Ordered list of the stable ``##`` headings each project memory file carries.
+# STATUS.md now ends with a ``## Task Queue`` section that carries the
+# ``### Completed`` / ``### In Progress`` / ``### Next`` board (Phase 10.2 —
+# the former TASK_QUEUE.md). It is intentionally LAST so a ``replace`` of the
+# section (the engine's ``##``-level granularity) rewrites the whole board
+# without touching the status prose above it.
 CANONICAL_SECTIONS: dict[str, list[str]] = {
     "PROJECT.md": ["Vision", "Scope", "Target User", "Tech Stack"],
-    "STATUS.md": ["Current Phase", "Latest Milestone", "What Works", "Next Up"],
-    "TASK_QUEUE.md": ["In Progress", "Up Next", "Done"],
+    "STATUS.md": ["Current Phase", "Latest Milestone", "What Works", "Next Up", "Task Queue"],
     "DECISIONS.md": ["Decisions"],
     "RESEARCH.md": ["Findings"],
+    # Phase 10.2 — durable, project-specific lessons the Main Agent learns from
+    # builds, failures, fixes, reviews, deployments, research, and user
+    # decisions. Writable by the intake judge + post-run reconciliation; a
+    # target for skill-patch evidence. Never written by the Coding Agent.
+    "LESSONS.md": ["Lessons"],
     # Phase 8 — the deployment ledger. One append-only section; entries are
     # self-describing ``###`` blocks written by ``ops_ledger``. Scaffolded here
     # (so the section anchor exists) but intentionally NOT in DEFAULT_SECTION or
@@ -90,10 +102,15 @@ CANONICAL_SECTIONS: dict[str, list[str]] = {
 DEFAULT_SECTION: dict[str, str] = {
     "PROJECT.md": "Scope",
     "STATUS.md": "What Works",
-    "TASK_QUEUE.md": "Done",
     "DECISIONS.md": "Decisions",
     "RESEARCH.md": "Findings",
+    "LESSONS.md": "Lessons",
 }
+
+# The ``## Task Queue`` board inside STATUS.md. Its three ``###`` subsections
+# are the merge target of the former TASK_QUEUE.md (see migration below).
+TASK_QUEUE_SECTION = "Task Queue"
+TASK_QUEUE_SUBSECTIONS = ("Completed", "In Progress", "Next")
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +252,41 @@ def apply_update(
         # the individual existing lines, so an exact repeat is still deduped.
         if body and _block_already_present(body, current):
             return False
-        if current and not current.endswith("\n"):
-            current += "\n"
-        current += content + ("\n" if not content.endswith("\n") else "")
+        # Section-aware append: when ``section`` names an existing ``## heading``,
+        # insert at the END of that section (just before the next ``## `` or EOF)
+        # rather than at end-of-file. Before Phase 10.2 an EOF append to a
+        # multi-section file (STATUS.md) landed in the trailing prose harmlessly;
+        # now STATUS.md ends with the structured ``## Task Queue`` board, so a
+        # blind EOF append would misfile the write inside the board. Falls back
+        # to EOF append when no/unknown section (preserves single-section files).
+        target_heading = f"## {section}" if section else ""
+        lines = current.split("\n")
+        insert_at = None
+        if target_heading and any(ln.rstrip() == target_heading for ln in lines):
+            in_section = False
+            last_content_idx = None
+            for i, ln in enumerate(lines):
+                if ln.rstrip() == target_heading:
+                    in_section = True
+                    last_content_idx = i
+                    continue
+                if in_section and ln.startswith("## "):
+                    break
+                if in_section and ln.strip():
+                    last_content_idx = i
+            if last_content_idx is not None:
+                insert_at = last_content_idx + 1
+        addition = content.rstrip("\n")
+        if insert_at is not None:
+            lines[insert_at:insert_at] = [addition]
+            new_text = "\n".join(lines)
+        else:
+            new_text = current
+            if new_text and not new_text.endswith("\n"):
+                new_text += "\n"
+            new_text += content + ("\n" if not content.endswith("\n") else "")
         try:
-            _atomic_write(filepath, current)
+            _atomic_write(filepath, new_text)
         except OSError as exc:
             log.warning("memory_engine: could not write %s: %s", filepath, exc)
             return False
@@ -286,14 +333,22 @@ def apply_update(
 
 # Default seed bodies for each canonical section, used only to backfill a file
 # (or a section) that is entirely missing. Never overwrites existing content.
+# The ``## Task Queue`` section seeds the three ``###`` subsections as one
+# block (the board lives under a single ``##`` heading so the engine can
+# replace it wholesale).
+_TASK_QUEUE_SEED = (
+    "### Completed\n\n- [x] Project created\n\n"
+    "### In Progress\n\n- [ ] Define project scope and requirements\n\n"
+    "### Next\n\n- [ ] Set up initial project structure"
+)
+
 _SECTION_SEED: dict[tuple[str, str], str] = {
     ("STATUS.md", "Current Phase"): "Planning",
     ("STATUS.md", "Latest Milestone"): "Project created",
     ("STATUS.md", "What Works"): "- Project folder initialized",
     ("STATUS.md", "Next Up"): "- Define project scope and goals",
-    ("TASK_QUEUE.md", "In Progress"): "- [ ] Define project scope and requirements",
-    ("TASK_QUEUE.md", "Up Next"): "- [ ] Set up initial project structure",
-    ("TASK_QUEUE.md", "Done"): "- [x] Project created",
+    ("STATUS.md", "Task Queue"): _TASK_QUEUE_SEED,
+    ("LESSONS.md", "Lessons"): "- (Durable project lessons are captured here as work progresses.)",
 }
 
 
@@ -301,11 +356,126 @@ def _title_for(filename: str, project_name: str) -> str:
     return {
         "PROJECT.md": f"# {project_name}",
         "STATUS.md": f"# Status: {project_name}",
-        "TASK_QUEUE.md": f"# Task Queue: {project_name}",
         "DECISIONS.md": f"# Decisions: {project_name}",
         "RESEARCH.md": f"# Research: {project_name}",
+        "LESSONS.md": f"# Lessons: {project_name}",
         "OPS.md": f"# Ops: {project_name}",
     }.get(filename, f"# {project_name}")
+
+
+# ---------------------------------------------------------------------------
+# Migration: fold a legacy standalone TASK_QUEUE.md into STATUS.md (Phase 10.2)
+# ---------------------------------------------------------------------------
+
+# Old TASK_QUEUE.md ``##`` heading -> new ``### `` subsection under Task Queue.
+_LEGACY_TQ_MAP = {"done": "Completed", "in progress": "In Progress", "up next": "Next"}
+
+
+def _parse_md_sections(text: str) -> list[tuple[str, str]]:
+    """Split markdown into ``(heading, body)`` pairs.
+
+    Any content BEFORE the first ``## `` heading (excluding a single leading
+    ``# `` H1 title line) is preserved under the sentinel heading
+    ``"(preamble)"`` so a caller that migrates the file can keep hand-edited
+    items placed above the first heading. Bodies are ``strip("\\n")``-ed.
+    """
+    sections: list[tuple[str, str]] = []
+    heading = "(preamble)"
+    buf: list[str] = []
+    saw_h1 = False
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            body = "\n".join(buf).strip("\n")
+            if body:
+                sections.append((heading, body))
+            heading = line[3:].strip()
+            buf = []
+        elif heading == "(preamble)" and not saw_h1 and line.startswith("# "):
+            saw_h1 = True  # drop exactly one leading H1 title
+        else:
+            buf.append(line)
+    body = "\n".join(buf).strip("\n")
+    if body:
+        sections.append((heading, body))
+    return sections
+
+
+def _build_task_queue_from_legacy(tq_text: str) -> str:
+    """Render a legacy TASK_QUEUE.md body as a ``## Task Queue`` section block
+    (``### Completed`` / ``### In Progress`` / ``### Next``), preserving every
+    item. Unmapped legacy headings are kept under a ``### Other`` subsection so
+    nothing is lost."""
+    by_new: dict[str, list[str]] = {name: [] for name in TASK_QUEUE_SUBSECTIONS}
+    other: list[str] = []
+    for heading, body in _parse_md_sections(tq_text):
+        new_name = _LEGACY_TQ_MAP.get(heading.strip().lower())
+        target = by_new[new_name] if new_name else other
+        if body.strip():
+            target.append(body.rstrip())
+    parts: list[str] = []
+    for name in TASK_QUEUE_SUBSECTIONS:
+        parts.append(f"### {name}\n")
+        if by_new[name]:
+            parts.append("\n".join(by_new[name]))
+        parts.append("")
+    if other:
+        parts.append("### Other (migrated)\n")
+        parts.append("\n".join(other))
+        parts.append("")
+    return "\n".join(parts).strip("\n")
+
+
+def migrate_task_queue_into_status(base_dir: Path) -> bool:
+    """Fold a legacy standalone ``TASK_QUEUE.md`` into ``STATUS.md``'s
+    ``## Task Queue`` section, then remove the standalone file. Idempotent
+    (no-op once TASK_QUEUE.md is gone) and non-destructive (every legacy item
+    is preserved). Returns True iff a migration was performed.
+
+    Runs BEFORE ``ensure_memory_scaffold`` so the scaffold sees the merged
+    section already present and doesn't seed an empty duplicate.
+    """
+    tq_path = base_dir / "TASK_QUEUE.md"
+    if not tq_path.exists():
+        return False
+    try:
+        tq_text = tq_path.read_text(encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - disk error
+        log.warning("migrate_task_queue: could not read %s: %s", tq_path, exc)
+        return False
+
+    status_path = base_dir / "STATUS.md"
+    try:
+        status_text = status_path.read_text(encoding="utf-8") if status_path.exists() else ""
+    except OSError as exc:  # pragma: no cover - disk error
+        log.warning("migrate_task_queue: could not read %s: %s", status_path, exc)
+        return False
+    if not status_text.strip():
+        status_text = f"# Status\n"
+
+    board = _build_task_queue_from_legacy(tq_text)
+    if "## Task Queue" in status_text:
+        # STATUS already has the board (partial prior migration) — append the
+        # legacy items at EOF under a dated-free "migrated" marker so nothing is
+        # lost, rather than clobbering the existing board.
+        if not status_text.endswith("\n"):
+            status_text += "\n"
+        status_text += "\n### Migrated from TASK_QUEUE.md\n" + board + "\n"
+    else:
+        if not status_text.endswith("\n"):
+            status_text += "\n"
+        status_text += f"\n## {TASK_QUEUE_SECTION}\n" + board + "\n"
+
+    try:
+        _atomic_write(status_path, status_text)
+    except OSError as exc:  # pragma: no cover - disk error
+        log.warning("migrate_task_queue: could not write %s: %s", status_path, exc)
+        return False
+    # Content is safely in STATUS.md now — drop the standalone file.
+    try:
+        tq_path.unlink()
+    except OSError as exc:  # pragma: no cover - disk error
+        log.warning("migrate_task_queue: migrated but could not remove %s: %s", tq_path, exc)
+    return True
 
 
 def ensure_memory_scaffold(base_dir: Path, project_name: str) -> list[str]:
@@ -329,7 +499,13 @@ def ensure_memory_scaffold(base_dir: Path, project_name: str) -> list[str]:
             log.warning("ensure_memory_scaffold: could not create %s: %s", base_dir, exc)
             return []
 
+    # Phase 10.2 — fold any legacy standalone TASK_QUEUE.md into STATUS.md
+    # BEFORE seeding canonical sections, so the scaffold sees the merged
+    # ``## Task Queue`` already present (no empty duplicate). Idempotent.
     touched: list[str] = []
+    if migrate_task_queue_into_status(base_dir):
+        touched.append("STATUS.md")
+
     for filename, sections in CANONICAL_SECTIONS.items():
         filepath = base_dir / filename
         try:

@@ -95,6 +95,7 @@ def test_mode_mapping_covers_the_at_commands():
     assert ROLE_FOR_MODE["review"] == "reviewer"
     assert ROLE_FOR_MODE["inspect"] == "inspector"
     assert ROLE_FOR_MODE["memory"] == "memory_steward"
+    assert ROLE_FOR_MODE["research"] == "researcher"
 
 
 # ---------- enforced tool sets ----------

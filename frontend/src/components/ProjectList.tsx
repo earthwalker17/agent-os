@@ -18,6 +18,7 @@ interface Props {
   onSelectGeneral: () => void
   onNewGeneralConversation: () => void
   onOpenGlobalMemory: () => void
+  onOpenAgents: () => void
 }
 
 function ProjectList({
@@ -37,6 +38,7 @@ function ProjectList({
   onSelectGeneral,
   onNewGeneralConversation,
   onOpenGlobalMemory,
+  onOpenAgents,
 }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [generalExpanded, setGeneralExpanded] = useState(false)
@@ -60,6 +62,11 @@ function ProjectList({
 
   return (
     <aside className="sidebar project-list">
+      {/* Phase 10 — Agents browser */}
+      <button className="agents-btn" onClick={onOpenAgents}>
+        Agents
+      </button>
+
       {/* Global memory button */}
       <button className="global-memory-btn" onClick={onOpenGlobalMemory}>
         View Global Memories

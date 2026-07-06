@@ -318,6 +318,136 @@ session; no new feature layer.
   timeout wired only to the Anthropic client, not the finite-timeout urllib path)
   was verified a non-issue.
 
+## Phase 10 — Research / RAG / Skills (increment 1: discovery + skills + safe @search)
+
+Made the agent system **discoverable**, gave agents a minimal **built-in
+skills** foundation, and added a **safe, approval-first web-research channel**.
+Additive — every invariant holds, and the explicit-command boundary now also
+governs network access. (BLUEPRINT Pillar 4. Module/pipeline detail:
+`ARCHITECTURE.md §5–§7.J`.)
+
+- **Agent profile registry** (`agents_registry.py`, top-level leaf) — 10
+  structured profiles (command/aliases, mode↔role linkage by string,
+  introduction / use cases / responsibilities / tool categories, capability
+  badges, approval boundary, skill index) behind `GET /api/agents`; consumed by
+  both the composer autocomplete and the Agents browser, so agent descriptions
+  live in one place. `roles.py` gains the `researcher` chat contract
+  (`ROLE_FOR_MODE["research"]`); a sync test pins MODE_COMMANDS ↔ profiles ↔
+  ROLE_FOR_MODE.
+- **Composer `@` discovery** — typing `@` opens an upward autocomplete
+  (`CommandMenu`, ModelPicker pattern): command + agent name + one-line
+  description + capability badges (read-only / web / dispatches run / asks
+  first); ↑/↓/Enter/Tab/Esc keyboard nav that only intercepts while the menu is
+  open (Ctrl/Cmd+Enter send untouched).
+- **Agents browser** — an "Agents" button atop the sidebar opens a two-pane
+  modal (list + full contract detail) rendered from the registry; per-agent
+  skills are readable and manually editable in place.
+- **Skills foundation** — 18 committed markdown skills under
+  `skills/{agent}/{skill}.md` (method / checklist / rubric / template — never
+  executable tools); `skills_store.py` is the only read/write path
+  (registry-validated pair before any path build, atomic, 20k cap) and folds a
+  chat mode's skills into its guidance block (900/skill, 2000 total). The only
+  writer is the user's Save in the UI — no autonomous skill generation
+  (post-run "suggested skill patch" stays a planned follow-up).
+- **Safe `@search` / `@research`** — one research mode, two spellings, added to
+  `MODE_COMMANDS`; the explicit command is the per-turn **network grant**.
+  `orchestrate()` becomes a combined inspect/research loop (independent budgets
+  3 / 4, 16k research-char cap, forced-text tail) returning
+  `(text, inspected_files, research_sources)`. `research.py` mirrors
+  `inspect.py` (strict JSON protocol, `ok=False` results, never raises):
+  `web_search` returns snippets only (Tavily adapter in `web_search.py`; key
+  header-only via the new `search` credentials provider; Brave slot
+  documented); `fetch_url` is SSRF-screened (scheme/port/userinfo guards,
+  public-DNS enforcement incl. v4-mapped v6, hop-by-hop redirect re-screening),
+  domain-allowlisted (user-pasted URLs bypass only the allowlist), tag-stripped,
+  capped, and framed as untrusted evidence. A `redact()`-diff egress guard
+  refuses any outbound query/URL carrying a credential-shaped value. GENERAL
+  `@search` is allowed but skips memory intake (findings belong in project
+  RESEARCH.md, which the ordinary intake judge already handles for projects).
+- **Semantic proposal stays approval-first** — a judge-labeled `research`
+  intent produces a `research_suggestion` ({command, query}) rendered as a
+  "Run @search" chip that only pre-fills the composer; sending it is the grant.
+  Executed research actions ride `ChatResponse.research_sources` and persist in
+  message metadata (🔎 sources chip, reload-safe — the `inspected_files`
+  pattern).
+- **Not in this increment (deliberate):** MCP anything; autonomous skill
+  generation/promotion; a separate research-cache artifact (RESEARCH.md + the
+  persisted source metadata are the durable record); Brave adapter; local RAG
+  indexes (repo/run-history retrieval); research runs via the Coding Agent.
+- **Tests:** +87 across 6 new files (registry sync/capabilities 17, skills
+  store/folding 12, research SSRF/allowlist/redirects/egress 31, web-search
+  adapter 9, combined-loop orchestration 10, agents/skills/chat endpoints 8),
+  plus mechanical updates (`test_roles`, `test_inspect`, `test_providers`
+  3-tuple unpacks). `npm run build` green.
+- **Adversarial review pass.** A multi-agent find→verify review over the
+  increment (self-verified where the panel was interrupted) caught + fixed:
+  the research fetcher could raise on a mid-read network error (broke the
+  never-raises contract); an egress-refused URL persisted its secret-shaped
+  value unredacted into `research_sources` (now redacted in `_fetch_fail`); the
+  live chat turn dropped `research_sources`/`research_suggestion` from message
+  metadata so chips only appeared after reload (now carried on the live turn);
+  a failed `fetch_url` source rendered a model-controlled URL as an unvalidated
+  `<a href>` (now http(s)-only); voice dictation left the `@`-menu on a stale
+  caret; the composer offered mid-message `@`-commands the backend ignores (now
+  start-of-message only); and the docs overstated the egress guard (reworded:
+  it blocks credential-shaped values, not arbitrary memory/repo text).
+
+## Phase 10.2 — Live research validation, skill patches, local RAG, memory upgrade
+
+The second Phase 10 increment: validated the research channel live, added the
+review-first self-improvement step, a minimal local retrieval layer, and
+upgraded the project-memory scaffold. Additive; every invariant holds.
+(BLUEPRINT Pillar 4 + 5.)
+
+- **Live Tavily validation.** Drove real `@search` turns end-to-end through a
+  running backend (real Claude + real Tavily on `backend/.env`): the `web_search`
+  (Tavily) and `fetch_url` tools both returned real, cited, bounded results;
+  `research_sources` rode the response and persisted in message metadata
+  (reload-safe); a natural-language research request stayed approval-first (zero
+  network, only a `@search` suggestion chip).
+- **Suggested skill patch (review-first)** — `skill_patch.py`: after a GREEN
+  run, a cheaply-gated best-effort judge (mirrors `recovery.assess_run`; skips
+  trivial/read-only runs before any LLM call) may PROPOSE an **append-style**
+  skill refinement onto `run.json` (`SkillPatchProposal`: target agent/skill,
+  rationale, run evidence, before/after content). The Run Detail modal shows an
+  Apply / Edit / Reject card; **Apply is the only write path** and routes
+  through `skills_store.write_skill` (existing content never lost, registry-
+  validated). No autonomous skill creation or global promotion.
+- **Minimal local RAG** — `local_rag.py`: bounded, keyword-based (not vector)
+  retrieval over project memory (scored `##` sections), recent run history
+  (`run_store` summaries), and a sandbox-safe repo map (two-level walk via
+  `inspect`, sensitive names filtered so `.env`/`.git`/`*.key` never surface).
+  Per-source + per-turn char caps, never raises; exposed as the Main Agent's
+  `retrieve` inspection tool and `POST /api/projects/{id}/retrieve`. No vector
+  DB, no full-repo injection.
+- **Project memory upgrade** — the former standalone `TASK_QUEUE.md` is now a
+  `## Task Queue` section inside `STATUS.md` (`### Completed / ### In Progress /
+  ### Next`); `memory_engine.migrate_task_queue_into_status` folds legacy files
+  in on scaffold (non-destructive, idempotent, mapped subsections) and startup
+  migration handles existing projects. New `LESSONS.md` (durable Main-Agent
+  lessons) joins the writable + reconciliation sets and compaction (bounded
+  tail); it's UI-visible/editable and never written by the Coding Agent. All
+  intake/reconciliation/judge prompts, writable sets, the `/context` endpoint,
+  `ContextPanel`, and the example templates updated in lock-step.
+- **Tests:** +40 (`test_local_rag` 13, `test_skill_patch` 13, `test_memory_engine`
+  +9 migration/LESSONS/append-fixes, plus MemoryContext/target-file updates across
+  `test_memory_intake` / `test_intent_router`). Full backend sweep + `npm run
+  build` green.
+- **Adversarial review pass** (5-dimension find→verify, 3-vote panels) caught +
+  fixed 5 real defects: migration silently dropped legacy items placed ABOVE the
+  first heading before deleting the file (now preserved under "Other
+  (migrated)"); `apply_update` append landed at EOF — i.e. inside the new
+  trailing Task Queue board — for a named section (now **section-aware**: append
+  lands inside the named `##` section, EOF fallback only when the section is
+  absent); local RAG could surface the name/content of credential files the
+  sandbox's narrow set misses — `.npmrc` / `id_rsa` / `credentials.json` / `*.p12`
+  (retrieval now uses a **broader** credential filter than the write-guard set);
+  retrieval hits weren't redacted (now every hit passes `credentials.redact`);
+  and a skill-patch Apply wrote the propose-time snapshot, clobbering edits made
+  since (Apply now **re-bases** the addition onto the live skill, and an explicit
+  user edit still writes verbatim). The 3 findings that failed verification
+  (0/3 votes) were correctly rejected.
+
 ---
 
 ## Current Constraints
@@ -338,6 +468,10 @@ session; no new feature layer.
   chat response + memory judge).
 - **Main agent never auto-reads repo contents** — only the bounded inspection loop
   (max 3 reads/turn).
+- **Web access only on an explicit grant.** The research channel runs only on an
+  explicit `@search`/`@research` turn (≤4 requests, 16k chars, allowlist +
+  SSRF-screened; user-pasted URLs bypass only the allowlist). Search needs a
+  Tavily key under the `search` connector; URL fetch works keyless.
 - **Single-user, single-process.** No auth, no shared deploy.
 
 ---
@@ -345,8 +479,15 @@ session; no new feature layer.
 ## Test Coverage
 
 Backend tests live under `backend/tests/`, stub `llm.chat` (no API key needed),
-and are each runnable standalone (`python tests/<file>.py`). **635 total**
-(Phase 9.1 hardening added ~29 regressions across sandbox device-name/dot guards,
+and are each runnable standalone (`python tests/<file>.py`). **757 total**
+(Phase 10.2 added 40: local RAG 13, skill patch 13, memory-engine migration/
+LESSONS/append +9, plus adversarial-review regressions; Phase 10 added 87 across
+the agent registry, skills store, research channel,
+web-search adapter, combined orchestration loop, and agents/skills endpoints —
+including a post-implementation adversarial-review pass that hardened the
+research fetcher's never-raises contract, egress-URL redaction, v4-mapped-IPv6
+SSRF, and budget-exhaustion coverage; Phase 9.1 hardening added ~29 regressions
+across sandbox device-name/dot guards,
 sequential-path role enforcement, terminal transient-state sweeps, cancel/deploy
 run.json-lock races, pending double-confirm claim, integration case-collision,
 compileall skip-dirs, browser teardown/port-guard, memory-engine matching,
@@ -374,7 +515,7 @@ attachment XSS, provider timeout + Gemini-key redaction, and team-run PM context
 | `test_autonomy_hardening` | 11 | dependency skip, productive continuation, iterative repair |
 | `test_live_metrics` | 5 | progressive run-level + per-task metrics |
 | `test_visual_judge` | 16 | gate/skip, JSON parse, never-raises, model resolution |
-| `test_memory_engine` | 13 | apply_update policy/atomic/dedup; scaffold; write-path |
+| `test_memory_engine` | 24 | apply_update policy/atomic/dedup + section-aware append; scaffold; write-path; TASK_QUEUE→STATUS migration (+ preamble preservation) + LESSONS.md |
 | `test_memory_intake` | 10 | structured intake judge: parse, filter, reason, apply |
 | `test_intent_router` | 18 | mode `@`-command parser, `intent`, mode→prompt shaping |
 | `test_recovery` (+`_budget`) | 8 / 9 | assess_run non-green/idempotent; auto-recover gating/cap/decrement |
@@ -393,7 +534,15 @@ attachment XSS, provider timeout + Gemini-key redaction, and team-run PM context
 | `test_phase8_invariants` | 2 | orchestrator imports no connector; OPS.md excluded from judge sets |
 | `test_supabase_connector` | 5 | migration apply secrets-in-env/destructive, redaction, Docker-missing |
 | `test_stripe_connector` | 7 | form-encoding+Idempotency-Key, test/livemode gate, webhook-secret-never-returned |
-| `test_roles` | 11 | role registry contracts, tool sets, mode↔role map, coder fallback |
+| `test_roles` | 11 | role registry contracts, tool sets, mode↔role map (incl. research), coder fallback |
+| `test_agents_registry` | 17 | profile shape/uniqueness, MODE_COMMANDS↔profiles↔ROLE_FOR_MODE sync, capability honesty, command entries |
+| `test_skills_store` | 12 | registry-gated read/write, slug guard, caps, prompt folding, registry↔disk drift |
+| `test_research` | 31 | protocol parse, SSRF matrix (incl. v4-mapped IPv6), allowlist + user-URL bypass, redirect re-screening + no-Location, caps, extraction, mid-read never-raises, secret egress + refused-URL redaction |
+| `test_web_search` | 9 | Tavily request shape (key header-only), parsing, redacted errors, config gates |
+| `test_research_orchestration` | 10 | combined loop: budgets, char cap, forced-text tail, inspect-over-budget, GENERAL research-only, ungranted turns, user URLs |
+| `test_agents_endpoints` | 8 | /api/agents shape, skill read/write routes, @search chat flow (GENERAL no-memory, metadata persistence, suggestion-only semantic path) |
+| `test_local_rag` | 13 | memory/run/repo retrieval, scoring, caps, kinds filter, broad credential-name filtering, hit redaction, inspect tool + /retrieve endpoint |
+| `test_skill_patch` | 13 | green-only gating, append-style proposal, unknown-target rejection, idempotency, never-raises, apply-via-skills_store (+ edit, + rebase), reject, endpoints |
 | `test_patch_workspace` | 13 | overlay read/write/append/list/search, `.git` guard, unsafe-id containment, blocked executors |
 | `test_team_planner` | 18 | role/parallel parsing, wave layering, cycle handling, eligibility gate, id sanitization |
 | `test_integration` | 7 | clean apply, dedupe, first-writer-wins conflict, sandbox re-validation, failed-task output |
@@ -403,7 +552,17 @@ attachment XSS, provider timeout + Gemini-key redaction, and team-run PM context
 
 ## Recommended Next Steps
 
-**Next up.**
+**Next up (Phase 10 increment 3).**
+- **Skill-patch surfacing in chat** — echo a proposed skill patch as a chat
+  affordance (today it lives in the Run Detail modal), and allow a patch to
+  target a NEW skill (registry-add behind explicit review), extending the
+  self-improvement ladder.
+- **RAG ranking + run-diff retrieval** — add recent-diff snippets and light
+  symbol indexing to `local_rag`; better scoring than substring counts.
+- **Brave adapter + allowlist config** — second search engine behind the same
+  seam; user-extensible fetch allowlist (per-project or global file).
+
+**Also queued.**
 - **Auto-repair on a failed visual verdict** — feed a `failed` verdict + evidence
   back as one bounded repair pass (reuse `_verify_with_repair`), then re-capture +
   re-judge once. Capped + opt-in.

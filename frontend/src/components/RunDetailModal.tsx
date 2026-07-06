@@ -5,6 +5,7 @@ import type {
   RecoveryAssessment,
   RunEvent,
   RunRecord,
+  SkillPatchProposal,
   VerificationResult,
   VisualReviewResult,
 } from '../types'
@@ -294,6 +295,109 @@ function RecoveryBlock({
         <div className="run-detail-verify-cmd">
           <span className="run-detail-label">Recovery run</span>
           <code>{recoveredBy}</code>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SkillPatchBlock({
+  projectId,
+  runId,
+  patch,
+  onChanged,
+}: {
+  projectId: string
+  runId: string
+  patch: SkillPatchProposal
+  onChanged: () => void
+}): JSX.Element {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(patch.proposed_content)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const act = async (action: 'apply' | 'reject', content?: string) => {
+    setBusy(true)
+    setError('')
+    try {
+      const res = await fetch(
+        `/api/projects/${projectId}/execution/runs/${runId}/skill-patch/${action}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(action === 'apply' ? { content: content ?? null } : {}),
+        },
+      )
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || `HTTP ${res.status}`)
+      }
+      onChanged()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Action failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const settled = patch.status === 'applied' || patch.status === 'rejected'
+
+  return (
+    <div className="run-detail-verification">
+      <div>
+        <span
+          className={`run-verify-status status-${
+            patch.status === 'applied' ? 'passed' : patch.status === 'rejected' ? 'skipped' : 'partial'
+          }`}
+        >
+          {patch.status}
+        </span>
+        <span className="run-detail-verify-meta">
+          <code>{patch.target_agent_id}/{patch.target_skill_id}</code> — {patch.target_skill_title}
+        </span>
+      </div>
+      {patch.rationale && <p className="run-detail-visual-headline">{patch.rationale}</p>}
+      {patch.evidence && <p className="run-detail-visual-reason">Evidence: {patch.evidence}</p>}
+      <div className="run-detail-verify-cmd">
+        <span className="run-detail-label">
+          {editing ? 'Edit the new skill content' : 'Proposed skill content (after patch)'}
+        </span>
+        {editing ? (
+          <textarea
+            className="skill-textarea"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+        ) : (
+          <pre className="run-detail-resultmd">{patch.proposed_content}</pre>
+        )}
+      </div>
+      {error && <p className="run-detail-visual-reason">{error}</p>}
+      {!settled && (
+        <div className="skill-patch-actions">
+          {editing ? (
+            <>
+              <button className="btn-save" disabled={busy} onClick={() => void act('apply', draft)}>
+                {busy ? 'Applying…' : 'Apply edited'}
+              </button>
+              <button className="btn-cancel" disabled={busy} onClick={() => setEditing(false)}>
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="btn-save" disabled={busy} onClick={() => void act('apply')}>
+                {busy ? 'Applying…' : 'Apply'}
+              </button>
+              <button className="btn-edit-global" disabled={busy} onClick={() => { setDraft(patch.proposed_content); setEditing(true) }}>
+                Edit
+              </button>
+              <button className="btn-cancel" disabled={busy} onClick={() => void act('reject')}>
+                Reject
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -727,6 +831,24 @@ function RunDetailModal({ projectId, runId, onClose, onRunsChanged, onOpenTrace 
                   <p className="run-detail-hint">
                     The Main Agent's read of a non-green run — proposes a bounded
                     next step; never auto-runs unless a recovery budget was approved.
+                  </p>
+                </section>
+              )}
+
+              {/* Phase 10.2 — review-first suggested skill patch (green runs). */}
+              {record.skill_patch && record.skill_patch.proposed && (
+                <section className="run-detail-result">
+                  <h4>Suggested skill patch</h4>
+                  <SkillPatchBlock
+                    projectId={projectId}
+                    runId={runId}
+                    patch={record.skill_patch}
+                    onChanged={load}
+                  />
+                  <p className="run-detail-hint">
+                    A reusable lesson from this run — nothing is written until you
+                    Apply; applying edits the skill markdown through the same write
+                    path you use in the Agents browser.
                   </p>
                 </section>
               )}

@@ -682,7 +682,7 @@ def test_orchestrate_routes_selected_provider():
     prev = providers.complete
     providers.complete = fake_complete
     try:
-        text, inspected = orchestrator.orchestrate(
+        text, inspected, _research = orchestrator.orchestrate(
             orchestrator.GENERAL_PROJECT_ID, "hello", history=[], provider="gpt"
         )
     finally:

@@ -5,7 +5,8 @@ import ContextPanel from './components/ContextPanel'
 import EditModal from './components/EditModal'
 import ConfirmDialog from './components/ConfirmDialog'
 import GlobalMemoryModal from './components/GlobalMemoryModal'
-import type { Message, Conversation, ProjectContext, PendingExecution, ChatAttachment, ProviderInfo } from './types'
+import AgentsModal from './components/AgentsModal'
+import type { Message, Conversation, ProjectContext, PendingExecution, ChatAttachment, ProviderInfo, AgentInfo } from './types'
 
 const GENERAL_PROJECT_ID = '__GENERAL__'
 
@@ -49,6 +50,11 @@ function App() {
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: (checked: boolean) => void; checkboxLabel?: string } | null>(null)
   const [globalMemoryModal, setGlobalMemoryModal] = useState(false)
   const [globalMemory, setGlobalMemory] = useState<Record<string, string>>({})
+
+  // Phase 10 — the agent profile registry (Agents browser + composer @-menu).
+  // Loaded once; static per backend build.
+  const [agentsList, setAgentsList] = useState<AgentInfo[]>([])
+  const [agentsModal, setAgentsModal] = useState(false)
 
   // Runs panel refresh trigger — bumped after the user sends an @code message
   // so the panel reloads without waiting for the next poll tick.
@@ -134,6 +140,15 @@ function App() {
           setSelectedModel(chosen.default_model || chosen.models?.[0]?.id || '')
         }
       })
+      .catch(console.error)
+  }, [])
+
+  // Phase 10 — load the agent registry once (shared by the Agents browser
+  // and the composer's @-command autocomplete).
+  useEffect(() => {
+    fetch('/api/agents')
+      .then(res => res.json())
+      .then((data: { agents: AgentInfo[] }) => setAgentsList(data.agents ?? []))
       .catch(console.error)
   }, [])
 
@@ -505,18 +520,21 @@ function App() {
       // Task 06.2D — a dispatched run id (from an @code message) is echoed on
       // the response; carry it in metadata so the chat-first run follow-up card
       // attaches to this message (and survives a reload via persisted metadata).
-      const newMsgMeta: Record<string, unknown> | null = data.run_id
-        ? { run_id: data.run_id }
-        : data.pending_execution
-        ? { pending_execution_id: data.pending_execution.pending_execution_id }
-        : null
+      const newMsgMeta: Record<string, unknown> = {}
+      if (data.run_id) newMsgMeta.run_id = data.run_id
+      else if (data.pending_execution)
+        newMsgMeta.pending_execution_id = data.pending_execution.pending_execution_id
+      // Phase 10 — carry research chips on the live turn too (they otherwise
+      // only appear after a reload, from persisted metadata).
+      if (data.research_sources?.length) newMsgMeta.research_sources = data.research_sources
+      if (data.research_suggestion) newMsgMeta.research_suggestion = data.research_suggestion
       const newMsg: Message = {
         id: data.message_id ?? undefined,
         role: data.role,
         content: data.content,
         timestamp: data.timestamp,
         pending_execution: data.pending_execution ?? null,
-        metadata: newMsgMeta,
+        metadata: Object.keys(newMsgMeta).length ? newMsgMeta : null,
       }
       setMessages(prev => [...prev, newMsg])
 
@@ -676,6 +694,7 @@ function App() {
         onSelectGeneral={handleSelectGeneral}
         onNewGeneralConversation={handleNewGeneralConversation}
         onOpenGlobalMemory={handleOpenGlobalMemory}
+        onOpenAgents={() => setAgentsModal(true)}
       />
       <ChatPanel
         projectId={isGeneralActive ? 'general' : activeProject}
@@ -700,6 +719,7 @@ function App() {
         onSelectModel={handleSelectModel}
         theme={theme}
         onSelectTheme={setTheme}
+        agents={agentsList}
       />
       <ContextPanel
         projectId={isGeneralActive ? null : activeProject}
@@ -728,6 +748,12 @@ function App() {
           memory={globalMemory}
           onSave={handleSaveGlobalFile}
           onClose={() => setGlobalMemoryModal(false)}
+        />
+      )}
+      {agentsModal && agentsList.length > 0 && (
+        <AgentsModal
+          agents={agentsList}
+          onClose={() => setAgentsModal(false)}
         />
       )}
     </div>

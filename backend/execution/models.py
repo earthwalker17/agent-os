@@ -379,6 +379,41 @@ class RecoveryAssessment(BaseModel):
     error: Optional[str] = None
 
 
+class SkillPatchProposal(BaseModel):
+    """A review-first suggestion to refine one built-in skill from a run's
+    outcome (Phase 10.2).
+
+    Produced best-effort by ``execution.skill_patch.propose_skill_patch`` after
+    a GREEN (``completed``) run that revealed a reusable method / checklist /
+    repair pattern / lesson. It is a PROPOSAL only — nothing is written to a
+    skill file until the user clicks Apply (which routes through
+    ``skills_store.write_skill``, the sole skill write path). Skills stay
+    markdown methods/checklists/rubrics/templates — never executable tools —
+    and there is no autonomous global promotion.
+
+    ``proposed`` is False on the skip / error paths. ``status`` is
+    ``proposed`` → ``applied`` / ``rejected`` (set by the apply/reject
+    endpoints). ``current_content`` + ``proposed_content`` give the UI a
+    before/after diff; the user may edit ``proposed_content`` before applying.
+    """
+
+    proposed: bool = False
+    target_agent_id: str = ""
+    target_skill_id: str = ""
+    target_skill_title: str = ""
+    rationale: str = ""
+    evidence: str = ""
+    # ``current_content`` + ``proposed_content`` are a propose-time snapshot for
+    # the before/after diff. ``addition`` is the append-only block, kept so an
+    # un-edited Apply can RE-BASE onto the live skill (preserving any edits made
+    # between propose and apply) instead of writing the stale snapshot.
+    current_content: str = ""
+    proposed_content: str = ""
+    addition: str = ""
+    status: str = "proposed"  # proposed | applied | rejected
+    error: Optional[str] = None
+
+
 class RunRecord(BaseModel):
     """Persistent metadata for a single agent run (serialized as run.json)."""
 
@@ -477,6 +512,11 @@ class RunRecord(BaseModel):
     # an assessment failure never fails the run. Populated by
     # ``execution.recovery.assess_run`` from ``runner._finalize``.
     recovery_assessment: Optional[RecoveryAssessment] = None
+    # Phase 10.2 — a review-first suggested skill patch produced from a GREEN
+    # run's outcome. ``None`` until proposed (and for non-green / read-only runs,
+    # which are skipped). Best-effort; a proposal failure never fails the run.
+    # Applied only by explicit user action through ``skills_store``.
+    skill_patch: Optional[SkillPatchProposal] = None
     # Phase 7 — Project Ops (Git/GitHub) linkage. All default ``None``/``False``
     # so old run.json records round-trip unchanged (mirrors the ``retry_of`` /
     # ``recovery_of`` convention). Scalar refs only — the full diff text lives in

@@ -60,7 +60,8 @@ use **5174** to avoid colliding with Agent OS itself.
 Agent OS/
 ├─ CLAUDE.md / ROADMAP.md / ARCHITECTURE.md / BLUEPRINT.md / README.md   ← docs
 ├─ memory/                      global: SOUL.md (read-only anchor), USER/WORKSTYLE/MEMORY.md
-├─ projects/{id}/               per-project: PROJECT/STATUS/TASK_QUEUE/DECISIONS/RESEARCH.md (+ OPS.md ledger)
+├─ skills/{agent_id}/{skill}.md built-in skill markdown (committed; user-editable + suggested-patch-applied via UI only)
+├─ projects/{id}/               per-project: PROJECT/STATUS(+`## Task Queue`)/DECISIONS/RESEARCH/LESSONS.md (+ OPS.md ledger)
 ├─ execution_workspaces/{id}/
 │  ├─ repo/                     working code tree (Coding Agent's sandbox); repo/uploads/ for chat files
 │  ├─ runs/{run_id}/            task_card.md · events.jsonl · run.json · plan.json · result.md
@@ -85,8 +86,10 @@ conversations, messages, `pending_executions`.
 | File | Purpose |
 |------|---------|
 | `main.py` | FastAPI app + every HTTP endpoint (projects, conversations, chat, memory, execution, inspection, verification, preview, run control, Git/deploy/migration contracts). Startup: `sweep_stuck_runs` + `reconcile_stuck_external_actions` + memory-scaffold migration. |
-| `orchestrator.py` | The chat brain. Loads SOUL + memory, **compacts** project memory (`_compact_memory`: STATUS/PROJECT/SOUL whole, append-growth files tail-trimmed over a threshold), assembles context (+ optional `@`-mode/intent block), produces the reply, runs the bounded inspection loop, then the structured memory-intake judge (`judge_memory_intake → MemoryDecision`). Imports no connector/executor (asserted by a test). |
-| `memory_engine.py` | Stdlib-only leaf: the single markdown write path `apply_update(base_dir, allow=…)` (policy-filtered, atomic temp+`os.replace`, append-deduped, robust section replace), writable-file sets, `MemoryDecision`, idempotent `ensure_memory_scaffold`. `OPS.md` is scaffolded but excluded from every writable set (only `ops_ledger` writes it). |
+| `orchestrator.py` | The chat brain. Loads SOUL + memory, **compacts** project memory (`_compact_memory`: STATUS/PROJECT/SOUL whole, append-growth files tail-trimmed over a threshold), assembles context (+ optional `@`-mode/intent block with the mode's skills folded in), produces the reply, runs the bounded inspection/research loop (independent budgets; research only on an explicit grant), then the structured memory-intake judge (`judge_memory_intake → MemoryDecision`). Imports no connector/executor (asserted by a test). |
+| `agents_registry.py` | Leaf module (pydantic only): the agent profile registry behind `GET /api/agents` — 10 frozen `AgentProfile`s (command/aliases, mode↔role linkage BY STRING, introduction/use-cases/responsibilities, `AgentCapabilities` badges, approval boundary, `SkillRef` index). Presentation + contract, not permissions; sync with `MODE_COMMANDS`/`ROLE_FOR_MODE` is test-asserted. |
+| `skills_store.py` | Leaf module: the ONLY read/write path for `skills/{agent}/{skill}.md` (registry-validated pair before any path build, slug re-check, atomic write, 20k cap; writes come only from the user's Save in the UI) + `skills_prompt_block(mode)` — the bounded (900/skill, 2000 total) fold-in for chat-mode guidance. Never raises into a turn. |
+| `memory_engine.py` | Stdlib-only leaf: the single markdown write path `apply_update(base_dir, allow=…)` (policy-filtered, atomic temp+`os.replace`, append-deduped, robust section replace), writable-file sets, `MemoryDecision`, idempotent `ensure_memory_scaffold`. Phase 10.2 — the task board is a `## Task Queue` section inside STATUS.md (was standalone TASK_QUEUE.md; `migrate_task_queue_into_status` folds legacy files in on scaffold, non-destructive + idempotent); `LESSONS.md` added to the writable/reconciliation sets. `OPS.md` is scaffolded but excluded from every writable set (only `ops_ledger` writes it). |
 | `llm.py` | Thin entry point: `chat(system, messages, model?, provider?) -> str` + `chat_vision(…)`. Delegates to `providers.py`; shared transient-retry. |
 | `providers.py` | Capability-aware model registry — Claude / GPT / Gemini / DeepSeek / Kimi / GLM. Key-presence availability (+ env aliases), Claude-first default, per-model `vision` flags, env-overridable default model/base-URL, `is_known_model`, `complete()` + vision-gated `complete_vision()`. Anthropic via SDK; others via OpenAI-compatible/`generateContent` `urllib` (no new deps). |
 | `database.py` | SQLite persistence: conversations, messages, `pending_executions`. |
@@ -109,12 +112,16 @@ conversations, messages, `pending_executions`.
 | `integration.py` | Deterministic per-wave merge (team runs): overlays apply into the shared repo through the base `ToolRuntime` (sandbox re-validates), plan order; identical content de-dupes, conflicting content → first-writer-wins + `IntegrationConflict` + blocker; apply errors surfaced. No LLM. |
 | `runner.py` | `CodingAgentRunner`: phased run (plan → execute → finalize) with verification + iterative repair, cooperative cancel (`cancel_event` at step boundaries → `_finalize_cancelled`), progressive live metrics. **Team path** `_run_execution_phase_team` (gated by `plan_is_team_eligible`): wave scheduling, `_run_parallel_batch` on a dedicated per-batch pool (never the shared manager pool), per-unit `_UnitContext` (own runtime + observed lists + enforced tools), per-wave `integrate_wave`, conflict/error-capped aggregate; coordinator is the sole run.json/plan.json writer. |
 | `background.py` | `BackgroundRunManager`: thread-pool dispatch; crash → `failed` (clears every transient sub-status); per-run cancel-`Event` registry (`request_cancel`); `dispatch(…, retry_of/recovery_of/recovery_budget/orchestration_round)`; `submit` (off-thread finalize). `_maybe_auto_recover` (clean-finalize only) auto-dispatches ONE linked recovery run when a user-approved budget remains. |
-| `chat_delegation.py` | `@code` trigger + deterministic mode `@`-commands (`parse_mode_command`: `@plan`/`@design`/`@debug`/`@review`/`@inspect`/`@memory` — shape the response, never dispatch). |
+| `chat_delegation.py` | `@code` trigger + deterministic mode `@`-commands (`parse_mode_command`: `@plan`/`@design`/`@debug`/`@review`/`@inspect`/`@memory`/`@search`/`@research` — shape the response, never dispatch; the explicit `@search`/`@research` additionally grants the research channel for that turn). |
 | `delegation_intent.py` / `delegation_judge.py` | Heuristic fallback detector; LLM semantic delegation judge (primary — 3 decisions + a richer informational `intent` label). |
 | `pending_execution.py` | Confirmable execution plans (store / render / revise). |
 | `memory_reconciliation.py` | Post-run bounded reconciliation judge (writes STATUS/TASK_QUEUE/DECISIONS/RESEARCH via `memory_engine`; skip rules; once-only). |
 | `recovery.py` | Best-effort `assess_run`: interprets a non-green terminal run, recommends one bounded next step (`RecoveryAssessment`). Confirmable handoff only — never auto-dispatches. |
-| `inspect.py` | Main-agent on-demand, read-only file inspection (bounded, max 3/turn). |
+| `inspect.py` | Main-agent on-demand, read-only file inspection (bounded, max 3/turn). Phase 10.2 — also dispatches the `retrieve` local-RAG tool. |
+| `local_rag.py` | Minimal, keyword-based (not vector) local retrieval (Phase 10.2): bounded, cited evidence from project memory (scored `##` sections), recent run history (`run_store` summaries), and a sandbox-safe repo map (two-level walk via `inspect`, sensitive names filtered). Per-source + per-turn char caps; never raises. Exposed as the `retrieve` inspection tool + `POST …/retrieve`. |
+| `skill_patch.py` | Review-first suggested skill patch (Phase 10.2): a best-effort, green-run-only, cheaply-gated judge (mirrors `recovery.assess_run`) that PROPOSES an append-style skill refinement (`SkillPatchProposal` on run.json) — target agent/skill, rationale, run evidence, before/after content. `apply_skill_patch` writes ONLY through `skills_store.write_skill` on explicit user action (Apply, optionally edited); `reject_skill_patch` writes nothing. Never creates skills or promotes globally. |
+| `research.py` | The bounded research channel (Phase 10, mirrors inspect.py): strict `{"research_request": …}` protocol, two tools (`web_search` snippets-only, `fetch_url` bounded tag-stripped extract), SSRF screening (scheme/port/userinfo, public-DNS enforcement incl. v4-mapped v6, hop-by-hop redirect re-screening), `DEFAULT_ALLOWED_DOMAINS` allowlist (user-pasted URLs bypass only that), `redact()`-diff egress guard on every outbound query/URL, per-fetch 6k + per-turn 16k char caps, untrusted-content framing. Never raises into the loop. |
+| `web_search.py` | Search-engine adapter (Tavily v1; Brave slot documented): `search_web → [{title,url,snippet}]`, key from `credentials.get_token("search")` in a header ONLY, errors redacted, injectable opener. No key → clear config error (URL fetch stays keyless). |
 | `verification.py` | Command verification: `plan_verification` (manual `## Verification` block else inferred), `run_verification_specs`, render. |
 | `browser_verification.py` | Browser lifecycle: dev server → HTTP readiness → render-readiness-gated multi-page Playwright capture (`BrowserPageCapture[]`) → teardown; legacy single-capture adapter keeps `screenshots/browser.png`. |
 | `visual_judge.py` | AI visual judgment over screenshots (`run_visual_review` → verdict + rationale, `visual_review.json`). Resolves a vision-capable model (selected, else any available), skips gracefully otherwise. Diagnostic-only. |
@@ -135,8 +142,10 @@ conversations, messages, `pending_executions`.
 |------|---------|
 | `main.tsx` / `App.tsx` | Entry + three-column layout + all top-level state. Theme via `data-theme` on `<html>`, persisted to `localStorage`. |
 | `types.ts` | Shared TS types mirroring backend models. |
-| `components/ProjectList.tsx` | Left column: projects + conversations + CRUD. |
-| `components/ChatPanel.tsx` | Center: header (provider + theme selectors) + message thread + multi-modal composer (auto-grow textarea, `Ctrl/Cmd+Enter`, file upload with chips + "add to workspace", voice). Renders `RunChatCard` on `run_id` messages; `ModelPicker` above the composer gates image upload by the selected model's `vision` flag. |
+| `components/ProjectList.tsx` | Left column: Agents button (top) + projects + conversations + CRUD. |
+| `components/AgentsModal.tsx` | Agents browser: two-pane modal over `GET /api/agents` — agent list with command/capability chips, full contract detail (introduction, use cases, responsibilities, tools, approval boundary), per-agent skills readable/editable in place (Save → the skill-update endpoint). |
+| `components/CommandMenu.tsx` | Composer `@`-command autocomplete: upward popover (ModelPicker pattern) with command + name + one-line description + capability badges; rows derived from the agent registry (`buildCommandEntries`, aliases expanded). |
+| `components/ChatPanel.tsx` | Center: header (provider + theme selectors) + message thread + multi-modal composer (auto-grow textarea, `Ctrl/Cmd+Enter`, file upload with chips + "add to workspace", voice, `@`-command autocomplete with caret-token detection + ↑/↓/Enter/Tab/Esc). Renders `RunChatCard` on `run_id` messages, research-sources 🔎 chip + "Run @search" suggestion chip from message metadata; `ModelPicker` above the composer gates image upload by the selected model's `vision` flag. |
 | `components/ModelPicker.tsx` | Compact per-provider model dropdown with vision/text tags. |
 | `components/ContextPanel.tsx` | Right column: editable project memory files + `RunsSection` + env registry. |
 | `components/RunsSection.tsx` | Runs list (auto-polls while active; live files/cmds counts) + Start/Stop preview + per-row Trace. |
@@ -155,7 +164,8 @@ conversations, messages, `pending_executions`.
 
 ### A. Chat turn (non-`@code`) — `orchestrator.orchestrate()`
 1. Load SOUL + global + project memory; assemble context (+ optional `@`-mode
-   block that shapes the response without dispatching).
+   block — with the mode's built-in skills folded in, capped — that shapes the
+   response without dispatching).
 2. **Intent router.** An explicit mode `@`-command sets the mode + skips the
    judge. Else the delegation judge classifies (`dispatch_suggested` /
    `discussion` / `memory_only`) + emits an informational `intent`; a
@@ -163,9 +173,13 @@ conversations, messages, `pending_executions`.
    fallback. A non-dispatch intent also routes to the matching `orchestrate(mode=…)`.
 3. **Main response** LLM call. May emit `{"inspect_request": …}` to read a repo
    file via `inspect.py` (max 3/turn), each result fed back before the next.
+   On an explicit `@search`/`@research` turn the same loop also accepts
+   `{"research_request": …}` (§J) with its own independent budget.
 4. **Memory-intake judge** proposes updates; the backend policy-filters (SOUL +
    non-writable excluded) and writes atomically via `memory_engine`. The
    decision `reason` + turn `intent` ride on the message metadata (UI chip/badge).
+   A GENERAL research turn skips this step entirely (findings belong in a
+   project's RESEARCH.md, not global memory).
 
 → 3–4 LLM calls/turn. The request carries a `provider`/`model` (validated,
 400 on unknown); the main response routes to it, internal subsystem calls use
@@ -266,6 +280,23 @@ provider only via header/exec-env, never a contract/log/artifact/UI. Startup
 `reconcile_stuck_external_actions` clears a crash-left transient state by
 querying the provider (never auto-retries).
 
+### J. Research channel — `research.py` + `web_search.py` (Phase 10)
+The explicit `@search`/`@research` command is the **per-turn network grant**
+(`main.py` sets `research_enabled`; a judge-labeled `research` intent instead
+yields a `research_suggestion` chip that pre-fills the command — Send is the
+approval). Granted turns run the combined loop in §A with two tools:
+`web_search` (Tavily adapter; key header-only from the `search` credential
+provider; snippets only) and `fetch_url` (SSRF-screened, allowlist-gated GET →
+tag-stripped extract, per-fetch/per-turn caps, framed as untrusted evidence).
+User-pasted URLs bypass only the allowlist; cross-host redirects lose that
+privilege. Every executed action lands in `research_sources` (ChatResponse +
+persisted message metadata → the 🔎 chip), and the ordinary memory-intake
+judge distills durable findings into `RESEARCH.md ▸ Findings` (skipped for
+GENERAL). The registry behind discovery: `agents_registry` (`GET /api/agents`)
+drives both the composer autocomplete and the Agents browser; `skills_store`
+folds a mode's committed skill markdown into its guidance block, and skill
+files are written ONLY by the user's Save in the UI.
+
 ## 8. Core data model — `RunRecord` (serialized as `run.json`)
 
 Identity/outcome: `run_id`, `project_id`, `task_title`, `status`
@@ -357,6 +388,19 @@ rewrites) and are overwritten with the authoritative lists at finalize.
   inferred-intent deploy/migration/payment; `orchestrator.py` imports no
   connector (asserted). Stripe stays TEST-only; `OPS.md` is written only by
   `ops_ledger`, never an LLM.
+- **Web research is grant-gated, bounded, and egress-clean.** The Main Agent
+  reaches the web ONLY through the research channel, enabled per-turn by an
+  explicit `@search`/`@research` command — inferred intent never triggers
+  network access (it only suggests the command). Fetches are SSRF-screened +
+  domain-allowlisted (user-pasted URLs bypass only the allowlist), results are
+  bounded cited extracts (never raw page dumps) framed as untrusted, and every
+  action is audited in `research_sources`. The `redact()`-diff egress guard
+  refuses any outbound query/URL carrying a **credential-shaped** value (stored
+  secrets + known patterns); it does not (and is not relied on to) scrub
+  arbitrary memory/repo text — that stays off the wire because it is never
+  auto-injected and the channel prompt forbids sending it. Skills are curated
+  committed markdown with exactly one writer — the user's explicit Save; no
+  LLM/autonomous path writes a skill file.
 
 ## 10. Lessons worth keeping (mostly Windows + subprocess)
 

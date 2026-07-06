@@ -15,14 +15,16 @@ never edits them.
 | File             | Purpose                                                       |
 |------------------|---------------------------------------------------------------|
 | `PROJECT.md`     | The stable project definition: vision, scope, target user, tech stack. |
-| `STATUS.md`      | Current phase, latest milestone, what works, what's next.     |
-| `TASK_QUEUE.md`  | In Progress / Up Next / Done checklist for the project.        |
+| `STATUS.md`      | Current phase, latest milestone, what works, what's next, and the `## Task Queue` board (Completed / In Progress / Next). |
 | `DECISIONS.md`   | Important decisions and their rationale, over time.           |
 | `RESEARCH.md`    | Research findings, external references, technical notes.       |
+| `LESSONS.md`     | Durable, reusable project lessons from builds, failures, fixes, reviews, deployments, and decisions. |
 
 These five files are seeded automatically when a project is created, then
 evolve through chat (policy-filtered memory writeback) and post-run
-reconciliation.
+reconciliation. (Before Phase 10.2 the task board lived in a separate
+`TASK_QUEUE.md`; it is now a section inside `STATUS.md`, and legacy files are
+migrated automatically on startup.)
 
 ## What's committed vs. private
 
@@ -32,9 +34,9 @@ files so the layout is documented:
 
 - `PROJECT.example.md`
 - `STATUS.example.md`
-- `TASK_QUEUE.example.md`
 - `DECISIONS.example.md`
 - `RESEARCH.example.md`
+- `LESSONS.example.md`
 
 In a real install these live together inside one `projects/{project_id}/`
 folder (one set per project), not flat at the root — they're flattened here

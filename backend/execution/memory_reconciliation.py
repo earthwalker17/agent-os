@@ -12,7 +12,7 @@ Design constraints:
     full repo contents.
 
   - **Bounded write surface.** The reconciler may only propose updates to
-    ``STATUS.md`` / ``TASK_QUEUE.md`` / ``DECISIONS.md`` / ``RESEARCH.md``.
+    ``STATUS.md`` / ``DECISIONS.md`` / ``RESEARCH.md`` / ``LESSONS.md``.
     ``PROJECT.md``, all global memory, ``SOUL.md``, and repo source files are
     out of scope. Writes route through the existing policy-filtered
     ``apply_memory_update`` so the writeback layer also rejects anything else.
@@ -239,15 +239,20 @@ You are the post-run memory reconciliation subsystem of Agent OS.
 A Coding Agent has just finished a bounded run inside a project's sandboxed
 `repo/` workspace. Your job: examine a compact summary of that run plus the
 current state of the project's memory files, then decide whether any of the
-four writable project memory files should be updated to reflect the outcome.
+writable project memory files should be updated to reflect the outcome.
 
 ## Files you can write
-- STATUS.md: current phase, latest milestone, what works, what's next.
-- TASK_QUEUE.md: actionable task tracking with checkboxes (In Progress / Up
-  Next / Done sections; `- [ ]` and `- [x]`).
+- STATUS.md: current phase, latest milestone, what works, what's next. Its
+  `## Task Queue` section holds the task board (`### Completed` / `### In
+  Progress` / `### Next`, with `- [ ]` and `- [x]` checkboxes) — to update the
+  board, use action "replace" on the `Task Queue` section and rewrite it,
+  KEEPING the three `###` subsections.
 - DECISIONS.md: important project decisions with rationale (including "we
   tried X and it didn't work" notes from failed runs).
 - RESEARCH.md: useful findings, external references, technical notes.
+- LESSONS.md: durable, reusable project lessons learned from this run —
+  build/failure/fix patterns, review findings, deployment gotchas. One concise
+  bullet per lesson under the `Lessons` section.
 
 ## Files you MUST NOT write
 - PROJECT.md (project definition — out of scope for run reconciliation).
@@ -271,7 +276,8 @@ four writable project memory files should be updated to reflect the outcome.
    "what we learned" finding may produce one short DECISIONS.md or
    RESEARCH.md entry.
 6. Use action "append" for new content, "replace" to overwrite a section.
-   For TASK_QUEUE.md use `- [ ]` / `- [x]` checkbox format.
+   For the STATUS.md `Task Queue` board, use `- [ ]` / `- [x]` checkbox format
+   and preserve the `### Completed` / `### In Progress` / `### Next` structure.
 7. Keep each update concise: one update per file, no repetition.
 8. The "section" field must name an existing `##` heading in the file, or
    the writer will create that heading.
@@ -285,7 +291,7 @@ Schema:
   "reason": "one short sentence justifying the decision",
   "updates": [
     {
-      "file": "STATUS.md" | "TASK_QUEUE.md" | "DECISIONS.md" | "RESEARCH.md",
+      "file": "STATUS.md" | "DECISIONS.md" | "RESEARCH.md" | "LESSONS.md",
       "section": "name of existing or new ## heading",
       "content": "clean markdown to write into that section",
       "action": "append" | "replace"
@@ -315,7 +321,7 @@ def _build_user_prompt(
         return f"### {label}\n" + "\n".join(f"- {x}" for x in items)
 
     memory_block_parts: list[str] = []
-    for name in ("STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RESEARCH.md"):
+    for name in ("STATUS.md", "DECISIONS.md", "RESEARCH.md", "LESSONS.md"):
         body = memory_snapshot.get(name, "") or "(empty)"
         memory_block_parts.append(f"### {name}\n{body}")
     memory_block = "\n\n".join(memory_block_parts)

@@ -47,6 +47,7 @@ from .models import (
 )
 from .memory_reconciliation import reconcile_run_memory
 from .recovery import assess_run
+from .skill_patch import propose_skill_patch
 from .integration import integrate_wave
 from .patch_workspace import (
     PatchToolRuntime,
@@ -2169,6 +2170,15 @@ class CodingAgentRunner:
         # fails finalization. Green runs are skipped inside `assess_run`.
         try:
             assess_run(self.project_id, run_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Phase 10.2 — review-first suggested skill patch. Best-effort and
+        # green-only (skipped inside for non-``completed`` runs); it only
+        # PROPOSES a skill refinement onto run.json for the user to Apply /
+        # Reject / Edit — it never writes a skill file and never fails finalize.
+        try:
+            propose_skill_patch(self.project_id, run_id, summary_override=summary)
         except Exception:  # noqa: BLE001
             pass
 

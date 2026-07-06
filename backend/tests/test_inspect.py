@@ -395,7 +395,7 @@ def test_orchestrate_no_workspace_returns_text_directly():
         layout.make_project("no-ws")
         # No workspace initialized → no inspection loop.
         caller = _make_caller(["Hello — answer from memory."])
-        text, inspected = orchestrator.orchestrate(
+        text, inspected, _research = orchestrator.orchestrate(
             "no-ws", "What's the project status?", history=[], llm_caller=caller,
         )
         assert text == "Hello — answer from memory."
@@ -410,7 +410,7 @@ def test_orchestrate_general_workspace_skips_inspection():
     def body(layout: _TempLayout):
         _seed_minimal_memory(layout)
         caller = _make_caller(["Reply from GENERAL."])
-        text, inspected = orchestrator.orchestrate(
+        text, inspected, _research = orchestrator.orchestrate(
             "__GENERAL__", "What's up?", history=[], llm_caller=caller,
         )
         assert text == "Reply from GENERAL."
@@ -427,7 +427,7 @@ def test_orchestrate_with_workspace_no_inspection_needed():
         layout.init_workspace("agent-os", {"README.md": "# repo\n"})
         # LLM answers directly — no inspect_request emitted.
         caller = _make_caller(["I can answer this without inspecting any files."])
-        text, inspected = orchestrator.orchestrate(
+        text, inspected, _research = orchestrator.orchestrate(
             "agent-os", "Summarize the project plan.", history=[], llm_caller=caller,
         )
         assert text.startswith("I can answer this")
@@ -448,7 +448,7 @@ def test_orchestrate_inspect_then_answer():
             json.dumps({"inspect_request": {"tool": "read_file", "path": "src/main.py"}}),
             "I read src/main.py and found a healthcheck function.",
         ])
-        text, inspected = orchestrator.orchestrate(
+        text, inspected, _research = orchestrator.orchestrate(
             "agent-os",
             "What's in src/main.py?",
             history=[],
@@ -483,7 +483,7 @@ def test_orchestrate_caps_at_max_inspections():
             infinite_request,  # step 2  → run inspection #3
             "Final answer forced after cap.",  # step 3 (force_text)
         ])
-        text, inspected = orchestrator.orchestrate(
+        text, inspected, _research = orchestrator.orchestrate(
             "agent-os", "tell me about a.txt", history=[], llm_caller=caller,
         )
         assert text == "Final answer forced after cap."
@@ -503,7 +503,7 @@ def test_orchestrate_records_failed_inspection_and_lets_model_recover():
             json.dumps({"inspect_request": {"tool": "read_file", "path": "../../etc/passwd"}}),
             "I couldn't read that path because it escapes the sandbox.",
         ])
-        text, inspected = orchestrator.orchestrate(
+        text, inspected, _research = orchestrator.orchestrate(
             "agent-os",
             "Read /etc/passwd",
             history=[],

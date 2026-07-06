@@ -209,6 +209,20 @@ export interface RecoveryAssessment {
   error?: string | null
 }
 
+/** Phase 10.2 — a review-first suggested skill patch from a green run. */
+export interface SkillPatchProposal {
+  proposed: boolean
+  target_agent_id: string
+  target_skill_id: string
+  target_skill_title: string
+  rationale?: string
+  evidence?: string
+  current_content: string
+  proposed_content: string
+  status: 'proposed' | 'applied' | 'rejected'
+  error?: string | null
+}
+
 /** Phase 5 — the run's persisted plan + task graph. */
 export interface ExecutionPlan {
   goal?: string
@@ -289,6 +303,8 @@ export interface RunRecord {
   memory_reconciliation_reason?: string | null
   /** Phase 6 — Main-Agent recovery assessment for a non-green run (null if green). */
   recovery_assessment?: RecoveryAssessment | null
+  /** Phase 10.2 — review-first suggested skill patch from a green run (null otherwise). */
+  skill_patch?: SkillPatchProposal | null
   /** Phase 6.1 — recovery lineage + budget. ``recovery_of`` is the run this one
    * was auto-recovered from; ``recovered_by`` is the recovery run spawned from
    * this one (set once a recovery exists, whether auto or confirmed). */
@@ -530,4 +546,60 @@ export interface ExternalActionResponse {
   applied: boolean
   async?: boolean
   run?: RunRecord
+}
+
+// --- Phase 10 — Agents / Skills / Research ---
+
+/** One built-in skill index entry (body fetched on demand). */
+export interface SkillInfo {
+  id: string
+  title: string
+  description: string
+}
+
+/** Coarse capability badges (UI-facing; enforcement lives in the backend). */
+export interface AgentCapabilities {
+  read_only: boolean
+  writes_memory: boolean
+  writes_repo: boolean
+  searches_web: boolean
+  deploys: boolean
+  dispatches_runs: boolean
+  requires_confirmation: boolean
+}
+
+/** One system agent profile from GET /api/agents (agents_registry). */
+export interface AgentInfo {
+  id: string
+  name: string
+  command: string
+  aliases: string[]
+  mode: string
+  role_id: string
+  status: 'active' | 'planned'
+  introduction: string
+  use_cases: string[]
+  responsibilities: string[]
+  tool_categories: string[]
+  approval_boundary: string
+  capabilities: AgentCapabilities
+  skills: SkillInfo[]
+}
+
+/** One research-channel action from an @search turn (message metadata). */
+export interface ResearchSource {
+  tool: string
+  query?: string
+  url?: string
+  title?: string
+  ok: boolean
+  truncated?: boolean
+  error?: string | null
+}
+
+/** Semantic research proposal riding on an assistant message: the UI offers
+ * to pre-fill `@search <query>` — sending it is the user's explicit grant. */
+export interface ResearchSuggestion {
+  command: string
+  query: string
 }

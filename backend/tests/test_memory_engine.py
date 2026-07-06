@@ -103,23 +103,23 @@ def test_append_new_short_entry_that_is_a_substring_still_writes():
     substring of existing content (the old raw-substring dedup lost writes)."""
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
-        (base / "TASK_QUEUE.md").write_text(
-            "# Task Queue\n\n## Queue\n- Add /healthcheck endpoint with a Pydantic model\n",
+        (base / "STATUS.md").write_text(
+            "# Status\n\n## Task Queue\n- Add /healthcheck endpoint with a Pydantic model\n",
             encoding="utf-8",
         )
         # "- [x] Add /healthcheck" is a substring of the existing line but is a
         # genuinely new, distinct entry — it must be appended, not rejected.
         ok = apply_update(
-            base, allow=WRITABLE_PROJECT, filename="TASK_QUEUE.md",
-            section="Queue", content="- [x] Add /healthcheck", action="append",
+            base, allow=WRITABLE_PROJECT, filename="STATUS.md",
+            section="Task Queue", content="- [x] Add /healthcheck", action="append",
         )
         assert ok is True
-        text = (base / "TASK_QUEUE.md").read_text(encoding="utf-8")
+        text = (base / "STATUS.md").read_text(encoding="utf-8")
         assert "- [x] Add /healthcheck" in text
         # An EXACT repeat of that same line is still deduped.
         ok2 = apply_update(
-            base, allow=WRITABLE_PROJECT, filename="TASK_QUEUE.md",
-            section="Queue", content="- [x] Add /healthcheck", action="append",
+            base, allow=WRITABLE_PROJECT, filename="STATUS.md",
+            section="Task Queue", content="- [x] Add /healthcheck", action="append",
         )
         assert ok2 is False
 
@@ -227,6 +227,146 @@ def test_scaffold_is_idempotent_and_additive():
         # Second call is a no-op for already-complete files.
         second = ensure_memory_scaffold(base, "Existing")
         assert "STATUS.md" not in second
+
+
+# ---------- Phase 10.2 — TASK_QUEUE -> STATUS merge + LESSONS.md ----------
+
+def test_task_queue_no_longer_a_writable_file_or_canonical():
+    assert "TASK_QUEUE.md" not in memory_engine.WRITABLE_PROJECT
+    assert "TASK_QUEUE.md" not in memory_engine.RECONCILIATION_WRITABLE
+    assert "TASK_QUEUE.md" not in memory_engine.CANONICAL_SECTIONS
+    assert "Task Queue" in memory_engine.CANONICAL_SECTIONS["STATUS.md"]
+
+
+def test_lessons_is_writable_and_scaffolded():
+    assert "LESSONS.md" in memory_engine.WRITABLE_PROJECT
+    assert "LESSONS.md" in memory_engine.RECONCILIATION_WRITABLE
+    assert memory_engine.CANONICAL_SECTIONS["LESSONS.md"] == ["Lessons"]
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "proj"
+        ensure_memory_scaffold(base, "P")
+        lessons = (base / "LESSONS.md").read_text(encoding="utf-8")
+        assert "## Lessons" in lessons and lessons.startswith("# Lessons: P")
+
+
+def test_scaffold_status_carries_task_queue_board():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "proj"
+        ensure_memory_scaffold(base, "P")
+        status = (base / "STATUS.md").read_text(encoding="utf-8")
+        assert "## Task Queue" in status
+        for sub in ("### Completed", "### In Progress", "### Next"):
+            assert sub in status
+        # the standalone file is not created
+        assert not (base / "TASK_QUEUE.md").exists()
+
+
+def test_migration_folds_legacy_task_queue_into_status_and_removes_it():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "proj"
+        base.mkdir(parents=True)
+        (base / "STATUS.md").write_text(
+            "# Status: Legacy\n\n## Current Phase\nBuild\n", encoding="utf-8"
+        )
+        (base / "TASK_QUEUE.md").write_text(
+            "# Task Queue: Legacy\n\n## In Progress\n- [ ] wire the API\n\n"
+            "## Up Next\n- [ ] add tests\n\n## Done\n- [x] scaffold\n",
+            encoding="utf-8",
+        )
+        migrated = memory_engine.migrate_task_queue_into_status(base)
+        assert migrated is True
+        status = (base / "STATUS.md").read_text(encoding="utf-8")
+        # legacy content preserved, mapped to the new subsections
+        assert "## Task Queue" in status
+        assert "- [ ] wire the API" in status   # In Progress
+        assert "- [ ] add tests" in status      # Up Next -> Next
+        assert "- [x] scaffold" in status       # Done -> Completed
+        assert "### Completed" in status and "### Next" in status
+        # status prose above is untouched
+        assert "## Current Phase" in status and "Build" in status
+        # standalone file removed
+        assert not (base / "TASK_QUEUE.md").exists()
+        # idempotent: a second call is a no-op
+        assert memory_engine.migrate_task_queue_into_status(base) is False
+
+
+def test_migration_preserves_preamble_items_before_first_heading():
+    # Hand-edited TASK_QUEUE.md with an item ABOVE the first ## heading must not
+    # be lost when the file is folded in and then removed.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "proj"
+        base.mkdir(parents=True)
+        (base / "STATUS.md").write_text("# Status\n\n## Current Phase\nGo\n", encoding="utf-8")
+        (base / "TASK_QUEUE.md").write_text(
+            "# Task Queue: P\n- [ ] PREAMBLE ITEM before any heading\n\n"
+            "## In Progress\n- [ ] wire it\n",
+            encoding="utf-8",
+        )
+        assert memory_engine.migrate_task_queue_into_status(base) is True
+        status = (base / "STATUS.md").read_text(encoding="utf-8")
+        assert "PREAMBLE ITEM before any heading" in status  # not dropped
+        assert "- [ ] wire it" in status
+        assert not (base / "TASK_QUEUE.md").exists()
+
+
+def test_append_is_section_aware_not_end_of_file():
+    # A Phase 10.2 regression: STATUS.md ends with the ## Task Queue board, so a
+    # blind EOF append would misfile a write inside the board. Append must land
+    # inside the NAMED section instead.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "STATUS.md").write_text(
+            "# Status\n\n## What Works\n- login works\n\n## Task Queue\n"
+            "### Completed\n- [x] scaffold\n\n### In Progress\n\n### Next\n",
+            encoding="utf-8",
+        )
+        ok = apply_update(
+            base, allow=WRITABLE_PROJECT, filename="STATUS.md",
+            section="What Works", content="- OAuth works", action="append",
+        )
+        assert ok is True
+        text = (base / "STATUS.md").read_text(encoding="utf-8")
+        # the new bullet is under What Works, BEFORE the Task Queue board
+        wanted_pos = text.index("- OAuth works")
+        board_pos = text.index("## Task Queue")
+        assert wanted_pos < board_pos, "append landed inside the Task Queue board"
+        # the board is intact
+        assert "- [x] scaffold" in text
+
+
+def test_append_falls_back_to_eof_for_single_section_file():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "RESEARCH.md").write_text("# Research\n\n## Findings\n- a\n", encoding="utf-8")
+        ok = apply_update(
+            base, allow=WRITABLE_PROJECT, filename="RESEARCH.md",
+            section="Findings", content="- b", action="append",
+        )
+        assert ok is True
+        assert "- b" in (base / "RESEARCH.md").read_text(encoding="utf-8")
+
+
+def test_migration_is_noop_without_legacy_file():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "proj"
+        base.mkdir(parents=True)
+        (base / "STATUS.md").write_text("# Status\n", encoding="utf-8")
+        assert memory_engine.migrate_task_queue_into_status(base) is False
+
+
+def test_scaffold_runs_migration_first():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "proj"
+        base.mkdir(parents=True)
+        (base / "TASK_QUEUE.md").write_text(
+            "# Task Queue\n\n## Done\n- [x] legacy item\n", encoding="utf-8"
+        )
+        ensure_memory_scaffold(base, "P")
+        status = (base / "STATUS.md").read_text(encoding="utf-8")
+        assert "- [x] legacy item" in status
+        assert not (base / "TASK_QUEUE.md").exists()
+        # no empty duplicate Task Queue section
+        assert status.count("## Task Queue") == 1
 
 
 # ---------- orchestrator wrappers (the previously-untested chat-turn write path) ----------

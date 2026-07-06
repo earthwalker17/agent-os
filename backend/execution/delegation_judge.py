@@ -10,7 +10,7 @@ buckets:
   - ``discussion`` — ordinary planning, architecture, explanation, or status
     Q&A. The orchestrator handles it normally.
   - ``memory_only`` — the user is asking for project memory (STATUS.md /
-    TASK_QUEUE.md / DECISIONS.md / RESEARCH.md / PROJECT.md) to be updated,
+    DECISIONS.md / RESEARCH.md / LESSONS.md / PROJECT.md) to be updated,
     but is not asking for changes inside ``repo/``. The orchestrator handles
     it normally — the existing memory writeback pipeline picks it up.
 
@@ -123,7 +123,7 @@ Each non-`@code` user message in a project chat must be classified into ONE of:
   status questions, ideation, brainstorming, explanations. The user is
   talking with the orchestrator, not requesting code execution.
 - "memory_only": The user is asking for project memory files to be updated
-  (STATUS.md, TASK_QUEUE.md, DECISIONS.md, RESEARCH.md, PROJECT.md) but is
+  (STATUS.md, DECISIONS.md, RESEARCH.md, LESSONS.md, PROJECT.md) but is
   NOT asking for changes inside `repo/`.
 
 Critical rules:
@@ -248,17 +248,17 @@ def _build_history_block(
 def _load_memory_snapshot(project_id: str) -> str:
     """Return a small compact snapshot of project memory for the judge.
 
-    We do not load all five files at full size — the judge mainly uses
-    STATUS.md and TASK_QUEUE.md to resolve "continue" / "do that" follow-ups.
-    PROJECT.md gives the project flavor in case the user message refers to
-    the system being built.
+    We do not load every file at full size — the judge mainly uses STATUS.md
+    (which now carries the ``## Task Queue`` board) to resolve "continue" / "do
+    that" follow-ups. PROJECT.md gives the project flavor in case the user
+    message refers to the system being built.
     """
     project_path = _PROJECTS_DIR / project_id
     if not project_path.exists():
         return "(no project memory available)"
 
     parts: list[str] = []
-    for filename in ("PROJECT.md", "STATUS.md", "TASK_QUEUE.md"):
+    for filename in ("PROJECT.md", "STATUS.md"):
         fpath = project_path / filename
         if not fpath.exists():
             continue

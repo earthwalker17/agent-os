@@ -87,6 +87,15 @@ _PROVIDERS: dict[str, dict] = {
         "secret_fields": ("secret_key", "webhook_secret"),
         "meta_fields": ("account", "publishable_key"),
     },
+    # Phase 10 — web-search API key for the research channel (Tavily v1;
+    # ``engine`` metadata selects the adapter when others land). Only Tavily
+    # env names here — a Brave key must not silently ride the Tavily path.
+    "search": {
+        "env_vars": ("TAVILY_API_KEY", "AGENT_OS_SEARCH_API_KEY"),
+        "token_field": "api_key",
+        "secret_fields": ("api_key",),
+        "meta_fields": ("engine",),
+    },
 }
 
 # A Stripe API key (publishable / secret / restricted) must be a TEST key unless

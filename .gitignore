@@ -33,9 +33,9 @@ projects/*
 !projects/README.md
 !projects/PROJECT.example.md
 !projects/STATUS.example.md
-!projects/TASK_QUEUE.example.md
 !projects/DECISIONS.example.md
 !projects/RESEARCH.example.md
+!projects/LESSONS.example.md
 !projects/OPS.example.md
 
 # Execution workspaces - generated agent artifacts, logs, repo sandboxes.

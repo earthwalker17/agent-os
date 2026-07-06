@@ -58,7 +58,9 @@ INSPECT_MAX_LIST_ENTRIES = 150
 INSPECT_MAX_SEARCH_HITS = 30
 
 
-VALID_TOOLS = {"list_files", "read_file", "search_files"}
+# ``retrieve`` (Phase 10.2) is the bounded local-RAG tool — memory + run
+# history + repo map as one compact cited bundle (see local_rag.py).
+VALID_TOOLS = {"list_files", "read_file", "search_files", "retrieve"}
 
 
 # ---------- data shape ----------
@@ -341,6 +343,24 @@ def execute_inspect_request(project_id: str, request: dict) -> InspectionResult:
         query = str(request.get("query") or "").strip()
         path = str(request.get("path") or ".").strip() or "."
         return search_repo_files(project_id, query, path)
+    if tool == "retrieve":
+        # Phase 10.2 — bounded local RAG over memory + run history + repo.
+        # Lazy import keeps the inspect <-> local_rag edge one-directional.
+        from . import local_rag
+
+        query = str(request.get("query") or "").strip()
+        raw_kinds = request.get("kinds")
+        kinds = [str(k) for k in raw_kinds] if isinstance(raw_kinds, list) else None
+        result = local_rag.retrieve(project_id, query, kinds=kinds)
+        return InspectionResult(
+            ok=result.ok,
+            kind="retrieve",
+            query=query,
+            content=result.to_text(),
+            truncated=result.truncated,
+            note=result.note,
+            error=result.error,
+        )
     return InspectionResult(
         ok=False,
         kind=tool or "unknown",
@@ -397,6 +417,13 @@ def inspect_system_prompt_section() -> str:
         "  {\"inspect_request\": {\"tool\": \"list_files\", \"path\": \".\"}}\n"
         "  {\"inspect_request\": {\"tool\": \"read_file\", \"path\": \"path/relative/to/repo\"}}\n"
         "  {\"inspect_request\": {\"tool\": \"search_files\", \"query\": \"...\", \"path\": \".\"}}\n"
+        "  {\"inspect_request\": {\"tool\": \"retrieve\", \"query\": \"...\"}}\n"
+        "\n"
+        "The `retrieve` tool is bounded LOCAL retrieval: it returns compact, cited "
+        "evidence from THIS project's memory (status/decisions/research/lessons), its "
+        "recent run history (plans/failures/fixes), and a repo map. Prefer it when the "
+        "answer may already live in the project's own memory or past runs. (Optional "
+        "`\"kinds\": [\"memory\",\"runs\",\"repo\"]` narrows the sources.)\n"
         "\n"
         "Rules:\n"
         "- Paths are relative to `repo/`. Never use absolute paths. Never use `..`.\n"

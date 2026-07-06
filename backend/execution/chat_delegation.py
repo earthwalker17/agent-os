@@ -52,6 +52,11 @@ def is_code_delegation(message: str) -> bool:
 # a run), these only SHAPE the Main Agent's chat response via an orchestration
 # "mode" string. NONE of them dispatch anything — execution still requires
 # `@code` or clicking "OK, run this" on a proposed plan.
+# Phase 10 — `@search` / `@research` (one mode, two spellings): besides shaping
+# the response, the explicit command is the per-turn grant that lets the chat
+# endpoint enable the bounded research channel (see main.py). The command being
+# explicit is the approval boundary — inferred `research` intent routes to the
+# same mode but NEVER enables network access.
 MODE_COMMANDS: dict[str, str] = {
     "@plan": "plan",
     "@design": "design",
@@ -59,6 +64,8 @@ MODE_COMMANDS: dict[str, str] = {
     "@review": "review",
     "@inspect": "inspect",
     "@memory": "memory",
+    "@search": "research",
+    "@research": "research",
 }
 
 

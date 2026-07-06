@@ -92,6 +92,8 @@ from uploads import (
 )
 import providers
 import credentials
+import agents_registry
+import skills_store
 
 app = FastAPI(title="Agent OS Backend")
 
@@ -104,7 +106,8 @@ app.add_middleware(
 
 PROJECTS_DIR = Path(__file__).resolve().parent.parent / "projects"
 
-MEMORY_FILES = ["PROJECT.md", "STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RESEARCH.md"]
+# Phase 10.2 — TASK_QUEUE.md merged into STATUS.md (## Task Queue); LESSONS.md added.
+MEMORY_FILES = ["PROJECT.md", "STATUS.md", "DECISIONS.md", "RESEARCH.md", "LESSONS.md"]
 
 
 @app.on_event("startup")
@@ -218,10 +221,12 @@ def api_get_project_context(project_id: str):
 
 DEFAULT_MEMORY_CONTENT = {
     "PROJECT.md": "# {name}\n\n## Vision\n(describe the project vision here)\n\n## Scope\n- (list key scope items)\n\n## Target User\n(who is this for?)\n\n## Tech Stack\n- (list technologies)\n",
-    "STATUS.md": "# Status: {name}\n\n## Current Phase\nPlanning\n\n## Latest Milestone\nProject created\n\n## What Works\n- Project folder initialized\n\n## Next Up\n- Define project scope and goals\n",
-    "TASK_QUEUE.md": "# Task Queue: {name}\n\n## In Progress\n- [ ] Define project scope and requirements\n\n## Up Next\n- [ ] Set up initial project structure\n\n## Done\n- [x] Project created\n",
+    # Phase 10.2 — the task board is now a ## Task Queue section inside STATUS.md
+    # (### Completed / ### In Progress / ### Next), no longer a standalone file.
+    "STATUS.md": "# Status: {name}\n\n## Current Phase\nPlanning\n\n## Latest Milestone\nProject created\n\n## What Works\n- Project folder initialized\n\n## Next Up\n- Define project scope and goals\n\n## Task Queue\n\n### Completed\n\n- [x] Project created\n\n### In Progress\n\n- [ ] Define project scope and requirements\n\n### Next\n\n- [ ] Set up initial project structure\n",
     "DECISIONS.md": "# Decisions: {name}\n\n## Decisions\n(record important project decisions and their rationale here)\n",
     "RESEARCH.md": "# Research: {name}\n\n## Findings\n(record research findings, external references, and technical notes here)\n",
+    "LESSONS.md": "# Lessons: {name}\n\n## Lessons\n(durable project lessons from builds, failures, fixes, reviews, deployments, and decisions are captured here)\n",
 }
 
 
@@ -519,6 +524,51 @@ def api_list_model_providers():
     }
 
 
+# --- Agent registry & skills endpoints (Phase 10) ---
+
+
+@app.get("/api/agents")
+def api_list_agents():
+    """The agent profile registry for the Agents browser + composer autocomplete.
+
+    Global, read-only, structured data (agents_registry) — skill bodies are
+    NOT included; the UI fetches one on demand via the skill read endpoint.
+    """
+    return {"agents": agents_registry.agents_for_ui()}
+
+
+@app.get("/api/agents/{agent_id}/skills/{skill_id}")
+def api_read_agent_skill(agent_id: str, skill_id: str):
+    """Read one built-in skill's markdown body (registry-validated pair)."""
+    ref = agents_registry.skill_ref(agent_id, skill_id)
+    if ref is None:
+        raise HTTPException(status_code=404, detail="Unknown agent or skill")
+    return {
+        "agent_id": agent_id,
+        "skill_id": ref.id,
+        "title": ref.title,
+        "description": ref.description,
+        "content": skills_store.read_skill(agent_id, ref.id),
+    }
+
+
+class UpdateSkillRequest(BaseModel):
+    content: str
+
+
+@app.post("/api/agents/{agent_id}/skills/{skill_id}")
+def api_update_agent_skill(agent_id: str, skill_id: str, req: UpdateSkillRequest):
+    """Persist a manual skill edit (the ONLY write path for skill files —
+    there is no LLM/autonomous route to this content)."""
+    if agents_registry.skill_ref(agent_id, skill_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown agent or skill")
+    try:
+        skills_store.write_skill(agent_id, skill_id, req.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "ok"}
+
+
 # --- Chat endpoint ---
 
 class ChatRequest(BaseModel):
@@ -574,6 +624,14 @@ class ChatResponse(BaseModel):
     # the user, surface that list so the UI can clearly distinguish
     # answers grounded in memory from answers grounded in file reads.
     inspected_files: list[dict] = []
+    # Phase 10 — the research actions (search / fetch) an explicit `@search`
+    # turn performed, for the sources chip + audit trail. [] otherwise.
+    research_sources: list[dict] = []
+    # Phase 10 — set when the judge labeled an ordinary message `research`:
+    # a {command, query} proposal the UI offers to pre-fill as `@search …`.
+    # Sending that message is the user's explicit network grant — the
+    # suggestion itself never triggers any network access.
+    research_suggestion: dict | None = None
 
 
 # Phase 6.1 — map a judged intent label (delegation_judge.INTENT_LABELS) to an
@@ -720,6 +778,13 @@ def api_chat(req: ChatRequest):
     mode_command, _mode_body = parse_mode_command(req.message)
     turn_intent: str = mode_command or ""
 
+    # Phase 10 — the explicit `@search`/`@research` command is the per-turn
+    # NETWORK GRANT for the bounded research channel. Nothing else sets this:
+    # a judge-labeled `research` intent routes to the research mode below but
+    # never enables web access. GENERAL is allowed (user decision) — but a
+    # GENERAL research turn skips memory intake entirely (see below).
+    research_enabled = mode_command == "research"
+
     if not is_general and mode_command is None:
         project_name = _project_display_name(project_id)
         decision = judge_delegation(
@@ -752,24 +817,30 @@ def api_chat(req: ChatRequest):
     # Task 07.1 — route the main response to the selected provider; Provider
     # Registry 2.0 — pin the selected model within that provider. Phase 6 —
     # ``mode`` shapes the system prompt for `@`-commands and (6.1) routed intents.
-    response_content, inspected_files = orchestrate(
+    response_content, inspected_files, research_sources = orchestrate(
         project_id, effective_message, history=history,
         provider=provider_id, model=model_id, mode=turn_mode,
+        research_enabled=research_enabled,
     )
 
     # Memory judgment (Phase 6): one structured intake decision per turn, scoped
     # global vs project. Carries a reason the UI can surface; never fails the turn.
     # Done before persisting the assistant message so its outcome (intent +
     # memory reason) can ride in the message metadata and survive a reload.
-    ctx = load_memory(project_id)
-    scope = "global" if is_general else "project"
-    mem_decision = judge_memory_intake(
-        scope, ctx, effective_message, response_content, intent=turn_intent or None
-    )
-    applied = apply_memory_decision(
-        mem_decision, scope, project_id=None if is_general else project_id
-    )
-    memory_reason = mem_decision.reason if applied else ""
+    # Phase 10 — a GENERAL `@search` turn skips memory intake entirely: research
+    # findings belong in a project's RESEARCH.md, not in global memory.
+    applied: list[dict] = []
+    memory_reason = ""
+    if not (research_enabled and is_general):
+        ctx = load_memory(project_id)
+        scope = "global" if is_general else "project"
+        mem_decision = judge_memory_intake(
+            scope, ctx, effective_message, response_content, intent=turn_intent or None
+        )
+        applied = apply_memory_decision(
+            mem_decision, scope, project_id=None if is_general else project_id
+        )
+        memory_reason = mem_decision.reason if applied else ""
 
     # Persist assistant reply. Include inspection list (06.1) + the Phase 6
     # intent / memory-reason so the chat history re-renders the badges/chips on
@@ -777,6 +848,17 @@ def api_chat(req: ChatRequest):
     assistant_meta: dict = {}
     if inspected_files:
         assistant_meta["inspected_files"] = inspected_files
+    # Phase 10 — persist the research audit trail + the semantic suggestion the
+    # same way (metadata survives reload, mirroring inspected_files).
+    if research_sources:
+        assistant_meta["research_sources"] = research_sources
+    research_suggestion: dict | None = None
+    if turn_intent == "research" and mode_command is None and not is_general:
+        research_suggestion = {
+            "command": "@search",
+            "query": effective_message[:300],
+        }
+        assistant_meta["research_suggestion"] = research_suggestion
     if turn_intent:
         assistant_meta["intent"] = turn_intent
     if memory_reason:
@@ -807,6 +889,8 @@ def api_chat(req: ChatRequest):
         intent=turn_intent,
         message_id=assistant_msg["id"],
         inspected_files=inspected_files,
+        research_sources=research_sources,
+        research_suggestion=research_suggestion,
     )
 
 
@@ -1508,6 +1592,42 @@ def api_retry_run(project_id: str, run_id: str):
         project_id, run_id, {"type": "run_retried", "new_run_id": new_record.run_id}
     )
     return new_record.model_dump()
+
+
+# --- Suggested skill patch (Phase 10.2) — review-first self-improvement ---
+# A green run may PROPOSE a skill refinement (stored on run.json). Applying goes
+# through skills_store (the sole skill write path) only on this explicit action.
+
+
+class ApplySkillPatchRequest(BaseModel):
+    # Optional user-edited content; when omitted, the proposal's content is used.
+    content: str | None = None
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/skill-patch/apply")
+def api_apply_skill_patch(project_id: str, run_id: str, req: ApplySkillPatchRequest):
+    _require_workspace(project_id)
+    from execution import skill_patch
+
+    try:
+        updated = skill_patch.apply_skill_patch(
+            project_id, run_id, content_override=req.content
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return updated.model_dump()
+
+
+@app.post("/api/projects/{project_id}/execution/runs/{run_id}/skill-patch/reject")
+def api_reject_skill_patch(project_id: str, run_id: str):
+    _require_workspace(project_id)
+    from execution import skill_patch
+
+    try:
+        updated = skill_patch.reject_skill_patch(project_id, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return updated.model_dump()
 
 
 class ProposeRecoveryRequest(BaseModel):
@@ -3049,6 +3169,26 @@ def api_inspect_read(project_id: str, req: InspectReadRequest):
 def api_inspect_search(project_id: str, req: InspectSearchRequest):
     _require_project(project_id)
     result = search_repo_files(project_id, req.query, req.path)
+    return result.to_dict()
+
+
+# --- Local RAG (Phase 10.2) — bounded local retrieval over memory + runs + repo ---
+
+
+class RetrieveRequest(BaseModel):
+    query: str = ""
+    kinds: list[str] | None = None
+
+
+@app.post("/api/projects/{project_id}/retrieve")
+def api_retrieve(project_id: str, req: RetrieveRequest):
+    """Bounded, cited local retrieval (project memory + run history + repo map).
+    The same engine the Main Agent's ``retrieve`` inspection tool uses — exposed
+    for the UI and for auditability."""
+    _require_project(project_id)
+    from execution import local_rag
+
+    result = local_rag.retrieve(project_id, req.query, kinds=req.kinds)
     return result.to_dict()
 
 

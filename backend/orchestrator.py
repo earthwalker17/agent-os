@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 from llm import chat as llm_chat
 import memory_engine
+import skills_store
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +38,10 @@ MEMORY_DIR = Path(__file__).resolve().parent.parent / "memory"
 PROJECTS_DIR = Path(__file__).resolve().parent.parent / "projects"
 
 GLOBAL_MEMORY_FILES = ["USER.md", "WORKSTYLE.md", "SOUL.md", "MEMORY.md"]
+# Phase 10.2 — TASK_QUEUE.md merged into STATUS.md's ``## Task Queue``;
+# LESSONS.md added for durable project lessons.
 PROJECT_MEMORY_FILES = [
-    "PROJECT.md", "STATUS.md", "TASK_QUEUE.md", "DECISIONS.md", "RESEARCH.md",
+    "PROJECT.md", "STATUS.md", "DECISIONS.md", "RESEARCH.md", "LESSONS.md",
 ]
 
 # Files that may be auto-written by the memory update pipeline.
@@ -63,9 +66,9 @@ class MemoryContext:
     # Project (empty for GENERAL workspace)
     project: str
     status: str
-    task_queue: str
     decisions: str
     research: str
+    lessons: str
     # Derived
     project_name: str
     project_id: str
@@ -98,16 +101,16 @@ def load_memory(project_id: str, history: list[dict] | None = None) -> MemoryCon
     global_memory = _read(MEMORY_DIR / "MEMORY.md")
 
     # Project memory (empty for GENERAL workspace)
-    project = status = task_queue = decisions = research = ""
+    project = status = decisions = research = lessons = ""
     project_name = project_id
 
     if project_id != GENERAL_PROJECT_ID:
         project_path = PROJECTS_DIR / project_id
         project = _read(project_path / "PROJECT.md")
         status = _read(project_path / "STATUS.md")
-        task_queue = _read(project_path / "TASK_QUEUE.md")
         decisions = _read(project_path / "DECISIONS.md")
         research = _read(project_path / "RESEARCH.md")
+        lessons = _read(project_path / "LESSONS.md")
 
         # Extract project name from first line of PROJECT.md
         if project:
@@ -122,9 +125,9 @@ def load_memory(project_id: str, history: list[dict] | None = None) -> MemoryCon
         global_memory=global_memory,
         project=project,
         status=status,
-        task_queue=task_queue,
         decisions=decisions,
         research=research,
+        lessons=lessons,
         project_name=project_name,
         project_id=project_id,
         history=history or [],
@@ -144,8 +147,10 @@ def load_memory(project_id: str, history: list[dict] | None = None) -> MemoryCon
 _CONTEXT_FILE_CHAR_CAP = 2400
 # Newest entries kept when an archive-style section is trimmed.
 _KEEP_RECENT_ITEMS = 8
-# "Current working state" sections — never trimmed (the live, high-signal part).
-# STATUS.md / PROJECT.md are kept whole; within TASK_QUEUE.md these stay whole.
+# "Current working state" section names never trimmed in an append-growth file.
+# STATUS.md / PROJECT.md are kept whole regardless (so the ``## Task Queue``
+# board inside STATUS is always fully present); this set only matters if a
+# future append-growth file reuses these live section names.
 _CURRENT_STATE_SECTIONS = {"In Progress", "Up Next"}
 
 
@@ -172,11 +177,11 @@ def _trim_section_body(buf: list[str]) -> list[str]:
 def _compact_memory(filename: str, content: str) -> str:
     """Compact a project-memory file for the main prompt when it grows large.
 
-    STATUS.md (current state) and PROJECT.md (identity/scope) are returned whole.
-    For the append-growth files (TASK_QUEUE.md / DECISIONS.md / RESEARCH.md),
-    once the file exceeds ``_CONTEXT_FILE_CHAR_CAP`` each ``##`` section's body is
-    trimmed to its newest entries — except the live ``In Progress`` / ``Up Next``
-    sections, which stay whole. Below the cap the content is byte-identical.
+    STATUS.md (current state, now including the ``## Task Queue`` board) and
+    PROJECT.md (identity/scope) are returned whole. For the append-growth files
+    (DECISIONS.md / RESEARCH.md / LESSONS.md), once the file exceeds
+    ``_CONTEXT_FILE_CHAR_CAP`` each ``##`` section's body is trimmed to its
+    newest entries. Below the cap the content is byte-identical.
     """
     if filename in ("STATUS.md", "PROJECT.md"):
         return content
@@ -264,7 +269,11 @@ _MODE_GUIDANCE = {
         "## This turn: RESEARCH\n"
         "This turn is about research / investigation. Lay out options, references, "
         "and tradeoffs clearly so the finding can be recorded in RESEARCH.md. Be "
-        "honest about what is and isn't known; don't fabricate sources."
+        "honest about what is and isn't known; don't fabricate sources. If this "
+        "turn includes an explicit web-research grant section below, use its "
+        "bounded tools and cite what you fetch; otherwise you have NO web access "
+        "this turn — answer from knowledge and memory, and suggest the user send "
+        "`@search <question>` if live sources would materially help."
     ),
 }
 
@@ -289,6 +298,12 @@ def _mode_guidance_section(ctx: MemoryContext, mode: Optional[str]) -> str:
         git_ctx = _latest_git_state_context(ctx.project_id)
         if git_ctx:
             block += "\n\n### Project Ops (Git/GitHub) state\n" + git_ctx
+    # Phase 10 — fold the mode's built-in skills (method/checklist/rubric text)
+    # into the guidance. Bounded (per-skill + total caps) and best-effort:
+    # skills_store never raises here, so a bad skill file can't break a turn.
+    skills_block = skills_store.skills_prompt_block(mode)
+    if skills_block:
+        block += "\n\n" + skills_block
     return "---\n\n# Mode\n\n" + block
 
 
@@ -444,12 +459,12 @@ def _build_system_prompt(
         project_parts.append(f"## PROJECT.md\n{_compact_memory('PROJECT.md', ctx.project)}")
     if ctx.status:
         project_parts.append(f"## STATUS.md\n{_compact_memory('STATUS.md', ctx.status)}")
-    if ctx.task_queue:
-        project_parts.append(f"## TASK_QUEUE.md\n{_compact_memory('TASK_QUEUE.md', ctx.task_queue)}")
     if ctx.decisions:
         project_parts.append(f"## DECISIONS.md\n{_compact_memory('DECISIONS.md', ctx.decisions)}")
     if ctx.research:
         project_parts.append(f"## RESEARCH.md\n{_compact_memory('RESEARCH.md', ctx.research)}")
+    if ctx.lessons:
+        project_parts.append(f"## LESSONS.md\n{_compact_memory('LESSONS.md', ctx.lessons)}")
     if project_parts:
         sections.append(
             f"---\n\n# Current Project: {ctx.project_name}\n\n"
@@ -554,24 +569,31 @@ def orchestrate(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     mode: Optional[str] = None,
-) -> tuple[str, list[dict]]:
+    research_enabled: bool = False,
+) -> tuple[str, list[dict], list[dict]]:
     """
     Main orchestration entry point.
 
-    Loads memory, assembles context, runs a bounded chat-with-inspection loop,
-    and returns ``(text_response, inspected_files)``. SOUL.md is always loaded
-    as the system-level identity anchor.
+    Loads memory, assembles context, runs a bounded chat loop with up to two
+    on-demand channels, and returns ``(text_response, inspected_files,
+    research_sources)``. SOUL.md is always loaded as the system-level
+    identity anchor.
 
-    The inspection loop is enabled only for non-GENERAL projects that have
-    an initialized execution workspace. Inside the loop the LLM may emit
-    ``{"inspect_request": {...}}`` JSON to read a file from ``repo/`` via
-    the sandboxed inspect API. The loop caps at
-    ``MAX_INSPECTIONS_PER_TURN`` so a runaway model cannot dump the repo
-    into chat context.
+    The **inspection channel** is enabled only for non-GENERAL projects with
+    an initialized execution workspace: the LLM may emit
+    ``{"inspect_request": {...}}`` JSON to read a file from ``repo/`` via the
+    sandboxed inspect API, capped at ``MAX_INSPECTIONS_PER_TURN``.
 
-    For GENERAL chats or projects without an execution workspace, behavior
-    is unchanged: a single LLM call producing text, with
-    ``inspected_files == []``.
+    The **research channel** (Phase 10) is enabled only when the caller sets
+    ``research_enabled=True`` — main.py does that solely for a turn the user
+    explicitly started with `@search`/`@research` (the per-turn network
+    grant; inferred `research` intent NEVER enables it). The LLM may emit
+    ``{"research_request": {...}}`` for a bounded, allowlisted web search /
+    URL fetch; capped at ``research.MAX_RESEARCH_REQUESTS_PER_TURN`` requests
+    and ``research.RESEARCH_MAX_TOTAL_CHARS`` context characters per turn.
+
+    When neither channel applies, behavior is the original single LLM call
+    with both lists empty.
 
     ``llm_caller`` is an optional injection seam for tests; the default is
     the live LLM. ``provider`` selects the model provider for the main
@@ -580,9 +602,8 @@ def orchestrate(
     default model is used. Both are ignored when ``llm_caller`` is supplied.
 
     ``mode`` (Phase 6) is an optional orchestration mode set by an explicit
-    `@`-command (``plan``/``design``/``debug``/``review``/``inspect``/``memory``);
-    it appends a small guidance block to the system prompt and never changes
-    routing or dispatch.
+    `@`-command or a routed intent; it appends a small guidance block to the
+    system prompt and never changes routing or dispatch.
     """
     ctx = load_memory(project_id, history=history)
     inspection_enabled = _inspection_enabled_for(project_id)
@@ -593,69 +614,112 @@ def orchestrate(
         lambda **kwargs: llm_chat(provider=provider, model=model, **kwargs)
     )
 
-    if not inspection_enabled:
+    if not inspection_enabled and not research_enabled:
         system_prompt = _build_system_prompt(ctx, inspection_enabled=False, mode=mode)
         messages = _build_messages(ctx, message)
         text = caller(system=system_prompt, messages=messages)
-        return text, []
+        return text, [], []
 
-    # ---- bounded inspection loop ----
-    # Imported here to keep the GENERAL/no-workspace path free of execution
-    # imports.
+    # ---- bounded inspection/research loop ----
+    # Imported here to keep the plain-chat path free of execution imports.
     from execution.inspect import (
+        InspectionResult,
         execute_inspect_request,
         format_result_for_llm,
         parse_inspect_request,
     )
 
-    base_system_prompt = _build_system_prompt(ctx, inspection_enabled=True, mode=mode)
+    inspect_cap = MAX_INSPECTIONS_PER_TURN if inspection_enabled else 0
+
+    # The research channel is loaded (and its prompt section added) only on a
+    # granted turn — an ungranted turn's prompt never mentions web access.
+    research_mod = None
+    research_cap = 0
+    user_urls: list[str] = []
+    research_section = ""
+    if research_enabled:
+        from execution import research as research_mod  # noqa: PLC0415
+
+        research_cap = research_mod.MAX_RESEARCH_REQUESTS_PER_TURN
+        user_urls = research_mod.extract_user_urls(message)
+        research_section = "\n\n---\n\n" + research_mod.research_system_prompt_section(user_urls)
+
+    base_system_prompt = (
+        _build_system_prompt(ctx, inspection_enabled=inspection_enabled, mode=mode)
+        + research_section
+    )
+    plain_system_prompt = _build_system_prompt(ctx, inspection_enabled=False, mode=mode)
     messages = _build_messages(ctx, message)
     inspected_files: list[dict] = []
+    research_sources: list[dict] = []
+    inspections_used = 0
+    research_used = 0
+    research_chars = 0
 
-    for step in range(MAX_INSPECTIONS_PER_TURN + 1):
-        # On the final allowed iteration, force a text answer by dropping the
-        # inspection guidance from the system prompt. This is what we hand
-        # the model after it has exhausted the inspection budget.
-        force_text = step == MAX_INSPECTIONS_PER_TURN
-        system_prompt = (
-            _build_system_prompt(ctx, inspection_enabled=False, mode=mode)
-            if force_text
-            else base_system_prompt
+    max_steps = inspect_cap + research_cap
+    for step in range(max_steps + 1):
+        # On the final allowed iteration (or once every budget is spent),
+        # force a text answer by dropping the channel guidance entirely.
+        force_text = step == max_steps or (
+            inspections_used >= inspect_cap and research_used >= research_cap
         )
+        system_prompt = plain_system_prompt if force_text else base_system_prompt
 
         raw = caller(system=system_prompt, messages=messages)
         if force_text:
-            return raw, inspected_files
+            return raw, inspected_files, research_sources
 
-        request = parse_inspect_request(raw)
-        if request is None:
+        inspect_req = parse_inspect_request(raw) if inspection_enabled else None
+        research_req = (
+            research_mod.parse_research_request(raw)
+            if research_mod is not None and inspect_req is None
+            else None
+        )
+        if inspect_req is None and research_req is None:
             # Plain text answer — done.
-            return raw, inspected_files
+            return raw, inspected_files, research_sources
 
-        # Run the inspection, record it, feed the result back into the
-        # transcript, and let the model decide whether to keep inspecting or
-        # answer.
-        result = execute_inspect_request(project_id, request)
-        inspected_files.append({
-            "tool": result.kind,
-            "path": result.path,
-            "query": result.query,
-            "ok": result.ok,
-            "truncated": result.truncated,
-            "error": result.error or None,
-        })
+        if inspect_req is not None:
+            if inspections_used >= inspect_cap:
+                result = InspectionResult(
+                    ok=False,
+                    kind=str(inspect_req.get("tool", "unknown")),
+                    error="inspection budget exhausted — answer now from what you have",
+                )
+            else:
+                inspections_used += 1
+                result = execute_inspect_request(project_id, inspect_req)
+                inspected_files.append({
+                    "tool": result.kind,
+                    "path": result.path,
+                    "query": result.query,
+                    "ok": result.ok,
+                    "truncated": result.truncated,
+                    "error": result.error or None,
+                })
+            feedback = format_result_for_llm(result)
+        else:
+            if research_used >= research_cap or research_chars >= research_mod.RESEARCH_MAX_TOTAL_CHARS:
+                r_result = research_mod.budget_exhausted_result(
+                    str(research_req.get("tool", "web_search"))
+                )
+            else:
+                research_used += 1
+                r_result = research_mod.execute_research_request(
+                    project_id, research_req, user_urls=user_urls
+                )
+                research_chars += len(r_result.content or "")
+                research_sources.append(r_result.to_source_dict())
+            feedback = research_mod.format_result_for_llm(r_result)
 
-        # Persist the model's request and the inspection result in the
-        # transcript so it can build on what it just learned.
+        # Persist the model's request and the result in the transcript so it
+        # can build on what it just learned.
         messages.append({"role": "assistant", "content": raw})
-        messages.append({
-            "role": "user",
-            "content": format_result_for_llm(result),
-        })
+        messages.append({"role": "user", "content": feedback})
 
     # The for-loop returns once it hits ``force_text``; this line is
     # unreachable but kept defensively.
-    return "", inspected_files
+    return "", inspected_files, research_sources
 
 
 def _inspection_enabled_for(project_id: str) -> bool:
@@ -695,7 +759,9 @@ conversation chatter. Most turns need NO update; prefer should_update=false.
 dump raw conversation text. Summarize and structure the knowledge.
 3. SOUL.md is read-only. Never include it in updates.
 4. Use action "append" to add content to a section, "replace" to overwrite a \
-section. For TASK_QUEUE.md use checkbox format ("- [ ]" open, "- [x]" done).
+section. STATUS.md's "Task Queue" section holds the task board — use checkbox \
+format ("- [ ]" open, "- [x]" done) and preserve its "### Completed / ### In \
+Progress / ### Next" subsections when replacing it.
 5. Keep each update concise: one clear update per file, no repetition of content \
 already present in the snapshot.
 6. The "section" field should match an existing ## heading in the file (a new \
@@ -724,10 +790,12 @@ _INTAKE_SYSTEM_PROJECT = (
     "project knowledge.\n\n"
     "## Writable files\n"
     "- PROJECT.md: project definition, vision, scope, target user, tech stack\n"
-    "- STATUS.md: current phase, latest milestone, what works, what's next\n"
-    "- TASK_QUEUE.md: actionable task tracking (In Progress / Up Next / Done)\n"
+    "- STATUS.md: current phase, latest milestone, what works, what's next, and "
+    "the '## Task Queue' board (### Completed / ### In Progress / ### Next)\n"
     "- DECISIONS.md: important project decisions with rationale\n"
-    "- RESEARCH.md: useful findings, external references, technical notes\n\n"
+    "- RESEARCH.md: useful findings, external references, technical notes\n"
+    "- LESSONS.md: durable, reusable project lessons from builds/failures/fixes/"
+    "reviews/deployments/decisions\n\n"
     + _INTAKE_RULES
 )
 
@@ -754,9 +822,9 @@ def _intake_snapshot(ctx: MemoryContext, scope: str) -> list[tuple[str, str]]:
     return [
         ("PROJECT.md", ctx.project),
         ("STATUS.md", ctx.status),
-        ("TASK_QUEUE.md", ctx.task_queue),
         ("DECISIONS.md", ctx.decisions),
         ("RESEARCH.md", ctx.research),
+        ("LESSONS.md", ctx.lessons),
     ]
 
 

@@ -11,7 +11,7 @@ interface Props {
   runsRefreshSignal?: number
 }
 
-const FILE_ORDER = ['PROJECT.md', 'STATUS.md', 'TASK_QUEUE.md', 'DECISIONS.md', 'RESEARCH.md']
+const FILE_ORDER = ['PROJECT.md', 'STATUS.md', 'DECISIONS.md', 'RESEARCH.md', 'LESSONS.md']
 
 function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Props) {
   if (!projectId || !context) {

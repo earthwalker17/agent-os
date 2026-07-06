@@ -5,8 +5,9 @@ permission set, and an expected output shape for one specialized agent inside
 a run. The registry is deliberately small — Phase 9 ships the minimum solid
 set needed for team execution (coder / reviewer / inspector) plus the system
 stages (integrator / verifier) and the chat-facing role contracts that the
-existing ``@`` modes map onto. Future roles (research / deploy / release /
-launch) get added here when a concrete consumer exists, not speculatively.
+existing ``@`` modes map onto. Phase 10 adds the researcher chat contract for
+`@search` / `@research`. Future roles (deploy / release / launch) get added
+here when a concrete consumer exists, not speculatively.
 
 Three kinds of entry:
 
@@ -185,6 +186,15 @@ _ROLES: dict[str, AgentRole] = {
             allowed_tools=frozenset(),
             executes_in_runs=False,
             mode="memory",
+        ),
+        AgentRole(
+            id="researcher",
+            title="Research Agent",
+            summary="Gathers bounded, cited external references via the research channel.",
+            read_only=True,
+            allowed_tools=frozenset(),
+            executes_in_runs=False,
+            mode="research",
         ),
     )
 }

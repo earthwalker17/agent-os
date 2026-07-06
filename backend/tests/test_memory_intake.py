@@ -29,7 +29,7 @@ def _ctx() -> MemoryContext:
     return MemoryContext(
         user="", workstyle="", soul="", global_memory="",
         project="# Demo", status="# Status: Demo\n\n## What Works\n- nothing yet\n",
-        task_queue="", decisions="", research="",
+        decisions="", research="", lessons="",
         project_name="Demo", project_id="demo", history=[],
     )
 

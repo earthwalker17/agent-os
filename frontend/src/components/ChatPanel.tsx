@@ -1,9 +1,12 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
-import type { Message, PendingExecution, ChatAttachment, ProviderInfo, ModelInfo } from '../types'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import type { Message, PendingExecution, ChatAttachment, ProviderInfo, ModelInfo, AgentInfo } from '../types'
 import RunDetailModal from './RunDetailModal'
 import RunChatCard from './RunChatCard'
 import RunTrace from './RunTrace'
 import ModelPicker from './ModelPicker'
+import CommandMenu, { buildCommandEntries } from './CommandMenu'
+import type { CommandEntry } from './CommandMenu'
+import type { ResearchSource, ResearchSuggestion } from '../types'
 
 interface Props {
   projectId: string | null
@@ -51,6 +54,8 @@ interface Props {
   /** Task 07.2 — active color theme + setter for the top-right theme dropdown. */
   theme?: 'dark' | 'light'
   onSelectTheme?: (theme: 'dark' | 'light') => void
+  /** Phase 10 — agent registry rows for the composer @-command autocomplete. */
+  agents?: AgentInfo[]
 }
 
 /** Minimal markdown-to-HTML for orchestration responses. */
@@ -97,6 +102,22 @@ function isImage(mime: string | undefined): boolean {
   return !!mime && mime.startsWith('image/')
 }
 
+// Phase 10 — compact host label for a research source link.
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+// Only http(s) URLs may become clickable links — a failed fetch_url source can
+// carry a model-controlled string (e.g. a rejected javascript:/data: scheme),
+// so never put an unvalidated value into an href.
+function isHttpUrl(url: string | undefined): boolean {
+  return !!url && /^https?:\/\//i.test(url)
+}
+
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
@@ -126,6 +147,27 @@ function joinTranscript(base: string, addition: string): string {
   return /\s$/.test(base) ? base + add : `${base} ${add}`
 }
 
+// Phase 10 — the whitespace-delimited token containing the caret, iff it
+// starts with `@` AND sits at the very start of the message (ignoring leading
+// whitespace). The backend only recognizes an `@`-command at the message
+// start (chat_delegation.parse_mode_command lstrips then matches), so the menu
+// must not offer a mid-message command the backend would ignore.
+function activeAtToken(
+  text: string,
+  caret: number,
+): { token: string; start: number; end: number } | null {
+  const pos = Math.max(0, Math.min(caret, text.length))
+  let start = pos
+  while (start > 0 && !/\s/.test(text[start - 1])) start--
+  let end = pos
+  while (end < text.length && !/\s/.test(text[end])) end++
+  const token = text.slice(start, end)
+  if (!token.startsWith('@')) return null
+  // Reject a mid-message @token: everything before it must be blank.
+  if (text.slice(0, start).trim() !== '') return null
+  return { token, start, end }
+}
+
 function ChatPanel({
   projectId,
   conversationId,
@@ -149,6 +191,7 @@ function ChatPanel({
   onSelectModel,
   theme,
   onSelectTheme,
+  agents,
 }: Props) {
   const [input, setInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -159,6 +202,8 @@ function ChatPanel({
   const [showTaskCardFor, setShowTaskCardFor] = useState<string | null>(null)
   // Phase 6.1 — which assistant message's memory-audit detail is expanded.
   const [memoryAuditFor, setMemoryAuditFor] = useState<string | null>(null)
+  // Phase 10 — which assistant message's research-sources list is expanded.
+  const [sourcesOpenFor, setSourcesOpenFor] = useState<string | null>(null)
   // Phase 6.1 — per-pending user-approved auto-recovery budget (0 = none).
   const [recoveryBudgets, setRecoveryBudgets] = useState<Record<string, number>>({})
 
@@ -318,7 +363,12 @@ function ChatPanel({
         else interimText += result[0].transcript
       }
       finalTextRef.current = finalText
-      setInput(joinTranscript(baseTextRef.current, finalText + interimText))
+      const dictated = joinTranscript(baseTextRef.current, finalText + interimText)
+      setInput(dictated)
+      // Keep the @-menu state consistent with dictated text: caret moves to the
+      // end and the command menu closes (dictation is never an @-command).
+      setCaret(dictated.length)
+      setMenuDismissed(true)
     }
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
@@ -461,6 +511,43 @@ function ChatPanel({
     setFiles([])
   }
 
+  // --- Phase 10: @-command autocomplete ---
+  // Caret tracking + menu selection; `menuDismissed` (Esc) is cleared on the
+  // next input change so the menu doesn't fight the token detector.
+  const [caret, setCaret] = useState(0)
+  const [menuIndex, setMenuIndex] = useState(0)
+  const [menuDismissed, setMenuDismissed] = useState(false)
+
+  const commandEntries = useMemo(() => buildCommandEntries(agents ?? []), [agents])
+  const atToken = activeAtToken(input, caret)
+  const menuEntries =
+    !menuDismissed && atToken
+      ? commandEntries.filter(en =>
+          en.command.toLowerCase().startsWith(atToken.token.toLowerCase())
+        )
+      : []
+  const menuSelected = menuEntries.length > 0 ? Math.min(menuIndex, menuEntries.length - 1) : 0
+
+  const selectCommand = (entry: CommandEntry) => {
+    if (!atToken) return
+    const next = input.slice(0, atToken.start) + entry.command + ' ' + input.slice(atToken.end)
+    const newCaret = atToken.start + entry.command.length + 1
+    setInput(next)
+    setCaret(newCaret)
+    setMenuDismissed(true)
+    requestAnimationFrame(() => {
+      const el = inputRef.current
+      if (el) {
+        el.focus()
+        el.setSelectionRange(newCaret, newCaret)
+      }
+    })
+  }
+
+  const syncCaret = (el: HTMLTextAreaElement) => {
+    setCaret(el.selectionStart ?? el.value.length)
+  }
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     void doSend()
@@ -468,9 +555,35 @@ function ChatPanel({
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Ctrl/Cmd + Enter sends; plain Enter inserts a newline (default behavior).
+    // This branch stays FIRST — the command menu never swallows a send.
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault()
       void doSend()
+      return
+    }
+    // Phase 10 — @-command menu keyboard nav. Interception happens ONLY while
+    // the menu is visibly open, so normal typing/newlines are untouched.
+    if (menuEntries.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setMenuIndex(i => (i + 1) % menuEntries.length)
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setMenuIndex(i => (i - 1 + menuEntries.length) % menuEntries.length)
+        return
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault()
+        selectCommand(menuEntries[menuSelected])
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        setMenuDismissed(true)
+        return
+      }
     }
   }
 
@@ -582,6 +695,18 @@ function ChatPanel({
               : []
           const memoryAuditKey = msg.id ?? `i${i}`
           const memoryAuditOpen = memoryAuditFor === memoryAuditKey
+          // Phase 10 — research sources + the @search suggestion from metadata.
+          const metaResearchSources =
+            msg.role === 'assistant'
+              ? (msg.metadata as { research_sources?: ResearchSource[] } | null | undefined)
+                  ?.research_sources ?? []
+              : []
+          const metaResearchSuggestion =
+            msg.role === 'assistant'
+              ? (msg.metadata as { research_suggestion?: ResearchSuggestion } | null | undefined)
+                  ?.research_suggestion
+              : undefined
+          const sourcesOpen = sourcesOpenFor === memoryAuditKey
           return (
             <div key={msg.id || i} className={`chat-message ${msg.role}`}>
               <div className="chat-message-role">{msg.role === 'user' ? 'You' : 'Agent OS'}</div>
@@ -593,7 +718,7 @@ function ChatPanel({
               ) : (
                 msg.content && <div className="chat-message-content">{msg.content}</div>
               )}
-              {(metaIntent || metaMemoryReason) && (
+              {(metaIntent || metaMemoryReason || metaResearchSources.length > 0 || metaResearchSuggestion) && (
                 <div className="chat-meta-row">
                   {metaIntent && (
                     <span className={`chat-intent-badge intent-${metaIntent}`}>{metaIntent}</span>
@@ -613,6 +738,34 @@ function ChatPanel({
                         🧠 {metaMemoryReason}
                       </span>
                     ))}
+                  {metaResearchSources.length > 0 && (
+                    <button
+                      type="button"
+                      className="chat-sources-chip"
+                      onClick={() => setSourcesOpenFor(sourcesOpen ? null : memoryAuditKey)}
+                      title="Show the web sources consulted this turn"
+                    >
+                      🔎 {metaResearchSources.length} source{metaResearchSources.length === 1 ? '' : 's'}{' '}
+                      {sourcesOpen ? '▾' : '▸'}
+                    </button>
+                  )}
+                  {metaResearchSuggestion && (
+                    <button
+                      type="button"
+                      className="research-suggest-chip"
+                      onClick={() => {
+                        setInput(`${metaResearchSuggestion.command} ${metaResearchSuggestion.query}`)
+                        setCaret(
+                          (`${metaResearchSuggestion.command} ${metaResearchSuggestion.query}`).length
+                        )
+                        setMenuDismissed(true)
+                        inputRef.current?.focus()
+                      }}
+                      title="Pre-fill an explicit @search command — sending it is your approval for bounded web research"
+                    >
+                      Run @search
+                    </button>
+                  )}
                 </div>
               )}
               {memoryAuditOpen && metaMemoryApplied.length > 0 && (
@@ -621,6 +774,35 @@ function ChatPanel({
                     <li key={ui}>
                       <code>{u.filename}</code>
                       {u.section ? <span className="chat-memory-audit-sec"> › {u.section}</span> : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {sourcesOpen && metaResearchSources.length > 0 && (
+                <ul className="chat-sources-list">
+                  {metaResearchSources.map((s, si) => (
+                    <li key={si} className={`chat-source-row${s.ok ? '' : ' failed'}`}>
+                      {s.tool === 'web_search' ? (
+                        <>🔎 searched: “{s.query}”</>
+                      ) : (
+                        <>
+                          📄 {s.title || s.url}{' '}
+                          {isHttpUrl(s.url) ? (
+                            <a
+                              className="chat-source-link"
+                              href={s.url}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {hostOf(s.url!)}
+                            </a>
+                          ) : (
+                            s.url && <span className="chat-source-link">{s.url}</span>
+                          )}
+                        </>
+                      )}
+                      {s.truncated && <span className="chat-source-flag">truncated</span>}
+                      {!s.ok && <span className="chat-source-flag">{s.error || 'failed'}</span>}
                     </li>
                   ))}
                 </ul>
@@ -832,6 +1014,14 @@ function ChatPanel({
         </div>
       )}
       <form className="chat-input composer" onSubmit={handleSubmit}>
+        {menuEntries.length > 0 && (
+          <CommandMenu
+            entries={menuEntries}
+            selectedIndex={menuSelected}
+            onSelect={selectCommand}
+            onHover={setMenuIndex}
+          />
+        )}
         <input
           ref={fileInputRef}
           type="file"
@@ -858,8 +1048,15 @@ function ChatPanel({
           ref={inputRef}
           className="composer-textarea"
           value={input}
-          onChange={e => setInput(e.target.value)}
+          onChange={e => {
+            setInput(e.target.value)
+            setCaret(e.target.selectionStart ?? e.target.value.length)
+            setMenuDismissed(false)
+            setMenuIndex(0)
+          }}
           onKeyDown={handleKeyDown}
+          onKeyUp={e => syncCaret(e.currentTarget)}
+          onClick={e => syncCaret(e.currentTarget)}
           placeholder={
             revisingPendingId
               ? 'Describe what to change about the plan...  (Ctrl+Enter to send)'

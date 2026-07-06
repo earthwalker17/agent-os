@@ -127,7 +127,7 @@ def test_intent_in_to_dict():
 def _ctx() -> MemoryContext:
     return MemoryContext(
         user="", workstyle="", soul="# Soul", global_memory="",
-        project="# Demo", status="", task_queue="", decisions="", research="",
+        project="# Demo", status="", decisions="", research="", lessons="",
         project_name="Demo", project_id="__GENERAL__", history=[],
     )
 

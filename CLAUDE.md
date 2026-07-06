@@ -74,7 +74,12 @@ and execute project work.
 - **Global memory** lives in `memory/`: `USER.md`, `WORKSTYLE.md`,
   `SOUL.md`, `MEMORY.md`.
 - **Project memory** lives in `projects/{project_id}/`: `PROJECT.md`,
-  `STATUS.md`, `TASK_QUEUE.md`, `DECISIONS.md`, `RESEARCH.md`.
+  `STATUS.md` (which carries the `## Task Queue` board — Completed / In
+  Progress / Next), `DECISIONS.md`, `RESEARCH.md`, `LESSONS.md`. (Phase 10.2
+  merged the former standalone `TASK_QUEUE.md` into `STATUS.md` and added
+  `LESSONS.md`; legacy `TASK_QUEUE.md` files migrate automatically on startup.
+  `LESSONS.md` holds durable Main-Agent lessons and is never written by the
+  Coding Agent.)
 - `SOUL.md` is **read-only and hidden**. It is loaded as the identity
   anchor on every turn and is never shown in any UI, never auto-written,
   never included in any write path.
@@ -163,6 +168,26 @@ and execute project work.
   executor; `OPS.md` is written only by `ops_ledger`, never an LLM; the
   orchestrator imports no connector. (Details: `ARCHITECTURE.md §7.I`; BLUEPRINT
   Pillar 2.)
+- **Phase 10 — Research channel & skills.** External web access exists ONLY
+  inside the bounded research channel, granted per-turn by an explicit
+  `@search` / `@research` command (a semantic `research` intent only produces a
+  suggestion chip that pre-fills the command — sending it is the user's grant).
+  Inferred intent never reaches the network. Fetches are SSRF-screened and
+  domain-allowlisted (user-pasted URLs bypass only the allowlist), and results
+  are bounded cited extracts (never raw page dumps). A `redact()`-diff egress
+  guard refuses any outbound query/URL carrying a **credential-shaped** value
+  (stored secrets + known secret patterns); memory/repo content stays off the
+  wire because it is never auto-injected into the agent's context and the
+  channel prompt forbids sending it — not because the guard scrubs arbitrary
+  text. Skills (`skills/*.md`) are curated committed markdown edited only by
+  the user through the UI — no LLM or autonomous path ever writes them.
+  **Local RAG** (`local_rag.py`, Phase 10.2) adds bounded, cited retrieval over
+  project memory + run history + a sandbox-safe repo map (no secrets, no
+  full-repo injection) via the `retrieve` inspection tool + `POST …/retrieve`.
+  A **suggested skill patch** may be PROPOSED after a green run, but a skill
+  file changes only on an explicit user Apply through `skills_store.write_skill`
+  — no autonomous skill writes, no global promotion. (Details:
+  `ARCHITECTURE.md §7.J`.)
 
 ## 6. Context Hygiene
 

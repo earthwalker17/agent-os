@@ -38,6 +38,7 @@ It runs entirely on your machine — **filesystem + SQLite + FastAPI + React**, 
 - **A two-agent split** — a **Main Agent** (the brain: planner, memory steward, orchestrator) and a sandboxed **Coding Agent** (the hands: a bounded executor inside one project's workspace).
 - **A capability-aware provider registry** — six model providers (**Claude, GPT, Gemini, DeepSeek, Kimi, Zhipu GLM**), each with a selectable model list and vision metadata.
 - **A full build → verify → preview → deliver loop** — plan into a task graph, execute task-by-task, verify with a real build, screenshot the running app, review it with a vision model, and deliver through audited Git/GitHub contracts — every external or destructive step behind an explicit human approval gate.
+- **Discoverable agents, built-in skills & approval-first research** — an `@`-command palette and an Agents browser back every agent with a structured contract and editable skill files; a `@search` research channel fetches bounded, cited web sources only on your explicit command; bounded **local retrieval** pulls cited evidence from a project's own memory, run history, and repo; and a green run may **propose** a reviewable skill refinement you Apply, Edit, or Reject.
 
 It is deliberately *not* a general-purpose assistant or a heavyweight agent platform. It's a clear, controllable place for one builder to plan, decide, and execute project work — with the model on a leash that makes its output trustworthy.
 
