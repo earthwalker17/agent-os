@@ -555,6 +555,38 @@ pipeline detail: `ARCHITECTURE.md §5 / §7.E / §7.E2 / §8 / §9`.)
 
 ---
 
+## UI Polish Pass (pre-Phase 12)
+
+Frontend-only visual/UX overhaul; **no behavior change** (verified by build +
+Playwright sweep of both themes + a behavior-preservation review pass).
+
+- **Design system.** `App.css` rewritten around one token layer (colors, type,
+  radii, shadows, motion) with a full light-theme token set — graphite surfaces,
+  periwinkle-indigo working accent, crimson demoted to danger-only, and a
+  tokenized status spectrum (ok/warn/run/blocked/cancel) that is readable in
+  both themes. Signature: telemetry-style small-caps mono for every eyebrow /
+  section label / status badge (`--font-mono`); humanist UI face for
+  conversation. Themed scrollbars, `:focus-visible` rings, `prefers-reduced-
+  motion` respected, `color-scheme` per theme. All pre-polish class names kept
+  (selector diff clean); only the header `provider-select`/`theme-select` rules
+  dropped with their elements.
+- **Settings modal** (`SettingsModal.tsx`). The chat-header provider/theme
+  dropdowns moved to a Settings modal opened from a pinned sidebar-footer
+  button; adds a model select driven by the same App state as the composer
+  picker. Identical handlers, options ("— no key" disabled entries), and
+  persistence (theme in `agentos-theme`; provider/model still session-only).
+- **Collapsible left sidebar.** Animated grid collapse (264px → 56px icon rail:
+  expand / Agents / Global memory / Settings) with the component kept mounted so
+  expand/selection state survives; preference persisted (`agentos-sidebar-
+  collapsed`). Center column gains the freed width.
+- **Component polish.** Inline SVG icon set (`icons.tsx`, no dependency);
+  restyled buttons/badges/cards/modals (overlay blur + entrance animation);
+  structured empty states; chat column width capped for readability; intent
+  badges tinted per judged intent; `ChatPanel` still threads `selectedProvider`
+  to run cards for verification calls.
+
+---
+
 ## Current Constraints
 
 - **Explicit dispatch only.** `@code` runs immediately; inferred intent only ever

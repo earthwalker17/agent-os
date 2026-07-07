@@ -18,14 +18,15 @@ function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Pro
     return (
       <aside className="sidebar context-panel">
         <h2>Context</h2>
-        <p className="context-empty">Select a project to view context</p>
+        <p className="context-empty">Select a project to view its memory and runs.</p>
       </aside>
     )
   }
 
   return (
     <aside className="sidebar context-panel">
-      <h2>Context: {projectId}</h2>
+      <h2>Context</h2>
+      <div className="context-project-name">{projectId}</div>
       <div className="context-files">
         {FILE_ORDER.map(filename => {
           const content = context[filename]

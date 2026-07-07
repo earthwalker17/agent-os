@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
-import type { Message, PendingExecution, ChatAttachment, ProviderInfo, ModelInfo, AgentInfo } from '../types'
+import type { Message, PendingExecution, ChatAttachment, ModelInfo, AgentInfo } from '../types'
+import { IconMic, IconPaperclip, IconStop } from './icons'
 import RunDetailModal from './RunDetailModal'
 import RunChatCard from './RunChatCard'
 import RunTrace from './RunTrace'
@@ -39,21 +40,18 @@ interface Props {
   onRunsChanged?: () => void
   /** Phase 6 — re-fetch the conversation messages (e.g. after a recovery plan is proposed). */
   onMessagesChanged?: () => void
-  /** Task 07.1 — model providers + current selection for the header dropdown. */
-  providers?: ProviderInfo[]
-  selectedProvider?: string
-  onSelectProvider?: (providerId: string) => void
   /**
    * Provider Registry 2.0 — the selected provider's capability-tagged models +
    * current model selection for the composer-side model picker. Drives the
    * per-model image-upload gating (a text-only model can't attach images).
+   * (Provider + theme *selection UI* moved to the Settings modal in the UI
+   * polish pass; App owns that state. `selectedProvider` is still threaded
+   * through so run cards can issue verification calls with the active pair.)
    */
+  selectedProvider?: string
   models?: ModelInfo[]
   selectedModel?: string
   onSelectModel?: (modelId: string) => void
-  /** Task 07.2 — active color theme + setter for the top-right theme dropdown. */
-  theme?: 'dark' | 'light'
-  onSelectTheme?: (theme: 'dark' | 'light') => void
   /** Phase 10 — agent registry rows for the composer @-command autocomplete. */
   agents?: AgentInfo[]
 }
@@ -183,14 +181,10 @@ function ChatPanel({
   onCancelRevise,
   onRunsChanged,
   onMessagesChanged,
-  providers,
   selectedProvider,
-  onSelectProvider,
   models,
   selectedModel,
   onSelectModel,
-  theme,
-  onSelectTheme,
   agents,
 }: Props) {
   const [input, setInput] = useState('')
@@ -589,44 +583,15 @@ function ChatPanel({
 
   const label = headerLabel || projectId
 
-  // Task 07.1 — provider dropdown shown top-left in the chat header. All four
-  // providers are listed; ones without a configured key render disabled.
-  const providerSelector =
-    providers && providers.length > 0 ? (
-      <select
-        className="provider-select"
-        value={selectedProvider ?? ''}
-        onChange={e => onSelectProvider && onSelectProvider(e.target.value)}
-        title="Model provider"
-        aria-label="Model provider"
-      >
-        {providers.map(p => (
-          <option key={p.id} value={p.id} disabled={!p.available}>
-            {p.label}
-            {p.available ? '' : ' — no key'}
-          </option>
-        ))}
-      </select>
-    ) : null
-
-  // Task 07.2 — light/dark theme dropdown, shown top-right in the chat header.
-  const themeSelector = onSelectTheme ? (
-    <select
-      className="theme-select"
-      value={theme ?? 'dark'}
-      onChange={e => onSelectTheme(e.target.value as 'dark' | 'light')}
-      title="Color theme"
-      aria-label="Color theme"
-    >
-      <option value="dark">Dark</option>
-      <option value="light">Light</option>
-    </select>
-  ) : null
-
   if (!projectId) {
     return (
       <main className="chat-panel">
-        <div className="chat-empty">Select a workspace to start chatting</div>
+        <div className="chat-empty">
+          <div className="empty-state">
+            <p className="empty-state-title">No workspace selected</p>
+            <p className="empty-state-hint">Pick a project or General from the sidebar to start chatting.</p>
+          </div>
+        </div>
       </main>
     )
   }
@@ -635,9 +600,17 @@ function ChatPanel({
     return (
       <main className="chat-panel">
         <div className="chat-header">
-          <h2>{label}</h2>
+          <div className="chat-header-row">
+            <span className="chat-header-eyebrow">Workspace</span>
+            <h2>{label}</h2>
+          </div>
         </div>
-        <div className="chat-empty">Select or create a conversation to start chatting</div>
+        <div className="chat-empty">
+          <div className="empty-state">
+            <p className="empty-state-title">No conversation open</p>
+            <p className="empty-state-hint">Select a conversation in the sidebar, or start a new one.</p>
+          </div>
+        </div>
       </main>
     )
   }
@@ -648,14 +621,22 @@ function ChatPanel({
     <main className="chat-panel">
       <div className="chat-header">
         <div className="chat-header-row">
-          {providerSelector}
+          <span className="chat-header-eyebrow">Workspace</span>
           <h2>{label}</h2>
         </div>
-        {themeSelector}
       </div>
       <div className="chat-messages">
         {messages.length === 0 && (
-          <div className="chat-empty">No messages yet. Start the conversation.</div>
+          <div className="chat-empty">
+            <div className="empty-state">
+              <p className="empty-state-title">No messages yet</p>
+              <p className="empty-state-hint">
+                {runProjectId
+                  ? 'Plan, discuss, or type @code to hand a task to the Coding Agent.'
+                  : 'Think out loud — useful facts are saved to global memory.'}
+              </p>
+            </div>
+          </div>
         )}
         {messages.map((msg, i) => {
           // Task 06.2D — a run id in message metadata drives the chat-first run
@@ -1042,7 +1023,7 @@ function ChatPanel({
           }
           aria-label="Attach files"
         >
-          +
+          <IconPaperclip />
         </button>
         <textarea
           ref={inputRef}
@@ -1080,7 +1061,7 @@ function ChatPanel({
           }
           aria-label="Voice input"
         >
-          {recording ? '■' : '🎤'}
+          {recording ? <IconStop /> : <IconMic />}
         </button>
         <button type="submit" className="composer-send-btn" disabled={sendDisabled}>
           {uploading ? 'Uploading...' : revisingPendingId ? 'Send revision' : 'Send'}

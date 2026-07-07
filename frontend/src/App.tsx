@@ -6,6 +6,7 @@ import EditModal from './components/EditModal'
 import ConfirmDialog from './components/ConfirmDialog'
 import GlobalMemoryModal from './components/GlobalMemoryModal'
 import AgentsModal from './components/AgentsModal'
+import SettingsModal from './components/SettingsModal'
 import type { Message, Conversation, ProjectContext, PendingExecution, ChatAttachment, ProviderInfo, AgentInfo } from './types'
 
 const GENERAL_PROJECT_ID = '__GENERAL__'
@@ -45,11 +46,23 @@ function App() {
     return saved === 'light' ? 'light' : 'dark'
   })
 
+  // UI polish pass — collapsible left sidebar, persisted across reloads.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
+    () => localStorage.getItem('agentos-sidebar-collapsed') === '1',
+  )
+
+  useEffect(() => {
+    localStorage.setItem('agentos-sidebar-collapsed', sidebarCollapsed ? '1' : '0')
+  }, [sidebarCollapsed])
+
   // Modal state
   const [editModal, setEditModal] = useState<{ filename: string; content: string } | null>(null)
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: (checked: boolean) => void; checkboxLabel?: string } | null>(null)
   const [globalMemoryModal, setGlobalMemoryModal] = useState(false)
   const [globalMemory, setGlobalMemory] = useState<Record<string, string>>({})
+  // UI polish pass — Settings modal (model/provider + theme), opened from the
+  // sidebar footer.
+  const [settingsModal, setSettingsModal] = useState(false)
 
   // Phase 10 — the agent profile registry (Agents browser + composer @-menu).
   // Loaded once; static per backend build.
@@ -676,7 +689,7 @@ function App() {
   const currentModels = providersList.find(p => p.id === selectedProvider)?.models ?? []
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
       <ProjectList
         projects={projects}
         activeProject={activeProject}
@@ -695,6 +708,9 @@ function App() {
         onNewGeneralConversation={handleNewGeneralConversation}
         onOpenGlobalMemory={handleOpenGlobalMemory}
         onOpenAgents={() => setAgentsModal(true)}
+        onOpenSettings={() => setSettingsModal(true)}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed(v => !v)}
       />
       <ChatPanel
         projectId={isGeneralActive ? 'general' : activeProject}
@@ -711,14 +727,10 @@ function App() {
         onCancelRevise={handleCancelRevise}
         onRunsChanged={() => setRunsRefreshKey(k => k + 1)}
         onMessagesChanged={reloadMessages}
-        providers={providersList}
         selectedProvider={selectedProvider}
-        onSelectProvider={handleSelectProvider}
         models={currentModels}
         selectedModel={selectedModel}
         onSelectModel={handleSelectModel}
-        theme={theme}
-        onSelectTheme={setTheme}
         agents={agentsList}
       />
       <ContextPanel
@@ -754,6 +766,19 @@ function App() {
         <AgentsModal
           agents={agentsList}
           onClose={() => setAgentsModal(false)}
+        />
+      )}
+      {settingsModal && (
+        <SettingsModal
+          providers={providersList}
+          selectedProvider={selectedProvider}
+          onSelectProvider={handleSelectProvider}
+          models={currentModels}
+          selectedModel={selectedModel}
+          onSelectModel={handleSelectModel}
+          theme={theme}
+          onSelectTheme={setTheme}
+          onClose={() => setSettingsModal(false)}
         />
       )}
     </div>

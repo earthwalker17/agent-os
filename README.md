@@ -110,7 +110,7 @@ Everything in this table is **implemented and tested** today.
 
 | Module | What it does |
 |--------|--------------|
-| **Project cockpit** | Three-column React UI (projects / chat / context + runs). Project- and conversation-scoped chat, editable memory files, a live Runs panel, and a multi-modal composer (multiline input, voice dictation, file attachments). |
+| **Project cockpit** | Three-column React UI (projects / chat / context + runs) with a token-based design system, polished light/dark themes, a collapsible sidebar, and a global Settings modal (model/provider + theme). Project- and conversation-scoped chat, editable memory files, a live Runs panel, and a multi-modal composer (multiline input, voice dictation, file attachments). |
 | **Main Agent orchestration** | Context assembly from memory, an **intent router** (`@plan` / `@design` / `@debug` / `@review` / `@inspect` / `@memory` modes), a model-judged **delegation** classifier, and an on-demand bounded file-inspection loop. |
 | **Memory engine** | A single atomic, policy-filtered markdown write path. After each turn a structured **memory-intake** judge proposes updates; the backend validates them against a writable-file set before touching disk. `SOUL.md` is read-only and never written. |
 | **Provider Registry 2.0** | Capability-aware registry of six providers, each with a selectable model list, per-model `vision` flags, env-overridable defaults, and key-presence availability. Anthropic via SDK; the rest via OpenAI-compatible / REST `urllib` calls — **no extra SDK dependencies**. |
