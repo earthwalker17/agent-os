@@ -141,6 +141,27 @@ should accomplish)
 #   npm run dev -- --host 127.0.0.1 --port 5174
 #   url: http://127.0.0.1:5174
 ```
+
+<!-- Phase 11 — optional interactive targeting. When the command/url above are
+active you may ALSO declare the routes and simple interactions that matter,
+as subsections of this block (outside the fence). Verification captures the
+declared views first, then runs each flow step-by-step (screenshotting as it
+goes) and fails the run if a declared flow fails. Bounded: max 6 views,
+2 flows, 10 steps per flow; actions are goto / click / fill / submit /
+expect_text / screenshot only; same-origin paths only; credential-like fill
+values are refused. Example (delete the surrounding comment markers to use):
+
+### Views
+- /settings
+- /reports — Reports page
+
+### Flow: add-item
+- goto /
+- click "Add item"
+- fill "Name" "Test item"
+- click "Save"
+- expect_text "Test item"
+-->
 """
 
 

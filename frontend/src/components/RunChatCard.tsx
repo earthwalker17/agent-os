@@ -401,6 +401,40 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
       )
     ) : null
 
+  // Phase 11 — declared interaction flows + runtime evidence summary. One
+  // compact line per flow; full step detail lives in the Run Detail modal.
+  const flowLines = (bv?.flows ?? []).map((f) => ({
+    name: f.name,
+    status: f.status,
+    passed: f.steps.filter((s) => s.status === 'passed').length,
+    total: f.steps.length,
+  }))
+  const consoleCount = bv?.console_errors?.length ?? 0
+  const networkCount = bv?.network_failures?.length ?? 0
+  const runtimeSignals =
+    flowLines.length > 0 || consoleCount > 0 || networkCount > 0 ? (
+      <div className="run-chat-flows">
+        {flowLines.map((f) => (
+          <p key={f.name} className="run-chat-muted">
+            <span className={`run-verify-status status-${f.status}`}>{f.status}</span>{' '}
+            flow <code>{f.name}</code> — {f.passed}/{f.total} steps passed
+          </p>
+        ))}
+        {(consoleCount > 0 || networkCount > 0) && (
+          <p className="run-chat-muted">
+            {consoleCount > 0
+              ? `${consoleCount} console error${consoleCount === 1 ? '' : 's'}`
+              : ''}
+            {consoleCount > 0 && networkCount > 0 ? ' · ' : ''}
+            {networkCount > 0
+              ? `${networkCount} network failure${networkCount === 1 ? '' : 's'}`
+              : ''}{' '}
+            captured — details in the run view.
+          </p>
+        )}
+      </div>
+    ) : null
+
   return (
     <div className="run-chat-card">
       {/* --- live phase badge (run control / timeline) --- */}
@@ -571,6 +605,7 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
               </a>
             </p>
           )}
+          {runtimeSignals}
           {gallery}
           {visualReviewBlock}
         </div>
@@ -593,6 +628,7 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
           {bv.output_preview && (
             <pre className="run-chat-verify-output">{bv.output_preview}</pre>
           )}
+          {runtimeSignals}
           {gallery}
         </div>
       )}
@@ -604,6 +640,14 @@ function RunChatCard({ projectId, runId, conversationId, onOpenRun, onOpenTrace,
             <span className="run-chat-recovery-icon">🛠️</span>
             <strong>Next steps</strong>
             <span className="run-chat-recovery-action">{ra.recommended_action}</span>
+            {ra.recovery_type && (
+              <span
+                className="run-chat-recovery-action"
+                title={`Recovery Matrix classification (${ra.classified_by || 'rules'})`}
+              >
+                {ra.recovery_type} repair
+              </span>
+            )}
           </div>
           {ra.diagnosis && <p className="run-chat-recovery-diagnosis">{ra.diagnosis}</p>}
           {ra.rationale && <p className="run-chat-muted">{ra.rationale}</p>}

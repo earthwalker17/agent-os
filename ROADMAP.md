@@ -448,6 +448,111 @@ upgraded the project-memory scaffold. Additive; every invariant holds.
   user edit still writes verbatim). The 3 findings that failed verification
   (0/3 votes) were correctly rejected.
 
+## Phase 11 — Long-horizon Self-healing + Interactive Browser Verification (increment 1)
+
+Upgraded recovery from "one generic repair after failure" into a **typed,
+evidence-driven, auditable repair loop**, and browser verification from passive
+screenshots into a **bounded, declarative interaction layer** — deliberately
+NOT a computer-use platform. Additive; every invariant holds and the Phase 6.1
+budget contract is preserved byte-for-byte. (BLUEPRINT Pillar 5. Module/
+pipeline detail: `ARCHITECTURE.md §5 / §7.E / §7.E2 / §8 / §9`.)
+
+- **Recovery Matrix foundation** (`recovery_matrix.py`, new leaf) — 8 frozen
+  typed contracts (accepted evidence, verification method, max attempts,
+  auto-eligibility, child-budget cap, confirmation boundary, audit note) + a
+  deterministic first-match classifier (`classify_failure` → type, reason,
+  `auto_ok`) + a bounded `redact()`-ed evidence builder (≤1800 chars).
+  Environment failures (missing Playwright/Chromium, occupied port) classify
+  `runtime` with `auto_ok=False` — a Coding Agent can't fix operator tooling,
+  so they never burn a budget. `assess_run` computes the classification
+  pre-LLM (strong prior; judge's type validated, `classified_by` audits which
+  won; survives LLM failure) and appends the evidence block to run-action
+  follow-up cards — **recovery children stopped being evidence-starved** on
+  both dispatch paths.
+- **Interactive browser verification** — the `## Browser Verification` block
+  gains `### Views` (routes auto-discovery misses) + `### Flow: <name>`
+  subsections (fixed vocabulary `goto/click/fill/submit/expect_text/screenshot`,
+  ≤6 views / ≤2 flows / ≤10 steps, same-origin only; proven backward-compatible
+  in both directions — the `##`-section regex never matches `###`, and
+  HTML-comment examples are stripped). The one Playwright capture subprocess
+  now collects **console errors / page errors / local-origin network failures**
+  (bounded, `[page-label]`-prefixed, redacted in-parent), captures explicit
+  views first (overall cap 8), and executes flows with per-step screenshots +
+  a final-state capture that rides the existing gallery (`nav_kind="step"`).
+  Credential-shaped fill values / sensitive input targets are **refused in the
+  parent process** (never serialized to the browser; `value_masked` only; a
+  refused flow is loud but never fails the run and is never auto-repaired). A
+  failed **declared** flow fails the verification (→ `partial`); console
+  errors alone never flip status — they are classification evidence and ride
+  the visual judge's new bounded "Runtime signals" prompt block.
+- **Bounded visual repair loop — via the existing recovery machinery, no new
+  loop.** `_maybe_auto_recover` now also fires on a `completed` run whose
+  visual verdict failed (closing a code-vs-constitution gap: CLAUDE.md already
+  defined non-green as including a failed visual review), gated by the
+  contract (`auto_eligible` + `auto_ok`) and clamped by it: a visual/runtime
+  child inherits budget 0 — exactly one repair pass, whose own tail re-runs
+  verification → browser → visual judge (before/after verdicts = parent vs
+  child, linked by lineage). Confirm-only types (integration / deployment /
+  database / docs_memory) never auto-dispatch; the generic non-green fallback
+  (`product`) preserves the Phase 6.1 behavior exactly.
+- **Manual recovery lineage fixed** — pending recovery plans persist
+  `recovery_of` (nullable column, PRAGMA-migrated); the confirm endpoint
+  threads `recovery_of` / `orchestration_round+1` / the parent's checkpoint,
+  clamps the budget by the contract, 409s (releasing the claim) when the
+  parent already has a recovery, and claims `recovered_by` under the per-run
+  `mutate_run_json` lock + a `manual_recovery_dispatched` event. The UI
+  browser-verify endpoint now also runs a best-effort `assess_run` on a failed
+  outcome (previously "Run suggested fix" dead-ended 409 for UI-discovered
+  failures).
+- **Artifacts + UI** — run.json gains `flows` / `console_errors` /
+  `network_failures` on the browser result and `recovery_type` /
+  `classified_by` on the assessment (all defaulted; old records round-trip;
+  legacy result.md renders byte-identical). RunChatCard: per-flow summary line,
+  console/network counts, recovery-type chip. RunDetailModal: per-step list
+  with errors + step-screenshot links, collapsible console/network evidence,
+  type chip. No new polling, no timeline changes.
+- **Validated live end-to-end on real Windows** (aegis-launch-control, real
+  Claude + real Playwright/Chromium through a running backend). Happy path:
+  the declared `### Views` route captured (`view-02.png`, `nav_kind="view"`),
+  the `simulator-smoke` flow clicked the Simulator tab, asserted
+  `SELECT SCENARIO`, and screenshotted per step + final state; a planted
+  `console.error` probe AND the app's real backend-down failures (Express on
+  3001 never started under `npm run dev`) were captured with page labels —
+  and console noise correctly did NOT fail the passing verification (visual
+  judge: passed). Failure path: a sabotaged `expect_text` failed the flow →
+  verification `failed` → run `partial` → typed assessment whose judge used
+  the console/network evidence to diagnose the REAL root cause (missing
+  backend → `runtime`, `classified_by=judge`, deviating from the `visual`
+  hint with justification) with the evidence block on the card. Manual
+  recovery: propose → pending plan carried `recovery_of` → confirm with
+  budget 2 → child dispatched with lineage + evidence-rich task card, budget
+  **contract-clamped 2→0**, parent `recovered_by` claimed +
+  `manual_recovery_dispatched` event; a second proposal 409'd; the child
+  cancelled cleanly (no wedged state). Repair→re-verify: fixing the flow and
+  re-verifying restored the run `partial → completed` with a fresh passing
+  visual verdict (before/after). A mid-E2E port-in-use collision (the
+  keep-alive preview) was itself correctly classified `runtime` as an
+  environment failure. Backend restart: sweeps left zero wedged states and
+  preserved the settled `browser_verification_state`. The showcase workspace
+  was restored to its committed state afterwards.
+- **Adversarial review pass** (6-dimension find→verify, 3-lens panels; run
+  twice after session-limit losses) confirmed 1 real defect + surfaced 4
+  verified-inline near-misses, all fixed: the capture subprocess truncated
+  console/network/step-error text at 300 chars BEFORE the parent's exact-match
+  redaction — a stored secret straddling the cut (e.g. a ~230-char Supabase
+  `service_role` JWT in a failed local API URL) would leak partially into
+  run.json/result.md/prompts/UI (child cap raised to 2000; the parent already
+  redacts-then-truncates); the evidence builder had the same
+  truncate-before-redact ordering per field (now redacts each field first);
+  a bare `\bmigration\b` blocker regex misclassified ordinary app runs as
+  confirm-only `database`, silently vetoing a user-approved budget (narrowed
+  to supabase/db-push signatures); incidental console noise on a rendered app
+  rerouted the generic Phase 6.1 fallback to a tighter contract (console rule
+  now requires unconfirmed readiness); duplicate flow names could mask a
+  failure via the by-name merge (parser dedupes); an all-None inherited
+  checkpoint suppressed a manual recovery child's fresh rollback anchor
+  (inherit only when the parent has one).
+
 ---
 
 ## Current Constraints
@@ -463,7 +568,15 @@ upgraded the project-memory scaffold. Additive; every invariant holds.
 - **Verification.** Automatic command verification + bounded repair gates
   `completed`; an opt-in `## Browser Verification` block (or the chat button) adds
   a render-gated multi-page capture + a diagnostic-only visual judgment (skips
-  without a vision model).
+  without a vision model). Phase 11: the block may declare views + bounded
+  interaction flows (≤2×10 steps, same-origin, no credential input) — a failed
+  declared flow fails the verification; console/network evidence is recorded,
+  never status-flipping.
+- **Recovery is typed and contract-bounded.** Every assessment carries a
+  Recovery Matrix type; auto-recovery (still budget-gated, ≤2, idempotent)
+  additionally requires an auto-eligible contract + `auto_ok` classification,
+  and visual/runtime children get exactly one pass. Confirm-only types and
+  environment failures never auto-dispatch.
 - **3–4 LLM calls per non-`@code` turn** (delegation judge + optional inspection +
   chat response + memory judge).
 - **Main agent never auto-reads repo contents** — only the bounded inspection loop
@@ -479,8 +592,11 @@ upgraded the project-memory scaffold. Additive; every invariant holds.
 ## Test Coverage
 
 Backend tests live under `backend/tests/`, stub `llm.chat` (no API key needed),
-and are each runnable standalone (`python tests/<file>.py`). **757 total**
-(Phase 10.2 added 40: local RAG 13, skill patch 13, memory-engine migration/
+and are each runnable standalone (`python tests/<file>.py`). **821 total**
+(Phase 11 added 64: recovery matrix 20, browser interactions 22, manual
+recovery lineage 5, recovery-budget matrix gating +6, recovery classification/
+evidence +6, pending recovery_of round-trip/migration +2, visual-judge runtime
+signals +2, UI browser-verify assess hook +1; Phase 10.2 added 40: local RAG 13, skill patch 13, memory-engine migration/
 LESSONS/append +9, plus adversarial-review regressions; Phase 10 added 87 across
 the agent registry, skills store, research channel,
 web-search adapter, combined orchestration loop, and agents/skills endpoints —
@@ -543,6 +659,9 @@ attachment XSS, provider timeout + Gemini-key redaction, and team-run PM context
 | `test_agents_endpoints` | 8 | /api/agents shape, skill read/write routes, @search chat flow (GENERAL no-memory, metadata persistence, suggestion-only semantic path) |
 | `test_local_rag` | 13 | memory/run/repo retrieval, scoring, caps, kinds filter, broad credential-name filtering, hit redaction, inspect tool + /retrieve endpoint |
 | `test_skill_patch` | 13 | green-only gating, append-style proposal, unknown-target rejection, idempotency, never-raises, apply-via-skills_store (+ edit, + rebase), reject, endpoints |
+| `test_recovery_matrix` | 20 | contract registry frozen/complete, classifier ladder + priority + `auto_ok` env guard + narrow DB regex + readiness-gated console rule, evidence bounds/redact-before-truncate |
+| `test_browser_interactions` | 22 | Views/Flow grammar + caps + duplicate-name dedupe + legacy identity + fence-less/HTML-comment edges, credential fill refusal (no echo), flow-failure⇒failed, refused/skipped flows, evidence redaction, dict-manifest parsing, script syntax, render byte-identity |
+| `test_manual_recovery_lineage` | 5 | confirm threads recovery_of/round/checkpoint + contract clamp + `recovered_by` claim + event; 409 releases claim; no-checkpoint/plain/missing-parent degrade |
 | `test_patch_workspace` | 13 | overlay read/write/append/list/search, `.git` guard, unsafe-id containment, blocked executors |
 | `test_team_planner` | 18 | role/parallel parsing, wave layering, cycle handling, eligibility gate, id sanitization |
 | `test_integration` | 7 | clean apply, dedupe, first-writer-wins conflict, sandbox re-validation, failed-task output |
@@ -563,11 +682,10 @@ attachment XSS, provider timeout + Gemini-key redaction, and team-run PM context
   seam; user-extensible fetch allowlist (per-project or global file).
 
 **Also queued.**
-- **Auto-repair on a failed visual verdict** — feed a `failed` verdict + evidence
-  back as one bounded repair pass (reuse `_verify_with_repair`), then re-capture +
-  re-judge once. Capped + opt-in.
-- **Per-view targeting** — let a `## Browser Verification` block list explicit
-  views/paths for apps whose nav isn't auto-discoverable.
+- **Phase 11 increment 2** — deployment/database repair automation behind their
+  existing explicit contracts (typed classification already lands); failure-
+  pattern memory (LESSONS.md ← repeated recovery types); run-health view over
+  recovery lineage chains.
 
 **After that.**
 - **Streaming** (SSE on `/api/chat`) → `llm.py`, `orchestrator.py`, the chat

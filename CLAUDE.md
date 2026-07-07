@@ -168,6 +168,21 @@ and execute project work.
   executor; `OPS.md` is written only by `ops_ledger`, never an LLM; the
   orchestrator imports no connector. (Details: `ARCHITECTURE.md §7.I`; BLUEPRINT
   Pillar 2.)
+- **Phase 11 — Recovery Matrix & interactive browser verification.** Recovery
+  is **typed**: a deterministic rule-based classifier (`recovery_matrix.py`)
+  labels every assessment (build/runtime/visual/integration/deployment/
+  database/product/docs_memory) and the per-type contract can only TIGHTEN the
+  Phase 6.1 budget boundary — confirm-only types and environment failures
+  (missing Playwright, occupied port) never auto-dispatch; a visual/runtime
+  repair is one bounded pass (child budget 0) whose re-verify happens in the
+  child's own tail. A `completed` run with a failed visual verdict is
+  recover-eligible under an explicit budget. Recovery task cards carry a
+  bounded, `redact()`-ed evidence block. Browser verification may execute
+  **declared** interaction flows from the committed `## Browser Verification`
+  block only (fixed vocabulary, ≤2 flows × ≤10 steps, ≤6 views, same-origin
+  only, credential-shaped fill values refused in-parent and never stored) —
+  never arbitrary browsing or computer use. A failed declared flow fails the
+  verification; console/network evidence never flips status by itself.
 - **Phase 10 — Research channel & skills.** External web access exists ONLY
   inside the bounded research channel, granted per-turn by an explicit
   `@search` / `@research` command (a semantic `research` intent only produces a

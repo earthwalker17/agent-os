@@ -111,20 +111,21 @@ conversations, messages, `pending_executions`.
 | `roles.py` | Agent role registry: `AgentRole` = prompt overlay + enforced `allowed_tools` + read-only flag. Execution roles `coder`/`reviewer`/`inspector`; system stages `integrator`/`verifier` (trace labels); chat `@`-mode ↔ role map. Pure data; unknown role → coder. |
 | `integration.py` | Deterministic per-wave merge (team runs): overlays apply into the shared repo through the base `ToolRuntime` (sandbox re-validates), plan order; identical content de-dupes, conflicting content → first-writer-wins + `IntegrationConflict` + blocker; apply errors surfaced. No LLM. |
 | `runner.py` | `CodingAgentRunner`: phased run (plan → execute → finalize) with verification + iterative repair, cooperative cancel (`cancel_event` at step boundaries → `_finalize_cancelled`), progressive live metrics. **Team path** `_run_execution_phase_team` (gated by `plan_is_team_eligible`): wave scheduling, `_run_parallel_batch` on a dedicated per-batch pool (never the shared manager pool), per-unit `_UnitContext` (own runtime + observed lists + enforced tools), per-wave `integrate_wave`, conflict/error-capped aggregate; coordinator is the sole run.json/plan.json writer. |
-| `background.py` | `BackgroundRunManager`: thread-pool dispatch; crash → `failed` (clears every transient sub-status); per-run cancel-`Event` registry (`request_cancel`); `dispatch(…, retry_of/recovery_of/recovery_budget/orchestration_round)`; `submit` (off-thread finalize). `_maybe_auto_recover` (clean-finalize only) auto-dispatches ONE linked recovery run when a user-approved budget remains. |
+| `background.py` | `BackgroundRunManager`: thread-pool dispatch; crash → `failed` (clears every transient sub-status); per-run cancel-`Event` registry (`request_cancel`); `dispatch(…, retry_of/recovery_of/recovery_budget/orchestration_round)`; `submit` (off-thread finalize). `_maybe_auto_recover` (clean-finalize only) auto-dispatches ONE linked recovery run when a user-approved budget remains. Phase 11 — also fires on a `completed` run whose visual verdict failed; enforces the Recovery Matrix contract (`auto_eligible` + classification `auto_ok`; confirm-only types and environment failures never auto-dispatch) and clamps the child's onward budget by the contract cap (visual/runtime → 0: one repair pass, one natural re-verify). |
 | `chat_delegation.py` | `@code` trigger + deterministic mode `@`-commands (`parse_mode_command`: `@plan`/`@design`/`@debug`/`@review`/`@inspect`/`@memory`/`@search`/`@research` — shape the response, never dispatch; the explicit `@search`/`@research` additionally grants the research channel for that turn). |
 | `delegation_intent.py` / `delegation_judge.py` | Heuristic fallback detector; LLM semantic delegation judge (primary — 3 decisions + a richer informational `intent` label). |
-| `pending_execution.py` | Confirmable execution plans (store / render / revise). |
+| `pending_execution.py` | Confirmable execution plans (store / render / revise). Phase 11 — a recovery proposal carries `recovery_of` (nullable SQLite column, PRAGMA-migrated) so the confirm endpoint threads full lineage. |
 | `memory_reconciliation.py` | Post-run bounded reconciliation judge (writes STATUS/TASK_QUEUE/DECISIONS/RESEARCH via `memory_engine`; skip rules; once-only). |
-| `recovery.py` | Best-effort `assess_run`: interprets a non-green terminal run, recommends one bounded next step (`RecoveryAssessment`). Confirmable handoff only — never auto-dispatches. |
+| `recovery.py` | Best-effort `assess_run`: interprets a non-green terminal run, recommends one bounded next step (`RecoveryAssessment`). Phase 11 — computes the deterministic `recovery_matrix` classification pre-LLM (rides the prompt as a strong prior; validates/falls back the judge's `recovery_type`, audited via `classified_by`), and appends the bounded redacted evidence block to a run-action `follow_up_task_card` so recovery children are no longer evidence-starved. Confirmable handoff only — never auto-dispatches. |
+| `recovery_matrix.py` | Phase 11 leaf module (models + credentials only; no LLM/IO): the typed Recovery Matrix. Frozen `RECOVERY_CONTRACTS` (8 types — build/runtime/visual auto-eligible under budget with per-type child-budget caps; integration/deployment/database/product*/docs_memory confirm-only; *product's non-green fallback stays auto-eligible to preserve the Phase 6.1 budget contract), deterministic first-match `classify_failure(record) -> (type, reason, auto_ok)` (`auto_ok=False` marks environment failures — missing Playwright/Chromium, occupied port — that a Coding Agent can't fix), and `build_recovery_evidence` (≤1800 chars, every line through `credentials.redact`). |
 | `inspect.py` | Main-agent on-demand, read-only file inspection (bounded, max 3/turn). Phase 10.2 — also dispatches the `retrieve` local-RAG tool. |
 | `local_rag.py` | Minimal, keyword-based (not vector) local retrieval (Phase 10.2): bounded, cited evidence from project memory (scored `##` sections), recent run history (`run_store` summaries), and a sandbox-safe repo map (two-level walk via `inspect`, sensitive names filtered). Per-source + per-turn char caps; never raises. Exposed as the `retrieve` inspection tool + `POST …/retrieve`. |
 | `skill_patch.py` | Review-first suggested skill patch (Phase 10.2): a best-effort, green-run-only, cheaply-gated judge (mirrors `recovery.assess_run`) that PROPOSES an append-style skill refinement (`SkillPatchProposal` on run.json) — target agent/skill, rationale, run evidence, before/after content. `apply_skill_patch` writes ONLY through `skills_store.write_skill` on explicit user action (Apply, optionally edited); `reject_skill_patch` writes nothing. Never creates skills or promotes globally. |
 | `research.py` | The bounded research channel (Phase 10, mirrors inspect.py): strict `{"research_request": …}` protocol, two tools (`web_search` snippets-only, `fetch_url` bounded tag-stripped extract), SSRF screening (scheme/port/userinfo, public-DNS enforcement incl. v4-mapped v6, hop-by-hop redirect re-screening), `DEFAULT_ALLOWED_DOMAINS` allowlist (user-pasted URLs bypass only that), `redact()`-diff egress guard on every outbound query/URL, per-fetch 6k + per-turn 16k char caps, untrusted-content framing. Never raises into the loop. |
 | `web_search.py` | Search-engine adapter (Tavily v1; Brave slot documented): `search_web → [{title,url,snippet}]`, key from `credentials.get_token("search")` in a header ONLY, errors redacted, injectable opener. No key → clear config error (URL fetch stays keyless). |
 | `verification.py` | Command verification: `plan_verification` (manual `## Verification` block else inferred), `run_verification_specs`, render. |
-| `browser_verification.py` | Browser lifecycle: dev server → HTTP readiness → render-readiness-gated multi-page Playwright capture (`BrowserPageCapture[]`) → teardown; legacy single-capture adapter keeps `screenshots/browser.png`. |
-| `visual_judge.py` | AI visual judgment over screenshots (`run_visual_review` → verdict + rationale, `visual_review.json`). Resolves a vision-capable model (selected, else any available), skips gracefully otherwise. Diagnostic-only. |
+| `browser_verification.py` | Browser lifecycle: dev server → HTTP readiness → render-readiness-gated multi-page Playwright capture (`BrowserPageCapture[]`) → teardown; legacy single-capture adapter keeps `screenshots/browser.png`. Phase 11 — the `## Browser Verification` block gains `### Views` / `### Flow:` subsections (fixed vocabulary `goto/click/fill/submit/expect_text/screenshot`; caps 6 views / 2 flows / 10 steps; HTML-comment examples inert); the capture subprocess collects console errors / page errors / local-origin network failures (bounded, redacted), captures explicit views first (overall cap 8), and executes flows with per-step screenshots + a final-state capture (`nav_kind="step"` rides the existing gallery). `CaptureOutcome` normalizes legacy list-returning capturers. `_screen_flows` refuses credential-shaped fill values / sensitive targets in-parent (never serialized). A failed **declared** flow fails the verification; console errors and policy refusals never do. |
+| `visual_judge.py` | AI visual judgment over screenshots (`run_visual_review` → verdict + rationale, `visual_review.json`). Resolves a vision-capable model (selected, else any available), skips gracefully otherwise. Diagnostic-only. Phase 11 — the prompt folds in a bounded "Runtime signals" text block (console/network/flow-step evidence, ≤1200 chars) as supporting signal. |
 | `preview.py` | Managed long-lived preview dev servers (one per project). |
 | `git_ops.py` | Sandboxed local Git via `run_git`: `ensure_repo`, `create_checkpoint` (out-of-branch tagged snapshot), `capture_diff` (redacted + bounded), secret-refusing `commit`, `create_branch`, gated `rollback`. Never raises into the run loop. |
 | `github_connector.py` / `_git_askpass.sh` | GitHub via REST/`urllib` (no `gh` CLI): `status`, tokenless `ensure_remote`, `push_branch`, `create_pull_request` — token injected ONLY via the generated `GIT_ASKPASS` env, never argv/`.git/config`. Output redacted. |
@@ -236,11 +237,38 @@ Events carry a `phase` tag + plan/task/wave/integration events.
 ### E. Browser preview + visual review — `browser_verification` + `visual_judge` + `preview`
 **Run browser verification** (`POST …/browser-verify`): `npm install` → dev
 server (5174) → poll URL → render-readiness-gated multi-page Playwright capture
-(entry page + a few discovered views; a readiness timeout captures anyway,
-marked `unconfirmed`). On pass the server is handed to `preview.py` (Start/Stop
-from the Runs panel). Same request: `run_visual_review` sends the screenshots +
-task context to a vision model → structured verdict (diagnostic-only; skips
-without a vision model). Screenshots served via `…/screenshot?name=`.
+(entry page + explicit `### Views` first + a few discovered views; a readiness
+timeout captures anyway, marked `unconfirmed`) → **declared interaction flows**
+(Phase 11: bounded `### Flow:` steps executed in the same capture subprocess —
+click/fill/submit/expect_text with per-step screenshots; console/pageerror/
+local-network evidence collected throughout, redacted in-parent). On pass the
+server is handed to `preview.py` (Start/Stop from the Runs panel); a
+flow-failed verification is `failed` (no handoff) and, from the UI endpoint,
+gets a best-effort typed `assess_run`. Same request: `run_visual_review` sends
+the screenshots + task context + runtime signals to a vision model → structured
+verdict (diagnostic-only; skips without a vision model). Screenshots served via
+`…/screenshot?name=`.
+
+### E2. Recovery Matrix — typed, evidence-driven repair (Phase 11)
+Every assessment is typed: `recovery_matrix.classify_failure` runs
+deterministically before the `assess_run` LLM call (strong prior; validated
+fallback; `classified_by` audits which won), and a run-action
+`follow_up_task_card` carries a bounded redacted evidence block (screenshot
+artifact names, failing route, visual verdict, console/network errors, failed
+flow steps, verification tail) so the recovery child sees the concrete failure.
+Repair reuses the EXISTING recovery-run machinery — no new loop: the child's
+own tail re-runs verification → browser → visual judge (before/after = parent
+vs child `visual_review`, linked by `recovery_of`/`recovered_by`). The
+auto-path (`_maybe_auto_recover`) additionally fires on a `completed` run whose
+visual verdict failed, but only for contract-`auto_eligible` types
+(build/runtime/visual + the non-green product fallback) with classification
+`auto_ok` (environment failures — missing Playwright, occupied port — never
+auto-repair), and clamps the child's onward budget by the contract cap
+(visual/runtime → 0 = exactly one repair pass). The manual path
+(propose-recovery → pending row with `recovery_of` → confirm) threads the same
+lineage: `recovery_of`, `orchestration_round+1`, inherited checkpoint, contract-
+clamped budget, parent `recovered_by` claim + `manual_recovery_dispatched`
+event; a parent that already has a recovery 409s.
 
 ### F. Chat attachment upload — `uploads.py`
 Composer sends files to `POST /api/chat/upload` before the chat send; each is
@@ -307,8 +335,10 @@ so old records round-trip; **no secret ever appears on the record.**
 - **Verification** — `verification` (`VerificationResult`: `mode`,
   `commands[]` breakdown, `repair_attempts`), transient `verification_state`.
 - **Browser/visual** — `browser_verification` (with `pages: BrowserPageCapture[]`
-  + `readiness`), `browser_verification_state`, diagnostic-only `visual_review`
-  (also `visual_review.json`).
+  + `readiness`; Phase 11 adds bounded redacted `console_errors[]` /
+  `network_failures[]` + `flows: BrowserFlowResult[]` of per-step outcomes —
+  fill values never stored, `value_masked` only), `browser_verification_state`,
+  diagnostic-only `visual_review` (also `visual_review.json`).
 - **Plan** — `plan` (`ExecutionPlan` of `ExecutionTask` units, also `plan.json`).
   Team fields on the task: `role`, `parallel_safe`, `wave`, `workspace`
   (`main`|`patch`); on the plan: `execution_mode` (`sequential`|`team`).
@@ -317,9 +347,11 @@ so old records round-trip; **no secret ever appears on the record.**
   manifests), transient `integration_state`.
 - **Memory** — `memory_reconciled` / `memory_reconciliation` (tag) / `_reason` /
   `_error`.
-- **Recovery** — `recovery_assessment` (`RecoveryAssessment`); budget lineage
-  `recovery_budget` / `recovery_of` / `recovered_by` / `orchestration_round`
-  (`recovered_by` set once → one recovery per parent).
+- **Recovery** — `recovery_assessment` (`RecoveryAssessment`; Phase 11 adds
+  `recovery_type` + `classified_by`); budget lineage `recovery_budget` /
+  `recovery_of` / `recovered_by` / `orchestration_round` (`recovered_by` set
+  once → one recovery per parent, claimed on BOTH the auto and the manual
+  confirm path).
 - **Run control** — `cancel_requested`, `retry_of` / `retried_by`.
 - **Git (Project Ops)** — `pre_run_checkpoint` / `checkpoint_tag` / `base_commit`
   (rollback anchor), `head_commit`, `branch`, `commit_sha`, `pushed`, `pr_url` /
@@ -361,6 +393,21 @@ rewrites) and are overwritten with the authoritative lists at finalize.
   budget** set when explicitly confirming a contract authorizes ≤2 bounded,
   linked, audited auto-recovery runs (clamped at the confirm endpoint,
   idempotent via `recovered_by`, never from inferred intent or a crash).
+  Phase 11 tightens, never loosens, this boundary: the Recovery Matrix contract
+  gates auto-recovery by failure type (confirm-only types and environment
+  failures never auto-dispatch; a visual/runtime repair child gets budget 0 —
+  one pass), while the generic non-green case preserves the Phase 6.1 behavior
+  exactly.
+- **Interactive browser verification is declarative + bounded.** Flows come
+  only from the committed `## Browser Verification` block (fixed action
+  vocabulary, ≤2 flows × ≤10 steps, ≤6 explicit views, overall page cap 8) and
+  run only against the local dev-server origin — no arbitrary browsing, no
+  external sites, no exploration. Credential-shaped fill values / sensitive
+  input targets are refused in the parent process (never serialized to the
+  browser, never stored — `value_masked` only), a refused flow never fails the
+  run and is never auto-repaired, and console/network evidence is bounded +
+  redacted before persistence. A failed **declared** flow fails the
+  verification; console errors alone never do.
 - **Best-effort post-run steps** (verification / browser / reconciliation /
   checkpoint / diff / integration) never crash finalization and never leave a
   run stuck in `running`.
@@ -485,6 +532,14 @@ rewrites) and are overwritten with the authoritative lists at finalize.
   the URL into every `ProviderError` (→ logs/tracebacks); the Gemini key rides the
   `x-goog-api-key` header instead, and `_safe_url` redacts any stray `key=` query
   secret defensively.
+- **Truncate-then-redact leaks secrets; always redact first.** Exact-value
+  redaction (`credentials.redact`) fails on a secret sliced mid-value by an
+  earlier truncation — e.g. a ~230-char Supabase `service_role` JWT in a failed
+  local API URL cut at a 300-char console-entry cap. Any bounded evidence path
+  (capture-subprocess entries, recovery-evidence fields) must apply the
+  generous transport cap first, then redact, then apply the small display
+  truncation — never truncate small before redacting. (Caught by the Phase 11
+  adversarial review.)
 
 ## 11. Starting a future session
 

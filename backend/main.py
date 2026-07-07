@@ -75,6 +75,8 @@ from execution.browser_verification import (
     DEFAULT_DEV_URL,
 )
 from execution.visual_judge import run_visual_review
+from execution.recovery import assess_run
+from execution.recovery_matrix import classify_failure, contract_for
 from execution import preview
 from execution import git_ops, github_connector
 from execution import app_env
@@ -1677,11 +1679,18 @@ def api_propose_recovery(project_id: str, run_id: str, req: ProposeRecoveryReque
         )
 
     title = derive_title_from_card(task_card, fallback=f"Recovery for {record.task_title or run_id}")
+    # The card can carry a Phase 11 evidence block — quote only its head in the
+    # chat bubble (the full card still rides the pending plan + Revise flow).
+    card_quote = task_card if len(task_card) <= 400 else task_card[:397].rstrip() + "..."
+    type_line = (
+        f"**Failure type:** {ra.recovery_type}\n\n" if ra.recovery_type else ""
+    )
     display_plan = (
         f"I looked at the **{record.status.value}** run _{record.task_title or run_id}_ and "
         f"recommend a **{ra.recommended_action}** follow-up.\n\n"
+        f"{type_line}"
         f"**Diagnosis:** {ra.diagnosis or '(none)'}\n\n"
-        f"**Proposed fix:**\n\n> {task_card}\n\n"
+        f"**Proposed fix:**\n\n> {card_quote}\n\n"
         f"{ra.rationale or ''}\n\n"
         "Confirm to dispatch this recovery run, or revise the plan first."
     ).strip()
@@ -1693,6 +1702,7 @@ def api_propose_recovery(project_id: str, run_id: str, req: ProposeRecoveryReque
         title=title,
         display_plan=display_plan,
         task_card=task_card,
+        recovery_of=run_id,
     )
     plan = serialize_pending(pending_row)
     body = render_pending_chat_body(plan)
@@ -1824,6 +1834,11 @@ def api_run_browser_verification(
             "pages": len(result.pages),
             "readiness": result.readiness,
             "duration_ms": result.duration_ms,
+            "flows": [
+                {"name": f.name, "status": f.status} for f in result.flows
+            ],
+            "console_errors": len(result.console_errors),
+            "network_failures": len(result.network_failures),
         },
     )
     if record.visual_review is not None:
@@ -1838,6 +1853,22 @@ def api_run_browser_verification(
                 "url": result.url,
             },
         )
+    # Phase 11 — a failed UI-triggered browser verification / visual verdict
+    # deserves a typed recovery assessment too (the runner-tail assessment
+    # only sees the state at finalize). Best-effort + idempotent: assess_run
+    # short-circuits when an assessment already exists and NEVER dispatches.
+    try:
+        if (
+            (result.enabled and result.status == "failed")
+            or (
+                record.visual_review is not None
+                and record.visual_review.enabled
+                and record.visual_review.status == "failed"
+            )
+        ):
+            assess_run(project_id, run_id)
+    except Exception:
+        pass
     return record.model_dump()
 
 
@@ -3280,15 +3311,92 @@ def api_confirm_pending_execution(
     )
     # Clamp the user-approved recovery budget at the trust boundary (0..2).
     recovery_budget = max(0, min(2, (req.recovery_budget if req else 0) or 0))
+
+    # Phase 11 — a recovery plan (propose-recovery) carries its parent run id;
+    # thread the lineage through dispatch so a MANUALLY-confirmed recovery run
+    # is linked, checkpoint-inherited, and budget-clamped exactly like an
+    # auto-dispatched one. Parent missing/corrupt degrades to a normal
+    # dispatch (defensive — the plan is still the user's explicit intent).
+    dispatch_kwargs: dict = {"recovery_budget": recovery_budget}
+    parent_record: RunRecord | None = None
+    if plan.recovery_of:
+        parent_raw = run_store.read_run_json(project_id, plan.recovery_of)
+        if parent_raw is not None:
+            try:
+                parent_record = RunRecord(**parent_raw)
+            except Exception:
+                parent_record = None
+        if parent_record is not None:
+            if parent_record.recovered_by is not None:
+                # One recovery per parent — a concurrent auto-recovery (or a
+                # second confirmed proposal) already claimed this run.
+                revert_pending_execution_to_pending(pending_id)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Run {plan.recovery_of} already has a recovery run "
+                        f"({parent_record.recovered_by})."
+                    ),
+                )
+            ra = parent_record.recovery_assessment
+            recovery_type = (
+                (ra.recovery_type if ra is not None else "")
+                or classify_failure(parent_record).recovery_type
+            )
+            contract = contract_for(recovery_type)
+            dispatch_kwargs = {
+                # The contract can only TIGHTEN the child's onward budget —
+                # e.g. a confirmed visual repair still gets exactly one pass.
+                "recovery_budget": min(recovery_budget, contract.child_budget_cap),
+                "recovery_of": plan.recovery_of,
+                "orchestration_round": parent_record.orchestration_round + 1,
+            }
+            # Share the parent's rollback anchor — but only when one exists;
+            # passing an all-None inherit would suppress the child's own
+            # fresh checkpoint.
+            if parent_record.pre_run_checkpoint:
+                dispatch_kwargs["inherit_checkpoint"] = {
+                    "ref": parent_record.pre_run_checkpoint,
+                    "base": parent_record.base_commit,
+                    "tag": parent_record.checkpoint_tag,
+                    "branch": parent_record.branch,
+                }
     try:
-        record = get_default_manager().dispatch(
-            project_id, spec, recovery_budget=recovery_budget
-        )
+        record = get_default_manager().dispatch(project_id, spec, **dispatch_kwargs)
     except Exception:
         # Dispatch failed after we claimed — release the claim so the button
         # doesn't dead-end, then surface the failure.
         revert_pending_execution_to_pending(pending_id)
         raise
+
+    # Claim the parent (recovered_by) under the per-run lock so the manual and
+    # auto paths share one idempotency story; audited via an event.
+    if plan.recovery_of and parent_record is not None:
+        def _claim_parent(rec: RunRecord):
+            if rec.recovered_by is None:
+                rec.recovered_by = record.run_id
+            return rec
+
+        try:
+            run_store.mutate_run_json(project_id, plan.recovery_of, _claim_parent)
+            run_store.append_event(
+                project_id,
+                plan.recovery_of,
+                {
+                    "type": "manual_recovery_dispatched",
+                    "child_run_id": record.run_id,
+                    "recovery_type": (
+                        (parent_record.recovery_assessment.recovery_type
+                         if parent_record.recovery_assessment is not None else "")
+                        or classify_failure(parent_record).recovery_type
+                    ),
+                    "orchestration_round": parent_record.orchestration_round + 1,
+                },
+            )
+        except Exception:
+            # Lineage is audit metadata — a claim/event failure must never
+            # fail the dispatch that already happened.
+            pass
 
     marked = mark_pending_execution_dispatched(pending_id, record.run_id)
     if not marked:

@@ -64,12 +64,49 @@ _SYSTEM_PROMPT = (
     "skeleton), visually coherent, relevant to the task, and free of obvious "
     "broken states (blank page, error overlay/stack trace, missing content, or "
     "an obviously wrong route). Do not assume functionality you cannot see. "
+    "When runtime signals (console errors, network failures, interaction step "
+    "results) are provided, treat them as supporting text evidence only — the "
+    "screenshots remain the primary basis of your verdict. "
     "Respond with ONLY a single JSON object and nothing else — no markdown "
     "fences, no commentary, no step-by-step reasoning."
 )
 
 
-def _build_user_prompt(task_card: str, summary: str, pages: list) -> str:
+# Cap on the Phase 11 runtime-signals text block folded into the user prompt.
+_RUNTIME_SIGNALS_MAX_CHARS = 1200
+
+
+def _runtime_signals_block(browser_result) -> str:
+    """Render bounded console/network/flow evidence for the judge (Phase 11).
+
+    Returns ``""`` when there is nothing to report, so legacy prompts stay
+    byte-identical.
+    """
+    if browser_result is None:
+        return ""
+    lines: list[str] = []
+    for flow in getattr(browser_result, "flows", None) or []:
+        passed = sum(1 for s in flow.steps if s.status == "passed")
+        lines.append(
+            f"- flow '{flow.name}': {flow.status} ({passed}/{len(flow.steps)} steps passed)"
+        )
+        for step in flow.steps:
+            if step.status == "failed":
+                detail = f": {step.error[:160]}" if step.error else ""
+                lines.append(f"  - failed at `{step.action} {step.target}`{detail}")
+    for entry in (getattr(browser_result, "console_errors", None) or [])[:5]:
+        lines.append(f"- console: {str(entry)[:200]}")
+    for entry in (getattr(browser_result, "network_failures", None) or [])[:5]:
+        lines.append(f"- network: {str(entry)[:200]}")
+    if not lines:
+        return ""
+    block = "\n".join(lines)[:_RUNTIME_SIGNALS_MAX_CHARS]
+    return "\n\n# Runtime signals (text evidence — supporting only)\n" + block
+
+
+def _build_user_prompt(
+    task_card: str, summary: str, pages: list, browser_result=None
+) -> str:
     page_lines = []
     for i, page in enumerate(pages, start=1):
         label = getattr(page, "label", "") or getattr(page, "path", "") or f"page {i}"
@@ -82,7 +119,8 @@ def _build_user_prompt(task_card: str, summary: str, pages: list) -> str:
         "# Build summary\n"
         f"{(summary or '(no summary)').strip()[:1000]}\n\n"
         "# Screenshots (in order)\n"
-        f"{pages_block}\n\n"
+        f"{pages_block}"
+        f"{_runtime_signals_block(browser_result)}\n\n"
         "# Output contract\n"
         "Return EXACTLY this JSON shape:\n"
         "{\n"
@@ -268,7 +306,9 @@ def run_visual_review(
             return _skipped("no readable screenshots to review")
 
         caller = vision_caller or llm.chat_vision
-        prompt = _build_user_prompt(task_card, summary, list(browser_result.pages or []))
+        prompt = _build_user_prompt(
+            task_card, summary, list(browser_result.pages or []), browser_result
+        )
         image_payload = [(media_type, data) for (_label, media_type, data) in images]
 
         try:

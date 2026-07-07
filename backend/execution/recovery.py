@@ -39,6 +39,13 @@ from llm import chat as llm_chat
 
 from . import run_store
 from .models import RunRecord, RunStatus, RecoveryAssessment
+from .recovery_matrix import (
+    RECOVERY_TYPES,
+    RecoveryClassification,
+    build_recovery_evidence,
+    classify_failure,
+    contract_for,
+)
 
 
 log = logging.getLogger(__name__)
@@ -118,6 +125,15 @@ next step for the user to confirm. You do NOT start runs — you only advise.
   pair with action "report".
 - "ok": the run is actually fine despite the signal (rare).
 
+## Recovery type (Phase 11 — Recovery Matrix)
+Classify the failure layer as exactly one of:
+"build" (compile/type/test/install), "runtime" (dev server/startup/port/console
+errors), "visual" (blank/broken/misrendered UI, failed interaction flow),
+"integration" (team-merge conflicts), "deployment", "database", "product"
+(works but misses intent), "docs_memory". You will be given a deterministic
+rule-based classification as a strong prior — deviate from it only when the
+evidence clearly says otherwise.
+
 ## Rules
 1. Be concrete and honest. Diagnose what actually went wrong from the evidence.
 2. When the action is repair / split / reverify, write ``follow_up_task_card`` as
@@ -132,13 +148,18 @@ Return ONLY a single JSON object. No markdown fences, no commentary.
   "verdict": "needs_recovery" | "exhausted" | "ok",
   "diagnosis": "one or two sentences on what went wrong",
   "recommended_action": "inspect" | "repair" | "split" | "reverify" | "report",
+  "recovery_type": "build" | "runtime" | "visual" | "integration" | "deployment" | "database" | "product" | "docs_memory",
   "follow_up_task_card": "imperative task card, or empty string",
   "rationale": "one sentence on why this is the right next step"
 }
 """
 
 
-def _build_user_prompt(record: RunRecord, result_md_text: str) -> str:
+def _build_user_prompt(
+    record: RunRecord,
+    result_md_text: str,
+    classification: Optional[RecoveryClassification] = None,
+) -> str:
     files = _trim_list(record.files_changed)
     commands = _trim_list(record.commands_run)
     blockers = _trim_list(record.blockers)
@@ -162,6 +183,22 @@ def _build_user_prompt(record: RunRecord, result_md_text: str) -> str:
             f"- browser verification: {b.status}"
             + (f" — {_truncate(b.output_preview, _MAX_OUTPUT_PREVIEW_CHARS)}" if b.output_preview else "")
         )
+        # Phase 11 — bounded interaction/runtime evidence.
+        for flow in b.flows or []:
+            passed = sum(1 for s in flow.steps if s.status == "passed")
+            signals.append(
+                f"- flow `{flow.name}`: {flow.status} ({passed}/{len(flow.steps)} steps passed)"
+            )
+            for step in flow.steps:
+                if step.status == "failed":
+                    signals.append(
+                        f"  - failed at `{step.action} {step.target}`"
+                        + (f": {_truncate(step.error, 200)}" if step.error else "")
+                    )
+        for entry in (b.console_errors or [])[:5]:
+            signals.append(f"- console error: {_truncate(str(entry), 200)}")
+        for entry in (b.network_failures or [])[:5]:
+            signals.append(f"- network failure: {_truncate(str(entry), 200)}")
     if record.visual_review and record.visual_review.enabled:
         vr = record.visual_review
         signals.append(
@@ -170,6 +207,15 @@ def _build_user_prompt(record: RunRecord, result_md_text: str) -> str:
             + (f" {_truncate(vr.reasoning, _MAX_OUTPUT_PREVIEW_CHARS)}" if vr.reasoning else "")
         )
     signals_block = "\n".join(signals) if signals else "_(no extra verification signals)_"
+
+    classification_block = ""
+    if classification is not None:
+        contract = contract_for(classification.recovery_type)
+        classification_block = (
+            f"### Deterministic classification (strong prior)\n"
+            f"- recovery_type: `{classification.recovery_type}` — {classification.reason}\n"
+            f"- contract: {contract.description}\n\n"
+        )
 
     return (
         f"## Run\n"
@@ -180,6 +226,7 @@ def _build_user_prompt(record: RunRecord, result_md_text: str) -> str:
         f"{_render('Files Changed', files)}\n\n"
         f"{_render('Commands Run', commands)}\n\n"
         f"{_render('Blockers / Errors', blockers)}\n\n"
+        f"{classification_block}"
         f"### Verification Signals\n{signals_block}\n\n"
         f"### Summary\n{_truncate(record.summary.strip(), _MAX_SUMMARY_CHARS) or '_(no summary)_'}\n\n"
         f"## Rendered result.md\n{_truncate(result_md_text, _MAX_RESULT_MD_CHARS) or '_(no result.md)_'}\n\n"
@@ -200,7 +247,10 @@ def _strip_code_fence(text: str) -> str:
     return inner[nl + 1:].strip() if nl != -1 else ""
 
 
-def _parse_assessment(raw: str) -> Optional[RecoveryAssessment]:
+def _parse_assessment(
+    raw: str,
+    classification: Optional[RecoveryClassification] = None,
+) -> Optional[RecoveryAssessment]:
     text = _strip_code_fence(raw)
     if not text:
         return None
@@ -221,6 +271,18 @@ def _parse_assessment(raw: str) -> Optional[RecoveryAssessment]:
     diagnosis = str(parsed.get("diagnosis", "")).strip()
     rationale = str(parsed.get("rationale", "")).strip()
     task_card = str(parsed.get("follow_up_task_card", "")).strip()
+    # Phase 11 — the judge's recovery type is validated against the matrix;
+    # anything unknown falls back to the deterministic classification.
+    judge_type = str(parsed.get("recovery_type", "")).strip().lower()
+    if judge_type in RECOVERY_TYPES:
+        recovery_type = judge_type
+        classified_by = "judge"
+    elif classification is not None:
+        recovery_type = classification.recovery_type
+        classified_by = "rules"
+    else:
+        recovery_type = ""
+        classified_by = ""
     # A task card only makes sense for run-type actions.
     if action not in _RUN_ACTIONS:
         task_card = ""
@@ -238,6 +300,8 @@ def _parse_assessment(raw: str) -> Optional[RecoveryAssessment]:
         recommended_action=action,
         follow_up_task_card=task_card,
         rationale=rationale,
+        recovery_type=recovery_type,
+        classified_by=classified_by,
     )
 
 
@@ -289,26 +353,62 @@ def _assess_inner(
         return None
 
     result_md = run_store.read_result_md(project_id, run_id) or ""
+    # Phase 11 — deterministic Recovery Matrix classification, computed before
+    # the LLM call: it rides the prompt as a strong prior, backs the judge's
+    # type as a fallback, and survives even a failed/malformed LLM call.
+    classification = classify_failure(record)
     caller = llm_caller or llm_chat
     try:
         out = caller(
             system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _build_user_prompt(record, result_md)}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": _build_user_prompt(record, result_md, classification),
+                }
+            ],
             max_tokens=900,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("Recovery judge LLM call failed: %s", exc)
         assessment = RecoveryAssessment(
-            assessed=False, verdict="ok", error=f"{type(exc).__name__}: {exc}"
+            assessed=False,
+            verdict="ok",
+            error=f"{type(exc).__name__}: {exc}",
+            recovery_type=classification.recovery_type,
+            classified_by="rules",
         )
         _persist(project_id, run_id, assessment)
         return assessment
 
-    assessment = _parse_assessment(out)
+    assessment = _parse_assessment(out, classification)
     if assessment is None:
         assessment = RecoveryAssessment(
-            assessed=False, verdict="ok", error="judge returned malformed output"
+            assessed=False,
+            verdict="ok",
+            error="judge returned malformed output",
+            recovery_type=classification.recovery_type,
+            classified_by="rules",
         )
+    # Phase 11 — a run-type follow-up card gets the bounded, redacted evidence
+    # block appended, so the recovery child (which never sees chat history or
+    # the parent's artifacts) receives the concrete failure evidence. Both
+    # dispatch paths (auto + manual confirm) carry this card verbatim.
+    if (
+        assessment.recommended_action in _RUN_ACTIONS
+        and assessment.follow_up_task_card
+    ):
+        try:
+            evidence = build_recovery_evidence(
+                record, project_id=project_id, classification=classification
+            )
+            assessment.follow_up_task_card = (
+                assessment.follow_up_task_card.rstrip()
+                + "\n\n## Evidence from failed run\n"
+                + evidence
+            )
+        except Exception:  # noqa: BLE001 — evidence is additive, never blocking
+            log.exception("Recovery evidence build failed for run %s", run_id)
     _persist(project_id, run_id, assessment)
     return assessment
 
@@ -332,6 +432,7 @@ def _persist(project_id: str, run_id: str, assessment: RecoveryAssessment) -> No
             "assessed": assessment.assessed,
             "verdict": assessment.verdict,
             "recommended_action": assessment.recommended_action,
+            "recovery_type": assessment.recovery_type,
             "has_task_card": bool(assessment.follow_up_task_card),
             "error": _truncate(assessment.error or "", 240),
         },

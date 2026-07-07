@@ -267,6 +267,78 @@ def test_delete_conversations_for_project_clears_pending_executions():
     assert n_conv == 0
 
 
+def test_recovery_of_roundtrip_and_default():
+    """Phase 11 — a pending recovery plan stores its parent run id; ordinary
+    plans read back None (and the serializer carries the field to the API)."""
+    db = _fresh_db_module()
+    conv = db.create_conversation("agent-os", "c")
+    plain = db.create_pending_execution(
+        project_id="agent-os", conversation_id=conv["id"], source_message_id=None,
+        title="t", display_plan="p", task_card="c",
+    )
+    assert plain["recovery_of"] is None
+
+    rec = db.create_pending_execution(
+        project_id="agent-os", conversation_id=conv["id"], source_message_id=None,
+        title="fix", display_plan="p", task_card="c",
+        recovery_of="20260101-000000-parent00",
+    )
+    assert rec["recovery_of"] == "20260101-000000-parent00"
+    assert db.get_pending_execution(rec["id"])["recovery_of"] == "20260101-000000-parent00"
+
+    from execution.pending_execution import serialize_pending
+    view = serialize_pending(db.get_pending_execution(rec["id"]))
+    assert view.recovery_of == "20260101-000000-parent00"
+    assert view.to_dict()["recovery_of"] == "20260101-000000-parent00"
+
+
+def test_recovery_of_migration_on_legacy_db():
+    """Phase 11 — init_db adds the recovery_of column to a pre-existing
+    pending_executions table (the messages.metadata migration pattern)."""
+    import sqlite3
+
+    import database
+
+    tmpdir = tempfile.mkdtemp(prefix="agentos-mig-")
+    legacy_path = Path(tmpdir) / "agent_os.db"
+    conn = sqlite3.connect(legacy_path)
+    conn.executescript(
+        """
+        CREATE TABLE conversations (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, timestamp TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+        );
+        CREATE TABLE pending_executions (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+            source_message_id TEXT, title TEXT NOT NULL, display_plan TEXT NOT NULL,
+            task_card TEXT NOT NULL, status TEXT NOT NULL, run_id TEXT,
+            revision_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+        );
+        INSERT INTO pending_executions VALUES
+            ('legacy1', 'agent-os', 'conv1', NULL, 't', 'p', 'c', 'pending', NULL, 0,
+             '2026-01-01', '2026-01-01');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    database.DB_PATH = legacy_path
+    importlib.reload(database)
+    database.DB_PATH = legacy_path
+    database.init_db()
+
+    row = database.get_pending_execution("legacy1")
+    assert row is not None
+    assert row["recovery_of"] is None  # legacy row reads back cleanly
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

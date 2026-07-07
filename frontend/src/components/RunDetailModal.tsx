@@ -210,6 +210,58 @@ function BrowserVerificationBlock({
           </ul>
         </div>
       )}
+      {/* Phase 11 — declared interaction flows: per-step outcome + artifacts. */}
+      {(v.flows ?? []).map((flow) => (
+        <div key={flow.name} className="run-detail-verify-cmd">
+          <span className="run-detail-label">Flow</span>
+          <code>{flow.name}</code>
+          <span className={`run-verify-status status-${flow.status}`}>{flow.status}</span>
+          <ul className="run-detail-shotlist">
+            {flow.steps.map((s, i) => (
+              <li key={i}>
+                <span className={`run-verify-status status-${s.status}`}>{s.status}</span>{' '}
+                <code>
+                  {s.action}
+                  {s.target ? ` ${s.target}` : ''}
+                  {s.value_masked ? ` ${s.value_masked}` : ''}
+                </code>
+                {s.error && <span className="run-detail-verify-meta">{s.error}</span>}
+                {s.screenshot && (
+                  <a
+                    className="run-detail-screenshot-link"
+                    href={pageUrl(s.screenshot)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    shot
+                  </a>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+      {/* Phase 11 — bounded runtime evidence (console / network). */}
+      {(v.console_errors ?? []).length > 0 && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">
+            Console errors ({(v.console_errors ?? []).length})
+          </span>
+          <pre className="run-detail-verify-output">
+            {(v.console_errors ?? []).join('\n')}
+          </pre>
+        </div>
+      )}
+      {(v.network_failures ?? []).length > 0 && (
+        <div className="run-detail-verify-cmd">
+          <span className="run-detail-label">
+            Network failures ({(v.network_failures ?? []).length})
+          </span>
+          <pre className="run-detail-verify-output">
+            {(v.network_failures ?? []).join('\n')}
+          </pre>
+        </div>
+      )}
       {v.output_preview && (
         <pre className="run-detail-verify-output">{v.output_preview}</pre>
       )}
@@ -281,6 +333,14 @@ function RecoveryBlock({
           {ra.verdict}
         </span>
         <span className="run-detail-verify-meta">{ra.recommended_action}</span>
+        {ra.recovery_type && (
+          <span
+            className="run-detail-verify-meta"
+            title={`Recovery Matrix classification (${ra.classified_by || 'rules'})`}
+          >
+            type: {ra.recovery_type}
+          </span>
+        )}
         {recoveredBy && <span className="run-detail-verify-meta">recovery run dispatched</span>}
       </div>
       {ra.diagnosis && <p className="run-detail-visual-headline">{ra.diagnosis}</p>}

@@ -209,6 +209,114 @@ def test_malformed_json_is_recorded_as_error():
         root.cleanup()
 
 
+# ---------- Phase 11: Recovery Matrix classification + evidence ----------
+
+def _payload_with_type(recovery_type, action="repair", card="Fix src/x.ts."):
+    return json.dumps({
+        "verdict": "needs_recovery",
+        "diagnosis": "d",
+        "recommended_action": action,
+        "recovery_type": recovery_type,
+        "follow_up_task_card": card if action in ("repair", "split", "reverify") else "",
+        "rationale": "r",
+    })
+
+
+def test_valid_judge_recovery_type_is_kept():
+    root = _Root()
+    try:
+        rec = _record()
+        root.seed_run(rec)
+        out = recovery.assess_run(
+            "demo", rec.run_id, llm_caller=_caller(_payload_with_type("visual"))
+        )
+        assert out.recovery_type == "visual"
+        assert out.classified_by == "judge"
+    finally:
+        root.cleanup()
+
+
+def test_invalid_judge_recovery_type_falls_back_to_rules():
+    root = _Root()
+    try:
+        rec = _record(
+            verification=VerificationResult(enabled=True, status="failed"),
+        )
+        root.seed_run(rec)
+        out = recovery.assess_run(
+            "demo", rec.run_id, llm_caller=_caller(_payload_with_type("nonsense"))
+        )
+        assert out.recovery_type == "build"  # deterministic classification
+        assert out.classified_by == "rules"
+    finally:
+        root.cleanup()
+
+
+def test_legacy_payload_without_type_falls_back_to_rules():
+    root = _Root()
+    try:
+        rec = _record()
+        root.seed_run(rec)
+        out = recovery.assess_run(
+            "demo", rec.run_id, llm_caller=_caller(_needs_recovery_payload())
+        )
+        assert out.recovery_type == "product"  # non-green fallback
+        assert out.classified_by == "rules"
+    finally:
+        root.cleanup()
+
+
+def test_evidence_appended_to_run_action_card():
+    root = _Root()
+    try:
+        rec = _record(
+            verification=VerificationResult(
+                enabled=True, status="failed", command="npm run build",
+                output_preview="error TS2304: Cannot find name 'foo'",
+            ),
+        )
+        root.seed_run(rec)
+        out = recovery.assess_run(
+            "demo", rec.run_id, llm_caller=_caller(_needs_recovery_payload())
+        )
+        assert "## Evidence from failed run" in out.follow_up_task_card
+        assert "TS2304" in out.follow_up_task_card
+        # Persisted card carries the evidence too (both dispatch paths read it).
+        persisted = _read_assessment("demo", rec.run_id)
+        assert "## Evidence from failed run" in persisted.follow_up_task_card
+    finally:
+        root.cleanup()
+
+
+def test_no_evidence_for_report_action():
+    root = _Root()
+    try:
+        rec = _record()
+        root.seed_run(rec)
+        out = recovery.assess_run(
+            "demo", rec.run_id,
+            llm_caller=_caller(_payload_with_type("product", action="report")),
+        )
+        assert out.follow_up_task_card == ""
+    finally:
+        root.cleanup()
+
+
+def test_llm_failure_still_carries_deterministic_type():
+    root = _Root()
+    try:
+        rec = _record(
+            verification=VerificationResult(enabled=True, status="failed"),
+        )
+        root.seed_run(rec)
+        out = recovery.assess_run("demo", rec.run_id, llm_caller=_caller(RuntimeError("boom")))
+        assert out.assessed is False
+        assert out.recovery_type == "build"
+        assert out.classified_by == "rules"
+    finally:
+        root.cleanup()
+
+
 def _run_all() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed: list[str] = []

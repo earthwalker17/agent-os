@@ -44,12 +44,17 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+import credentials
+
 from .manager import read_task_state
 from .models import (
+    BrowserFlowResult,
+    BrowserFlowStep,
     BrowserPageCapture,
     BrowserVerificationResult,
     RunRecord,
@@ -90,6 +95,36 @@ MAX_BROWSER_PAGES = 4
 # never failed outright; the AI visual judgment is the second line of defense
 # against a spinner-only capture).
 DEFAULT_PAGE_READINESS_TIMEOUT_SECONDS = 12
+
+# Phase 11 — interactive verification bounds. Views/flows are declared in the
+# ``## Browser Verification`` block of TASK.md (``### Views`` / ``### Flow:``
+# subsections) and are deliberately small: this is a bounded smoke check of the
+# routes and interactions the project says matter, never open-ended browsing.
+MAX_EXPLICIT_VIEWS = 6
+MAX_FLOWS = 2
+MAX_FLOW_STEPS = 10
+# Total page-capture budget when explicit views are declared: primary + views
+# first, auto-discovered targets fill whatever remains.
+MAX_TOTAL_CAPTURES = 8
+# Console/network evidence caps (per capture run, across all pages).
+MAX_CONSOLE_ERRORS = 20
+MAX_NETWORK_FAILURES = 20
+_CONSOLE_ENTRY_CHARS = 300
+# Global cap on per-step flow screenshots (each flow's final state is always
+# captured; intermediate step captures stop once this many exist).
+MAX_STEP_SCREENSHOTS = 12
+# The fixed interaction vocabulary. Anything else in a ``### Flow:`` list is
+# skipped at parse time — flows are declarative smoke tests, not automation.
+_FLOW_ACTIONS = ("goto", "click", "fill", "submit", "expect_text", "screenshot")
+_FLOW_TARGET_CHARS = 120
+_FLOW_VALUE_CHARS = 200
+# ``fill`` targets that look like credential inputs are refused outright (the
+# flow is marked ``refused`` and never reaches the browser) — Agent OS never
+# types secrets into a page, not even user-declared ones.
+_SENSITIVE_FILL_TARGET_RE = re.compile(
+    r"password|passcode|secret|token|api.?key|credit.?card|card.?number|cvv|ssn",
+    re.IGNORECASE,
+)
 
 # Task 06.2C — defaults for the user-triggered browser verification flow.
 # Agent OS's own frontend runs on 5173, so the verified app must use a
@@ -138,18 +173,123 @@ _URL_LINE_REGEX = re.compile(
 
 
 @dataclass
+class ViewTarget:
+    """One explicitly-declared route/view to capture (``### Views``)."""
+
+    path: str
+    label: str = ""
+
+
+@dataclass
+class FlowStepSpec:
+    """One declared interaction step (fixed vocabulary, bounded args)."""
+
+    action: str
+    target: str = ""
+    value: str = ""
+
+
+@dataclass
+class FlowSpec:
+    """One declared interaction flow (``### Flow: <name>``)."""
+
+    name: str
+    steps: list[FlowStepSpec] = field(default_factory=list)
+
+
+@dataclass
 class BrowserVerificationConfig:
-    """Parsed ``## Browser Verification`` block."""
+    """Parsed ``## Browser Verification`` block.
+
+    ``views`` / ``flows`` (Phase 11) come from optional ``### Views`` /
+    ``### Flow: <name>`` subsections *inside* the block but *outside* the
+    bash fence. Both default empty, so a legacy command+url block parses
+    identically to before.
+    """
 
     command: str
     url: str
+    views: list[ViewTarget] = field(default_factory=list)
+    flows: list[FlowSpec] = field(default_factory=list)
 
 
 # ---------- parser ----------
 
 
+_VIEWS_HEADING_REGEX = re.compile(r"^###\s+Views\s*$", re.IGNORECASE)
+_FLOW_HEADING_REGEX = re.compile(r"^###\s+Flow\s*:\s*(?P<name>.+?)\s*$", re.IGNORECASE)
+_ANY_SUBSECTION_REGEX = re.compile(r"^###\s+", re.MULTILINE)
+_QUOTED_ARG_REGEX = re.compile(r'"([^"]*)"')
+# HTML comments inside the block are documentation (the TASK.md template ships
+# a commented-out Views/Flow example) — never live config. Stripped before any
+# line scanning so a heading inside ``<!-- … -->`` can't activate a subsection.
+_HTML_COMMENT_REGEX = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _parse_view_line(line: str) -> Optional[ViewTarget]:
+    """Parse a ``- <path>`` (optionally ``- <path> — label``) view entry.
+
+    Only relative, same-app paths are accepted (``/…``, ``#/…``, ``./…``) —
+    a view can never point browser verification at an external site.
+    """
+    body = line[1:].strip() if line.startswith("-") else ""
+    if not body:
+        return None
+    label = ""
+    for sep in (" — ", " -- "):
+        if sep in body:
+            body, label = body.split(sep, 1)
+            body = body.strip()
+            label = label.strip()
+            break
+    if not body or " " in body:
+        return None
+    if not (body.startswith("/") or body.startswith("#/") or body.startswith("./")):
+        return None
+    return ViewTarget(path=body[:200], label=label[:80])
+
+
+def _parse_flow_step_line(line: str) -> Optional[FlowStepSpec]:
+    """Parse one ``- <action> …`` flow step. Unknown/malformed -> ``None``."""
+    body = line[1:].strip() if line.startswith("-") else ""
+    if not body:
+        return None
+    action = body.split(None, 1)[0].lower()
+    if action not in _FLOW_ACTIONS:
+        return None
+    rest = body[len(action):].strip()
+    quoted = _QUOTED_ARG_REGEX.findall(rest)
+    if action == "goto":
+        target = rest.strip().strip('"')
+        if not target or " " in target:
+            return None
+        if not (target.startswith("/") or target.startswith("#/") or target.startswith("./")):
+            return None
+        return FlowStepSpec(action="goto", target=target[:_FLOW_TARGET_CHARS])
+    if action == "click":
+        if not quoted or not quoted[0].strip():
+            return None
+        return FlowStepSpec(action="click", target=quoted[0].strip()[:_FLOW_TARGET_CHARS])
+    if action == "fill":
+        if len(quoted) < 2 or not quoted[0].strip():
+            return None
+        return FlowStepSpec(
+            action="fill",
+            target=quoted[0].strip()[:_FLOW_TARGET_CHARS],
+            value=quoted[1][:_FLOW_VALUE_CHARS],
+        )
+    if action == "expect_text":
+        if not quoted or not quoted[0].strip():
+            return None
+        return FlowStepSpec(
+            action="expect_text", target=quoted[0].strip()[:_FLOW_VALUE_CHARS]
+        )
+    # submit / screenshot take no arguments.
+    return FlowStepSpec(action=action)
+
+
 def parse_browser_verification(task_md_text: str) -> Optional[BrowserVerificationConfig]:
-    """Extract dev-server command + URL from TASK.md.
+    """Extract dev-server command + URL (+ optional views/flows) from TASK.md.
 
     Returns ``None`` when:
       - no ``## Browser Verification`` heading,
@@ -158,7 +298,9 @@ def parse_browser_verification(task_md_text: str) -> Optional[BrowserVerificatio
       - no ``url:`` line.
 
     Otherwise returns the first non-empty, non-comment command line plus
-    the first ``url:`` declaration.
+    the first ``url:`` declaration, and any ``### Views`` / ``### Flow:``
+    subsections (Phase 11 — bounded, tolerant: malformed lines are skipped,
+    caps enforced, a legacy block parses exactly as before).
     """
     if not task_md_text:
         return None
@@ -168,13 +310,20 @@ def parse_browser_verification(task_md_text: str) -> Optional[BrowserVerificatio
     section_body = section_match.group("body")
     if not section_body:
         return None
+    section_body = _HTML_COMMENT_REGEX.sub("", section_body)
 
     fence_match = _BASH_FENCE_REGEX.search(section_body)
-    candidate_lines = (
-        fence_match.group("body").splitlines()
-        if fence_match is not None
-        else section_body.splitlines()
-    )
+    if fence_match is not None:
+        candidate_lines = fence_match.group("body").splitlines()
+    else:
+        # Fence-less block: restrict the command/url scan to the body BEFORE
+        # the first ``###`` subsection so a ``- /settings`` view entry can
+        # never be misread as the dev-server command.
+        sub_at = _ANY_SUBSECTION_REGEX.search(section_body)
+        pre_subsection = (
+            section_body[: sub_at.start()] if sub_at is not None else section_body
+        )
+        candidate_lines = pre_subsection.splitlines()
 
     command: Optional[str] = None
     url: Optional[str] = None
@@ -196,7 +345,52 @@ def parse_browser_verification(task_md_text: str) -> Optional[BrowserVerificatio
 
     if not command or not url:
         return None
-    return BrowserVerificationConfig(command=command, url=url)
+
+    # ---- Phase 11: optional ### Views / ### Flow: subsections ----
+    views: list[ViewTarget] = []
+    flows: list[FlowSpec] = []
+    current: Optional[str] = None  # None | "views" | "flow"
+    current_flow: Optional[FlowSpec] = None
+    for raw_line in section_body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _VIEWS_HEADING_REGEX.match(line):
+            current = "views"
+            current_flow = None
+            continue
+        flow_heading = _FLOW_HEADING_REGEX.match(line)
+        if flow_heading is not None:
+            current = "flow"
+            name = flow_heading.group("name")[:80]
+            # Duplicate names are dropped: the flow-result merge is keyed by
+            # name, so a second same-named flow could mask the first one's
+            # failure.
+            if len(flows) < MAX_FLOWS and all(f.name != name for f in flows):
+                current_flow = FlowSpec(name=name)
+                flows.append(current_flow)
+            else:
+                current_flow = None  # over the cap / duplicate — collect nothing
+            continue
+        if line.startswith("###"):
+            current = None
+            current_flow = None
+            continue
+        if not line.startswith("-"):
+            continue
+        if current == "views":
+            view = _parse_view_line(line)
+            if view is not None and len(views) < MAX_EXPLICIT_VIEWS:
+                views.append(view)
+        elif current == "flow" and current_flow is not None:
+            step = _parse_flow_step_line(line)
+            if step is not None and len(current_flow.steps) < MAX_FLOW_STEPS:
+                current_flow.steps.append(step)
+
+    # A flow with zero valid steps is dropped (nothing to run).
+    flows = [f for f in flows if f.steps]
+
+    return BrowserVerificationConfig(command=command, url=url, views=views, flows=flows)
 
 
 # ---------- helpers ----------
@@ -663,11 +857,95 @@ def _default_playwright_screenshot(url: str, output_path: Path, timeout_seconds:
 
 
 # Signature: (url, screenshots_dir, *, max_pages, readiness_timeout_seconds,
-#             screenshot_timeout_seconds) -> list[BrowserPageCapture].
+#             screenshot_timeout_seconds[, views, flows]) -> CaptureOutcome
+#             (or a plain list[BrowserPageCapture] — legacy stubs are wrapped).
 # Captures the entry URL plus a bounded set of discovered navigation targets,
 # each only after the page has actually rendered. Raises on failure; tests can
 # swap in a stub. The default implementation drives Playwright.
-PageCaptureRunner = Callable[..., "list[BrowserPageCapture]"]
+PageCaptureRunner = Callable[..., "object"]
+
+
+@dataclass
+class CaptureOutcome:
+    """Everything one capture-subprocess run produced (Phase 11).
+
+    ``pages`` mirrors the legacy multi-page manifest. ``flows`` /
+    ``console_errors`` / ``network_failures`` are the interactive-verification
+    evidence — empty when the block declared none / the capturer predates
+    them. A legacy capturer returning a bare ``list[BrowserPageCapture]`` is
+    normalized into ``CaptureOutcome(pages=…)`` by the core.
+    """
+
+    pages: list[BrowserPageCapture] = field(default_factory=list)
+    flows: list[BrowserFlowResult] = field(default_factory=list)
+    console_errors: list[str] = field(default_factory=list)
+    network_failures: list[str] = field(default_factory=list)
+
+
+def _capturer_accepts_interactions(capturer: PageCaptureRunner) -> bool:
+    """True when the capturer can take the Phase 11 ``views=``/``flows=``
+    kwargs (explicit params or ``**kwargs``). Legacy injected stubs keep
+    their old call shape."""
+    try:
+        params = inspect.signature(capturer).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "views" in params
+
+
+def _screen_flows(
+    flows: "list[FlowSpec]", project_id: str
+) -> "tuple[list[FlowSpec], dict[str, BrowserFlowResult]]":
+    """Policy-screen declared flows BEFORE anything reaches the browser.
+
+    A ``fill`` whose value is credential-shaped (``credentials.redact``
+    changes it) or whose target names a sensitive input is refused: the whole
+    flow is pre-marked ``refused`` and its steps (values never echoed) are
+    recorded, so the refusal is loud in artifacts/UI — but it does NOT fail
+    the verification and is never auto-repaired. Returns the executable flows
+    plus ``{flow_name: refused_result}``.
+    """
+    executable: list[FlowSpec] = []
+    refused: dict[str, BrowserFlowResult] = {}
+    for flow in flows:
+        reason = ""
+        bad_idx = -1
+        for i, step in enumerate(flow.steps):
+            if step.action != "fill":
+                continue
+            if _SENSITIVE_FILL_TARGET_RE.search(step.target or ""):
+                reason = (
+                    f'fill target "{step.target}" looks like a credential input — '
+                    "refused by policy (Agent OS never types secrets into a page)"
+                )
+                bad_idx = i
+                break
+            if step.value and credentials.redact(step.value, project_id) != step.value:
+                reason = (
+                    "fill value is credential-shaped — refused by policy "
+                    "(Agent OS never types secrets into a page)"
+                )
+                bad_idx = i
+                break
+        if not reason:
+            executable.append(flow)
+            continue
+        steps = [
+            BrowserFlowStep(
+                action=s.action,
+                target=s.target,
+                value_masked=("***" if s.value else ""),
+                status=("refused" if i == bad_idx else "skipped"),
+                error=(reason if i == bad_idx else ""),
+            )
+            for i, s in enumerate(flow.steps)
+        ]
+        refused[flow.name] = BrowserFlowResult(
+            name=flow.name, status="refused", steps=steps
+        )
+    return executable, refused
 
 
 # Marker that delimits the JSON manifest on the capture subprocess's stdout, so
@@ -696,6 +974,7 @@ import json
 import os
 import sys
 import time
+from urllib.parse import urljoin, urlparse
 
 _MARKER = "''' + _CAPTURE_MANIFEST_MARKER + r'''"
 
@@ -706,8 +985,43 @@ max_pages = max(1, int(args["max_pages"]))
 readiness_timeout_ms = int(args["readiness_timeout_ms"])
 nav_timeout_ms = int(args["nav_timeout_ms"])
 primary_name = args.get("primary_name", "browser.png")
+views = args.get("views") or []
+flows = args.get("flows") or []
+max_console = max(0, int(args.get("max_console", 20)))
+max_network = max(0, int(args.get("max_network", 20)))
+max_step_shots = max(0, int(args.get("max_step_screenshots", 12)))
 
 os.makedirs(screenshots_dir, exist_ok=True)
+
+# Phase 11 — runtime evidence collected across every visited page. Bounded
+# lists; entries carry the page/flow label active when the event fired.
+console_errors = []
+network_failures = []
+flow_results = []
+current_label = ["Home"]
+
+_entry_host = (urlparse(url).hostname or "").lower()
+
+def is_local(u):
+    try:
+        host = (urlparse(u).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1") or (host != "" and host == _entry_host)
+
+# Generous per-entry cap. The parent redacts each entry BEFORE its final
+# display truncation; cutting here at a small cap could slice a stored secret
+# mid-value and defeat the parent's exact-match redaction, so this cap exists
+# only to bound subprocess stdout (counts are capped separately).
+_ENTRY_CHARS = 2000
+
+def add_console(text):
+    if len(console_errors) < max_console:
+        console_errors.append(("[" + current_label[0] + "] " + str(text))[:_ENTRY_CHARS])
+
+def add_network(text):
+    if len(network_failures) < max_network:
+        network_failures.append(("[" + current_label[0] + "] " + str(text))[:_ENTRY_CHARS])
 
 try:
     from playwright.sync_api import sync_playwright
@@ -815,23 +1129,116 @@ try:
         try:
             ctx = browser.new_context(viewport={"width": 1280, "height": 800})
             page = ctx.new_page()
+
+            # Phase 11 — console / page-error / network evidence listeners.
+            # Local origins only for network noise (the entry host plus
+            # localhost/127.0.0.1 on any port, so a generated app calling its
+            # own backend port is still captured); third-party hosts are
+            # unreachable in this flow anyway and would only add noise.
+            page.on("console", lambda m: add_console("console.error: " + m.text) if m.type == "error" else None)
+            page.on("pageerror", lambda e: add_console("pageerror: " + (str(e) or repr(e))))
+            page.on("requestfailed", lambda r: add_network(r.method + " " + r.url + " -> " + str(r.failure)) if is_local(r.url) else None)
+            page.on("response", lambda r: add_network("HTTP " + str(r.status) + " " + r.request.method + " " + r.url) if r.status >= 400 and is_local(r.url) else None)
+
+            def do_click(label):
+                for role in ("button", "link", "tab"):
+                    try:
+                        loc = page.get_by_role(role, name=label)
+                        if loc.count() > 0:
+                            loc.first.click(timeout=4000)
+                            return
+                    except Exception:
+                        continue
+                page.get_by_text(label, exact=False).first.click(timeout=4000)
+
+            def do_fill(label, value):
+                try:
+                    loc = page.get_by_label(label)
+                    if loc.count() > 0:
+                        loc.first.fill(value, timeout=4000)
+                        return
+                except Exception:
+                    pass
+                try:
+                    loc = page.get_by_placeholder(label)
+                    if loc.count() > 0:
+                        loc.first.fill(value, timeout=4000)
+                        return
+                except Exception:
+                    pass
+                page.get_by_role("textbox", name=label).first.fill(value, timeout=4000)
+
+            def do_submit():
+                try:
+                    loc = page.locator('button[type="submit"]')
+                    if loc.count() > 0:
+                        loc.first.click(timeout=4000)
+                        return
+                except Exception:
+                    pass
+                page.keyboard.press("Enter")
+
+            def settle():
+                try:
+                    page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    pass
+                time.sleep(0.4)
+
             page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
             readiness, title = wait_ready(page)
             page.screenshot(path=os.path.join(screenshots_dir, primary_name), full_page=False)
             manifest.append({"file": primary_name, "url": page.url, "label": (title or "Home"), "title": title, "readiness": readiness, "nav_kind": "primary"})
+            seen_urls = set([page.url])
             try:
                 targets = page.evaluate(NAV_DISCOVER_JS, max(0, max_pages - 1)) or []
             except Exception:
                 targets = []
             idx = 1
+
+            # ---- explicit views (declared in TASK.md) come first ----
+            for v in views:
+                if len(manifest) >= max_pages:
+                    break
+                try:
+                    target_url = urljoin(url, str(v.get("path") or ""))
+                    if not is_local(target_url):
+                        continue
+                    current_label[0] = str(v.get("label") or v.get("path") or "view")
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+                    readiness, title = wait_ready(page)
+                    if page.url in seen_urls:
+                        continue
+                    idx += 1
+                    fname = "view-%02d.png" % idx
+                    page.screenshot(path=os.path.join(screenshots_dir, fname), full_page=False)
+                    manifest.append({"file": fname, "url": page.url, "label": current_label[0], "title": title, "readiness": readiness, "nav_kind": "view"})
+                    seen_urls.add(page.url)
+                except Exception:
+                    continue
+            if views:
+                # Return to the entry page so click-based discovery targets
+                # (tabs/buttons scraped from it) still resolve.
+                try:
+                    current_label[0] = "Home"
+                    page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+                    wait_ready(page)
+                except Exception:
+                    pass
+
+            # ---- auto-discovered targets fill the remaining budget ----
             for t in targets:
                 if len(manifest) >= max_pages:
                     break
                 try:
                     if t.get("kind") == "link" and t.get("href"):
+                        if t["href"] in seen_urls:
+                            continue
+                        current_label[0] = t.get("label") or t["href"]
                         page.goto(t["href"], wait_until="domcontentloaded", timeout=nav_timeout_ms)
                     else:
                         label = t.get("label") or ""
+                        current_label[0] = label or "page"
                         clicked = False
                         for role in ("tab", "button", "link"):
                             try:
@@ -851,12 +1258,85 @@ try:
                         if not clicked:
                             continue
                     readiness, title = wait_ready(page)
+                    if page.url in seen_urls and t.get("kind") == "link":
+                        continue
                     idx += 1
                     fname = "page-%02d.png" % idx
                     page.screenshot(path=os.path.join(screenshots_dir, fname), full_page=False)
                     manifest.append({"file": fname, "url": page.url, "label": (t.get("label") or title or fname), "title": title, "readiness": readiness, "nav_kind": t.get("kind") or "link"})
+                    seen_urls.add(page.url)
                 except Exception:
                     continue
+
+            # ---- declared interaction flows (bounded, declarative) ----
+            step_shots = 0
+            fi = 0
+            for flow in flows:
+                fi += 1
+                fname_prefix = "flow-%02d" % fi
+                fr = {"name": str(flow.get("name") or fname_prefix), "status": "passed", "steps": []}
+                flow_results.append(fr)
+                current_label[0] = "flow:" + fr["name"]
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+                    wait_ready(page)
+                except Exception as exc:
+                    fr["status"] = "failed"
+                    for st in (flow.get("steps") or []):
+                        fr["steps"].append({"action": str(st.get("action") or ""), "target": str(st.get("target") or ""), "value_masked": ("***" if st.get("value") else ""), "status": "skipped", "error": "", "screenshot": ""})
+                    if fr["steps"]:
+                        fr["steps"][0]["status"] = "failed"
+                        fr["steps"][0]["error"] = ("could not open entry url: " + (str(exc) or repr(exc)))[:_ENTRY_CHARS]
+                    continue
+                failed = False
+                si = 0
+                for st in (flow.get("steps") or []):
+                    si += 1
+                    act = str(st.get("action") or "")
+                    rec = {"action": act, "target": str(st.get("target") or ""), "value_masked": ("***" if st.get("value") else ""), "status": "skipped", "error": "", "screenshot": ""}
+                    fr["steps"].append(rec)
+                    if failed:
+                        continue
+                    try:
+                        if act == "goto":
+                            target_url = urljoin(url, rec["target"])
+                            if not is_local(target_url):
+                                raise Exception("cross-origin goto refused: " + rec["target"])
+                            page.goto(target_url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+                            wait_ready(page)
+                        elif act == "click":
+                            do_click(rec["target"])
+                            settle()
+                        elif act == "fill":
+                            do_fill(rec["target"], str(st.get("value") or ""))
+                        elif act == "submit":
+                            do_submit()
+                            settle()
+                        elif act == "expect_text":
+                            page.get_by_text(rec["target"], exact=False).first.wait_for(state="visible", timeout=5000)
+                        elif act == "screenshot":
+                            pass
+                        else:
+                            raise Exception("unknown action: " + act)
+                        rec["status"] = "passed"
+                        if act in ("goto", "click", "submit", "screenshot") and step_shots < max_step_shots:
+                            step_shots += 1
+                            fname = "%s-step-%02d.png" % (fname_prefix, si)
+                            page.screenshot(path=os.path.join(screenshots_dir, fname), full_page=False)
+                            rec["screenshot"] = fname
+                    except Exception as exc:
+                        rec["status"] = "failed"
+                        rec["error"] = (str(exc) or repr(exc))[:_ENTRY_CHARS]
+                        failed = True
+                        fr["status"] = "failed"
+                # The flow's FINAL state joins the page gallery (one capture
+                # per flow — step captures live on the step records).
+                try:
+                    fname = "%s-final.png" % fname_prefix
+                    page.screenshot(path=os.path.join(screenshots_dir, fname), full_page=False)
+                    manifest.append({"file": fname, "url": page.url, "label": fr["name"] + " (final)", "title": "", "readiness": "unknown", "nav_kind": "step"})
+                except Exception:
+                    pass
         finally:
             browser.close()
 except SystemExit:
@@ -870,7 +1350,12 @@ if not manifest:
     sys.stderr.write(json.dumps({"error": "capture_failed", "message": "no pages captured"}))
     sys.exit(4)
 
-sys.stdout.write(_MARKER + json.dumps(manifest))
+sys.stdout.write(_MARKER + json.dumps({
+    "pages": manifest,
+    "flows": flow_results,
+    "console_errors": console_errors,
+    "network_failures": network_failures,
+}))
 '''
 )
 
@@ -882,16 +1367,22 @@ def _default_playwright_capture(
     max_pages: int = MAX_BROWSER_PAGES,
     readiness_timeout_seconds: int = DEFAULT_PAGE_READINESS_TIMEOUT_SECONDS,
     screenshot_timeout_seconds: int = DEFAULT_SCREENSHOT_TIMEOUT_SECONDS,
-) -> list[BrowserPageCapture]:
+    views: "Optional[list[ViewTarget]]" = None,
+    flows: "Optional[list[FlowSpec]]" = None,
+) -> CaptureOutcome:
     """Capture the entry URL + a few rendered navigation targets via Playwright.
 
-    Runs in a fresh Python subprocess (Windows asyncio workaround). Returns one
-    :class:`BrowserPageCapture` per captured page (primary first, keeping the
-    ``screenshots/browser.png`` name). Raises ``RuntimeError`` on any failure so
-    the caller records a clean ``failed`` browser verification.
+    Runs in a fresh Python subprocess (Windows asyncio workaround). Returns a
+    :class:`CaptureOutcome` — one :class:`BrowserPageCapture` per captured page
+    (primary first, keeping the ``screenshots/browser.png`` name), plus the
+    Phase 11 interaction/flow results and console/network evidence. Raises
+    ``RuntimeError`` on any failure so the caller records a clean ``failed``
+    browser verification.
     """
     screenshots_dir = Path(screenshots_dir)
     screenshots_dir.mkdir(parents=True, exist_ok=True)
+    views = views or []
+    flows = flows or []
     payload = json.dumps(
         {
             "url": url,
@@ -900,13 +1391,33 @@ def _default_playwright_capture(
             "readiness_timeout_ms": max(1, int(readiness_timeout_seconds)) * 1000,
             "nav_timeout_ms": max(1, int(screenshot_timeout_seconds)) * 1000,
             "primary_name": "browser.png",
+            "views": [{"path": v.path, "label": v.label} for v in views],
+            "flows": [
+                {
+                    "name": f.name,
+                    "steps": [
+                        {"action": s.action, "target": s.target, "value": s.value}
+                        for s in f.steps
+                    ],
+                }
+                for f in flows
+            ],
+            "max_console": MAX_CONSOLE_ERRORS,
+            "max_network": MAX_NETWORK_FAILURES,
+            "max_step_screenshots": MAX_STEP_SCREENSHOTS,
         }
     )
     # Generous outer cap: readiness + nav budget per page, plus headroom, so a
-    # hung subprocess can't pin the verification phase forever.
+    # hung subprocess can't pin the verification phase forever. Declared flows
+    # extend the budget (an entry-page reload + up to 10 bounded steps each).
     pages = max(1, int(max_pages))
+    total_steps = sum(len(f.steps) for f in flows)
     outer_timeout = max(
-        30, (readiness_timeout_seconds + screenshot_timeout_seconds) * pages + 30
+        30,
+        (readiness_timeout_seconds + screenshot_timeout_seconds) * pages
+        + 30
+        + len(flows) * (readiness_timeout_seconds + screenshot_timeout_seconds)
+        + total_steps * 10,
     )
     try:
         completed = subprocess.run(
@@ -942,8 +1453,21 @@ def _default_playwright_capture(
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"could not parse capture manifest: {_format_exception(exc)}")
 
+    # The manifest is a dict ({pages, flows, console_errors, network_failures})
+    # since Phase 11; tolerate the legacy bare-list shape defensively.
+    if isinstance(raw, dict):
+        page_entries = raw.get("pages") or []
+        flow_entries = raw.get("flows") or []
+        console_entries = raw.get("console_errors") or []
+        network_entries = raw.get("network_failures") or []
+    else:
+        page_entries = raw if isinstance(raw, list) else []
+        flow_entries = []
+        console_entries = []
+        network_entries = []
+
     captures: list[BrowserPageCapture] = []
-    for entry in raw if isinstance(raw, list) else []:
+    for entry in page_entries:
         if not isinstance(entry, dict):
             continue
         fname = str(entry.get("file") or "").strip()
@@ -961,7 +1485,40 @@ def _default_playwright_capture(
         )
     if not captures:
         raise RuntimeError("Playwright capture returned no pages")
-    return captures
+
+    flow_results: list[BrowserFlowResult] = []
+    for entry in flow_entries:
+        if not isinstance(entry, dict):
+            continue
+        steps: list[BrowserFlowStep] = []
+        for s in entry.get("steps") or []:
+            if not isinstance(s, dict):
+                continue
+            shot = str(s.get("screenshot") or "").strip()
+            steps.append(
+                BrowserFlowStep(
+                    action=str(s.get("action") or ""),
+                    target=str(s.get("target") or ""),
+                    value_masked=str(s.get("value_masked") or ""),
+                    status=str(s.get("status") or "skipped"),
+                    error=str(s.get("error") or ""),
+                    screenshot=(f"screenshots/{shot}" if shot else ""),
+                )
+            )
+        flow_results.append(
+            BrowserFlowResult(
+                name=str(entry.get("name") or ""),
+                status=str(entry.get("status") or "skipped"),
+                steps=steps,
+            )
+        )
+
+    return CaptureOutcome(
+        pages=captures,
+        flows=flow_results,
+        console_errors=[str(x) for x in console_entries][:MAX_CONSOLE_ERRORS],
+        network_failures=[str(x) for x in network_entries][:MAX_NETWORK_FAILURES],
+    )
 
 
 def _legacy_single_capture_adapter(
@@ -1173,14 +1730,26 @@ def _core_browser_verification(
             )
 
         screenshots_dir = run_dir / "screenshots"
+        # Phase 11 — policy-screen declared flows BEFORE anything reaches the
+        # browser (credential-shaped fill values / sensitive targets are
+        # refused in-parent and never serialized to the subprocess), and give
+        # explicit views first claim on an enlarged-but-capped page budget.
+        exec_flows, refused_flows = _screen_flows(config.flows or [], project_id)
+        effective_max_pages = (
+            min(max_pages + len(config.views), MAX_TOTAL_CAPTURES)
+            if config.views
+            else max_pages
+        )
+        capture_kwargs = dict(
+            max_pages=effective_max_pages,
+            readiness_timeout_seconds=page_readiness_timeout_seconds,
+            screenshot_timeout_seconds=screenshot_timeout_seconds,
+        )
+        if _capturer_accepts_interactions(capturer):
+            capture_kwargs["views"] = list(config.views or [])
+            capture_kwargs["flows"] = exec_flows
         try:
-            captures = capturer(
-                config.url,
-                screenshots_dir,
-                max_pages=max_pages,
-                readiness_timeout_seconds=page_readiness_timeout_seconds,
-                screenshot_timeout_seconds=screenshot_timeout_seconds,
-            )
+            raw_outcome = capturer(config.url, screenshots_dir, **capture_kwargs)
         except Exception as exc:  # noqa: BLE001
             stdout_text = stdout_drainer.snapshot()
             stderr_text = stderr_drainer.snapshot()
@@ -1198,6 +1767,16 @@ def _core_browser_verification(
                 ),
                 duration_ms=int((time.perf_counter() - start) * 1000),
             )
+
+        # Normalize: a legacy capturer (single-screenshot adapter / older test
+        # stubs) returns a bare list of page captures; the Phase 11 default
+        # returns a full CaptureOutcome.
+        outcome = (
+            raw_outcome
+            if isinstance(raw_outcome, CaptureOutcome)
+            else CaptureOutcome(pages=list(raw_outcome or []))
+        )
+        captures = outcome.pages
 
         primary = captures[0] if captures else None
         primary_abs = (run_dir / primary.path) if primary is not None else None
@@ -1224,11 +1803,80 @@ def _core_browser_verification(
             f"captured {page_count} page(s); primary at {screenshot_rel_path} "
             f"(readiness: {primary.readiness})"
         )
+
+        # Phase 11 — merge flow results in declaration order: refused flows
+        # (policy) + executed flows (from the capturer). A capturer without
+        # interaction support leaves a declared flow honestly ``skipped``.
+        executed_by_name = {f.name: f for f in outcome.flows}
+        final_flows: list[BrowserFlowResult] = []
+        for spec in config.flows or []:
+            if spec.name in refused_flows:
+                final_flows.append(refused_flows[spec.name])
+            elif spec.name in executed_by_name:
+                final_flows.append(executed_by_name[spec.name])
+            else:
+                final_flows.append(
+                    BrowserFlowResult(
+                        name=spec.name,
+                        status="skipped",
+                        steps=[
+                            BrowserFlowStep(
+                                action=s.action,
+                                target=s.target,
+                                value_masked=("***" if s.value else ""),
+                                status="skipped",
+                            )
+                            for s in spec.steps
+                        ],
+                    )
+                )
+        # Redact every evidence string before it can reach run.json /
+        # result.md / prompts (console text and step errors can echo page
+        # content; nothing credential-shaped may persist).
+        console_errors = [
+            _truncate(credentials.redact(x, project_id), _CONSOLE_ENTRY_CHARS)
+            for x in outcome.console_errors[:MAX_CONSOLE_ERRORS]
+        ]
+        network_failures = [
+            _truncate(credentials.redact(x, project_id), _CONSOLE_ENTRY_CHARS)
+            for x in outcome.network_failures[:MAX_NETWORK_FAILURES]
+        ]
+        for flow_result in final_flows:
+            for step in flow_result.steps:
+                if step.error:
+                    step.error = _truncate(
+                        credentials.redact(step.error, project_id), _CONSOLE_ENTRY_CHARS
+                    )
+
+        # A failed DECLARED flow fails the verification — the project said
+        # this interaction matters. (Console errors alone never flip status;
+        # they are classification evidence. A policy-``refused`` flow also
+        # never fails the run — it is surfaced loudly instead.)
+        failed_flow = next((f for f in final_flows if f.status == "failed"), None)
+        if failed_flow is not None:
+            failed_step = next(
+                (s for s in failed_flow.steps if s.status == "failed"), None
+            )
+            step_label = (
+                f"{failed_step.action} {failed_step.target}".strip()
+                if failed_step is not None
+                else "(unknown step)"
+            )
+            status = "failed"
+            extra_msg = (
+                f"declared flow '{failed_flow.name}' failed at step "
+                f"[{step_label}]"
+                + (f": {failed_step.error}" if failed_step and failed_step.error else "")
+                + f"; captured {page_count} page(s)"
+            )
+
         # Task 06.2D — hand the still-running dev server off to the preview
         # layer instead of tearing it down, so the captured URL stays live.
         # Only the UI flow supplies a registrar; the runner path leaves it
-        # ``None`` and the server is torn down as before.
-        if keep_alive_registrar is not None and proc is not None:
+        # ``None`` and the server is torn down as before. A flow-failed
+        # verification is NOT handed off — the user can start a preview
+        # explicitly from the Runs panel.
+        if status == "passed" and keep_alive_registrar is not None and proc is not None:
             try:
                 if keep_alive_registrar(
                     proc, stdout_drainer, stderr_drainer, config.command, config.url
@@ -1246,6 +1894,9 @@ def _core_browser_verification(
             duration_ms=int((time.perf_counter() - start) * 1000),
             pages=captures,
             readiness=primary.readiness,
+            console_errors=console_errors,
+            network_failures=network_failures,
+            flows=final_flows,
         )
     finally:
         # Always tear the server down, even if we hit an unexpected
@@ -1613,6 +2264,29 @@ def render_browser_verification_section(
             lines.append(
                 f"  - `{page.path}` — {label} ({page.readiness})"
             )
+    # Phase 11 — interaction/runtime evidence, rendered only when present so
+    # a legacy result.md stays byte-identical.
+    if result.flows:
+        for flow in result.flows:
+            passed = sum(1 for s in flow.steps if s.status == "passed")
+            lines.append(
+                f"- **Flow `{flow.name}`**: {flow.status} "
+                f"({passed}/{len(flow.steps)} steps passed)"
+            )
+            for step in flow.steps:
+                if step.status in ("failed", "refused"):
+                    detail = f" — {step.error}" if step.error else ""
+                    lines.append(
+                        f"  - `{step.action} {step.target}`: {step.status}{detail}"
+                    )
+    if result.console_errors:
+        lines.append(f"- **Console errors**: {len(result.console_errors)}")
+        for entry in result.console_errors[:3]:
+            lines.append(f"  - {entry}")
+    if result.network_failures:
+        lines.append(f"- **Network failures**: {len(result.network_failures)}")
+        for entry in result.network_failures[:3]:
+            lines.append(f"  - {entry}")
     if result.install_output_preview:
         lines.append("")
         lines.append("Install output:")

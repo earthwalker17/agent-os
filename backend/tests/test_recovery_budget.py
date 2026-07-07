@@ -21,7 +21,15 @@ if str(_BACKEND) not in sys.path:
 import execution.manager as exec_manager
 from execution import run_store
 from execution.background import BackgroundRunManager, RECOVERY_HARD_CAP
-from execution.models import RunRecord, RunStatus, RecoveryAssessment
+from execution.models import (
+    BrowserVerificationResult,
+    RecoveryAssessment,
+    RunRecord,
+    RunStatus,
+    VerificationCommandResult,
+    VerificationResult,
+    VisualReviewResult,
+)
 
 
 class _Root:
@@ -206,6 +214,126 @@ def test_child_inherits_decremented_budget_to_zero():
         mgr._maybe_auto_recover("demo", rec.run_id)
         assert len(calls) == 1
         assert calls[0]["recovery_budget"] == 0  # child can't recover again
+    finally:
+        root.cleanup()
+
+
+# ---------- Phase 11: Recovery Matrix gating ----------
+
+def test_visual_failed_completed_run_auto_recovers_under_budget():
+    """A COMPLETED run whose visual verdict failed is recover-eligible (the
+    verdict never downgrades status, so the old status-only gate could never
+    spend a granted budget on a visually-broken-but-green build)."""
+    root = _Root()
+    try:
+        rec = _record(
+            status=RunStatus.COMPLETED,
+            recovery_budget=2,
+            visual_review=VisualReviewResult(
+                enabled=True, status="failed", headline="Blank page"
+            ),
+        )
+        root.seed(rec)
+        mgr, calls = _mgr_with_spy()
+        mgr._maybe_auto_recover("demo", rec.run_id)
+        assert len(calls) == 1
+        # Visual repair is a single bounded pass: contract clamps the child's
+        # onward budget to 0 regardless of the remaining user budget.
+        assert calls[0]["recovery_budget"] == 0
+        assert calls[0]["recovery_of"] == rec.run_id
+        assert _read("demo", rec.run_id).recovered_by == "child-0001"
+    finally:
+        root.cleanup()
+
+
+def test_visual_warning_completed_run_does_not_recover():
+    root = _Root()
+    try:
+        rec = _record(
+            status=RunStatus.COMPLETED,
+            recovery_budget=2,
+            visual_review=VisualReviewResult(enabled=True, status="warning"),
+        )
+        root.seed(rec)
+        mgr, calls = _mgr_with_spy()
+        mgr._maybe_auto_recover("demo", rec.run_id)
+        assert calls == []
+    finally:
+        root.cleanup()
+
+
+def test_environment_failure_never_auto_recovers():
+    """Missing Playwright/Chromium, occupied port etc. are operator problems —
+    a Coding Agent can't fix them, so a granted budget must not be burned."""
+    root = _Root()
+    try:
+        rec = _record(
+            recovery_budget=2,
+            browser_verification=BrowserVerificationResult(
+                enabled=True, status="failed",
+                output_preview="chromium not installed — run: python -m playwright install chromium",
+            ),
+        )
+        root.seed(rec)
+        mgr, calls = _mgr_with_spy()
+        mgr._maybe_auto_recover("demo", rec.run_id)
+        assert calls == []
+        assert _read("demo", rec.run_id).recovered_by is None
+    finally:
+        root.cleanup()
+
+
+def test_confirm_only_type_never_auto_recovers():
+    """Evidence-driven confirm-only types (deployment/database/…) stay manual
+    even with budget + a needs_recovery card."""
+    root = _Root()
+    try:
+        rec = _record(
+            recovery_budget=2,
+            blockers=["supabase db push failed: column mismatch"],
+        )
+        root.seed(rec)
+        mgr, calls = _mgr_with_spy()
+        mgr._maybe_auto_recover("demo", rec.run_id)
+        assert calls == []
+    finally:
+        root.cleanup()
+
+
+def test_build_type_child_budget_clamped_by_contract():
+    root = _Root()
+    try:
+        rec = _record(
+            recovery_budget=2,
+            verification=VerificationResult(
+                enabled=True, status="failed",
+                commands=[VerificationCommandResult(
+                    command="npm run build", kind="build", status="failed"
+                )],
+            ),
+        )
+        root.seed(rec)
+        mgr, calls = _mgr_with_spy()
+        mgr._maybe_auto_recover("demo", rec.run_id)
+        assert len(calls) == 1
+        # build cap is 1: min(2 - 1, 1) == 1.
+        assert calls[0]["recovery_budget"] == 1
+    finally:
+        root.cleanup()
+
+
+def test_judge_recovery_type_overrides_rules_for_contract():
+    """The assessment's validated recovery_type wins over re-classification
+    when resolving the contract."""
+    root = _Root()
+    try:
+        assessment = _assessment()
+        assessment.recovery_type = "deployment"  # confirm-only by contract
+        rec = _record(recovery_budget=2, recovery_assessment=assessment)
+        root.seed(rec)
+        mgr, calls = _mgr_with_spy()
+        mgr._maybe_auto_recover("demo", rec.run_id)
+        assert calls == []
     finally:
         root.cleanup()
 

@@ -34,6 +34,7 @@ from . import run_store
 from .manager import get_execution_workspace
 from .memory_reconciliation import reconcile_run_memory
 from .models import RunRecord, RunStatus, TaskSpec
+from .recovery_matrix import classify_failure, contract_for
 from .runner import CodingAgentRunner
 
 
@@ -259,7 +260,20 @@ class BackgroundRunManager:
             return
 
         # Gates — budget is the source of truth; the rest are guards.
-        if rec.status not in (RunStatus.PARTIAL, RunStatus.FAILED, RunStatus.BLOCKED):
+        # Phase 11 — besides the three non-green statuses, a COMPLETED run
+        # whose AI visual verdict failed is recover-eligible: the verdict is
+        # diagnostic-only (never downgrades status), so without this a granted
+        # budget could never repair a visually-broken-but-green build. This
+        # matches CLAUDE.md §5's definition of non-green ("… or a failed
+        # verification / visual review").
+        non_green = rec.status in (RunStatus.PARTIAL, RunStatus.FAILED, RunStatus.BLOCKED)
+        visual_failed_green = (
+            rec.status == RunStatus.COMPLETED
+            and rec.visual_review is not None
+            and rec.visual_review.enabled
+            and rec.visual_review.status == "failed"
+        )
+        if not (non_green or visual_failed_green):
             return  # green (or cancelled) — nothing to recover
         if rec.recovery_budget <= 0:
             return  # no user-approved budget
@@ -274,13 +288,30 @@ class BackgroundRunManager:
         if not card:
             return
 
+        # Phase 11 — Recovery Matrix contract enforcement. The contract can
+        # only TIGHTEN the user-approved boundary, never loosen it: types that
+        # a bounded Coding Agent run can't plausibly fix (integration /
+        # deployment / database / product / docs_memory) never auto-dispatch,
+        # and environment failures (missing Playwright, occupied port) are
+        # excluded even inside an auto-eligible type.
+        classification = classify_failure(rec)
+        recovery_type = ra.recovery_type or classification.recovery_type
+        contract = contract_for(recovery_type)
+        if not contract.auto_eligible or not classification.auto_ok:
+            return
+        # Clamp the child's remaining budget by the contract's cap so e.g. a
+        # visual repair is a single bounded pass (child budget 0 = repair once,
+        # re-verify once in the child's own tail) regardless of the remaining
+        # user budget.
+        child_budget = min(rec.recovery_budget - 1, contract.child_budget_cap)
+
         title = card.split("\n", 1)[0].strip()[:80] or "Auto-recovery"
         child_task = TaskSpec(title=title, task_card=card, created_by="auto_recovery")
         child = self.dispatch(
             project_id,
             child_task,
             recovery_of=run_id,
-            recovery_budget=rec.recovery_budget - 1,
+            recovery_budget=child_budget,
             orchestration_round=rec.orchestration_round + 1,
             # Phase 7 — the recovery chain shares the parent's checkpoint as a
             # single rollback anchor (don't re-anchor mid-chain).
@@ -307,7 +338,8 @@ class BackgroundRunManager:
             {
                 "type": "auto_recovery_dispatched",
                 "child_run_id": child.run_id,
-                "remaining_budget": max(0, rec.recovery_budget - 1),
+                "remaining_budget": max(0, child_budget),
+                "recovery_type": recovery_type,
                 "orchestration_round": rec.orchestration_round + 1,
             },
         )

@@ -59,6 +59,8 @@ export interface PendingExecution {
   revision_count: number
   created_at: string
   updated_at: string
+  /** Phase 11 — set when this plan is a recovery proposal for a failed run. */
+  recovery_of?: string | null
 }
 
 export interface Conversation {
@@ -131,8 +133,27 @@ export interface BrowserPageCapture {
   title?: string
   /** 'confirmed' | 'unconfirmed' | 'unknown' — how sure we are the page rendered. */
   readiness?: string
-  /** 'primary' | 'link' | 'tab' | 'button' — how the page was reached. */
+  /** 'primary' | 'view' | 'link' | 'tab' | 'button' | 'step' — how the page was reached. */
   nav_kind?: string
+}
+
+/** Phase 11 — one executed step of a declared interaction flow. */
+export interface BrowserFlowStep {
+  action: string
+  target?: string
+  /** '***' when a fill carried a value — the value itself is never stored. */
+  value_masked?: string
+  status: 'passed' | 'failed' | 'refused' | 'skipped' | 'pending'
+  error?: string
+  /** Run-relative artifact path captured after the step, or ''. */
+  screenshot?: string
+}
+
+/** Phase 11 — outcome of one declared interaction flow. */
+export interface BrowserFlowResult {
+  name: string
+  status: 'passed' | 'failed' | 'refused' | 'skipped'
+  steps: BrowserFlowStep[]
 }
 
 export interface BrowserVerificationResult {
@@ -151,6 +172,11 @@ export interface BrowserVerificationResult {
   pages?: BrowserPageCapture[]
   /** Primary capture's render readiness: 'confirmed' | 'unconfirmed' | 'unknown'. */
   readiness?: string | null
+  /** Phase 11 — bounded, redacted runtime evidence (never flips status alone). */
+  console_errors?: string[]
+  network_failures?: string[]
+  /** Phase 11 — declared interaction flows (a failed flow fails verification). */
+  flows?: BrowserFlowResult[]
 }
 
 /** AI visual-judgment verdict over the captured screenshots (diagnostic-only). */
@@ -198,6 +224,18 @@ export interface ExecutionTask {
 export type RecoveryVerdict = 'ok' | 'needs_recovery' | 'exhausted'
 export type RecoveryAction = 'inspect' | 'repair' | 'split' | 'reverify' | 'report'
 
+/** Phase 11 — Recovery Matrix failure classification. */
+export type RecoveryType =
+  | 'build'
+  | 'runtime'
+  | 'visual'
+  | 'integration'
+  | 'deployment'
+  | 'database'
+  | 'product'
+  | 'docs_memory'
+  | ''
+
 export interface RecoveryAssessment {
   assessed: boolean
   verdict: RecoveryVerdict
@@ -207,6 +245,10 @@ export interface RecoveryAssessment {
   follow_up_task_card?: string
   rationale?: string
   error?: string | null
+  /** Phase 11 — typed classification ('' on legacy records). */
+  recovery_type?: RecoveryType
+  /** Phase 11 — 'judge' (LLM type survived validation) | 'rules' (deterministic fallback). */
+  classified_by?: 'rules' | 'judge' | ''
 }
 
 /** Phase 10.2 — a review-first suggested skill patch from a green run. */

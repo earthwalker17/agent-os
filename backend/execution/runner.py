@@ -2083,6 +2083,12 @@ class CodingAgentRunner:
                 "duration_ms": browser_verification.duration_ms,
                 "pages": len(browser_verification.pages),
                 "readiness": browser_verification.readiness,
+                "flows": [
+                    {"name": f.name, "status": f.status}
+                    for f in browser_verification.flows
+                ],
+                "console_errors": len(browser_verification.console_errors),
+                "network_failures": len(browser_verification.network_failures),
             },
         )
 

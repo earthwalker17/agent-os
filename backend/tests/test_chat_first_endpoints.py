@@ -197,6 +197,52 @@ def test_browser_verify_marks_running_then_settles_and_keeps_screenshot():
     _run(body)
 
 
+def test_browser_verify_failure_triggers_typed_assessment_without_dispatch():
+    """Phase 11 — a failed UI browser verification gets a best-effort
+    ``assess_run`` (previously only the runner tail assessed, so 'Run
+    suggested fix' 409'd on UI-discovered failures). No LLM key is present,
+    so the assessment records the error path — but the deterministic
+    Recovery Matrix classification still lands. Nothing is dispatched."""
+    def body(env: _Env):
+        env.make_project("p1")
+        env.seed_completed_run("p1", "r1")
+
+        def fake_verify(project_id, *, run_dir, keep_alive_registrar=None):
+            return BrowserVerificationResult(
+                enabled=True,
+                command="npm run dev",
+                url="http://127.0.0.1:5174",
+                status="failed",
+                output_preview="dev server exited before url was reachable (exit 1)",
+            )
+
+        import execution.recovery as recovery_mod
+
+        def _no_llm(**_kw):
+            raise RuntimeError("no LLM in tests")
+
+        prev = main.run_ui_browser_verification
+        prev_llm = recovery_mod.llm_chat
+        main.run_ui_browser_verification = fake_verify
+        recovery_mod.llm_chat = _no_llm
+        try:
+            res = env.client.post("/api/projects/p1/execution/runs/r1/browser-verify")
+        finally:
+            main.run_ui_browser_verification = prev
+            recovery_mod.llm_chat = prev_llm
+
+        assert res.status_code == 200
+        raw = run_store.read_run_json("p1", "r1")
+        ra = raw.get("recovery_assessment")
+        assert ra is not None  # the hook fired
+        # LLM unavailable → error path, but the deterministic classification
+        # survives (server-exit signature → runtime).
+        assert ra.get("recovery_type") == "runtime"
+        assert ra.get("classified_by") == "rules"
+
+    _run(body)
+
+
 # ---------- preview endpoints ----------
 
 

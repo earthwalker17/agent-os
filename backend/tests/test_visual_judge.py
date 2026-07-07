@@ -376,6 +376,40 @@ def test_skipped_when_only_text_only_provider_available():
     assert captured["called"] is False
 
 
+# ---------- Phase 11: runtime signals in the judge prompt ----------
+
+
+def test_prompt_includes_runtime_signals_when_present():
+    from execution.models import BrowserFlowResult, BrowserFlowStep
+
+    br = BrowserVerificationResult(
+        enabled=True, status="passed",
+        pages=[BrowserPageCapture(path="screenshots/browser.png", label="Home")],
+        console_errors=["[Home] console.error: boom"],
+        network_failures=["[Home] HTTP 500 GET /api"],
+        flows=[BrowserFlowResult(name="smoke", status="failed", steps=[
+            BrowserFlowStep(action="click", target="Add", status="failed", error="timeout"),
+        ])],
+    )
+    prompt = vj._build_user_prompt("task", "summary", list(br.pages), br)
+    assert "Runtime signals" in prompt
+    assert "console.error: boom" in prompt
+    assert "HTTP 500" in prompt
+    assert "flow 'smoke': failed" in prompt
+    assert "click Add" in prompt
+
+
+def test_prompt_unchanged_without_runtime_signals():
+    br = BrowserVerificationResult(
+        enabled=True, status="passed",
+        pages=[BrowserPageCapture(path="screenshots/browser.png", label="Home")],
+    )
+    with_result = vj._build_user_prompt("task", "summary", list(br.pages), br)
+    legacy = vj._build_user_prompt("task", "summary", list(br.pages))
+    assert with_result == legacy
+    assert "Runtime signals" not in with_result
+
+
 # ---------- render ----------
 
 

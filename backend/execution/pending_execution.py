@@ -72,6 +72,9 @@ class PendingExecutionView:
     revision_count: int
     created_at: str
     updated_at: str
+    # Phase 11 — set when this plan is a recovery proposal for a specific
+    # failed run; the confirm endpoint threads it into dispatch lineage.
+    recovery_of: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +89,7 @@ class PendingExecutionView:
             "revision_count": self.revision_count,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "recovery_of": self.recovery_of,
         }
 
 
@@ -103,6 +107,7 @@ def serialize_pending(row: dict) -> PendingExecutionView:
         revision_count=row.get("revision_count", 0) or 0,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        recovery_of=row.get("recovery_of"),
     )
 
 

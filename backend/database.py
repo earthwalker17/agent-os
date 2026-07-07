@@ -72,6 +72,7 @@ def init_db():
                 revision_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                recovery_of TEXT,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
             );
 
@@ -92,6 +93,15 @@ def init_db():
         }
         if "metadata" not in existing_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN metadata TEXT")
+        # Phase 11 — pending recovery plans carry the parent run id so the
+        # confirm endpoint can thread recovery lineage (recovery_of /
+        # recovered_by / inherited checkpoint) through dispatch.
+        pending_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(pending_executions)").fetchall()
+        }
+        if "recovery_of" not in pending_cols:
+            conn.execute("ALTER TABLE pending_executions ADD COLUMN recovery_of TEXT")
 
 
 def create_conversation(project_id: str, title: str) -> dict:
@@ -267,6 +277,7 @@ def create_pending_execution(
     title: str,
     display_plan: str,
     task_card: str,
+    recovery_of: str | None = None,
 ) -> dict:
     pending_id = uuid.uuid4().hex[:12]
     now = datetime.now().isoformat()
@@ -275,11 +286,11 @@ def create_pending_execution(
             "INSERT INTO pending_executions "
             "(id, project_id, conversation_id, source_message_id, title, "
             " display_plan, task_card, status, run_id, revision_count, "
-            " created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, ?, ?)",
+            " created_at, updated_at, recovery_of) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, ?, ?, ?)",
             (
                 pending_id, project_id, conversation_id, source_message_id,
-                title, display_plan, task_card, now, now,
+                title, display_plan, task_card, now, now, recovery_of,
             ),
         )
     return get_pending_execution(pending_id)  # type: ignore[return-value]
@@ -290,7 +301,7 @@ def get_pending_execution(pending_id: str) -> dict | None:
         row = conn.execute(
             "SELECT id, project_id, conversation_id, source_message_id, title, "
             "       display_plan, task_card, status, run_id, revision_count, "
-            "       created_at, updated_at "
+            "       created_at, updated_at, recovery_of "
             "FROM pending_executions WHERE id = ?",
             (pending_id,),
         ).fetchone()

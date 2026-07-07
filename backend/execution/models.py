@@ -233,6 +233,42 @@ class BrowserPageCapture(BaseModel):
     nav_kind: str = ""  # "primary" | "link" | "tab" | "button"
 
 
+class BrowserFlowStep(BaseModel):
+    """One executed step of a declared interaction flow (Phase 11).
+
+    Steps come from the ``### Flow:`` subsection of the ``## Browser
+    Verification`` block in TASK.md — a fixed, bounded action vocabulary
+    (``goto`` / ``click`` / ``fill`` / ``submit`` / ``expect_text`` /
+    ``screenshot``), never free-form automation. ``value_masked`` is ``"***"``
+    when a ``fill`` carried a value — the value itself is NEVER stored on the
+    record or any artifact. ``status`` is ``"passed"`` / ``"failed"`` /
+    ``"refused"`` (blocked by the credential-input policy before execution) /
+    ``"skipped"`` (an earlier step in the flow failed). ``screenshot`` is the
+    run-relative artifact path captured after the step, or ``""``.
+    """
+
+    action: str
+    target: str = ""
+    value_masked: str = ""
+    status: str = "pending"  # passed | failed | refused | skipped | pending
+    error: str = ""
+    screenshot: str = ""
+
+
+class BrowserFlowResult(BaseModel):
+    """Outcome of one declared interaction flow (Phase 11).
+
+    ``status`` is ``"passed"`` (every step passed), ``"failed"`` (a step
+    failed; the rest are ``skipped``), ``"refused"`` (policy refused the flow
+    before execution — this never fails the verification and is never
+    auto-repaired), or ``"skipped"``.
+    """
+
+    name: str
+    status: str = "skipped"  # passed | failed | refused | skipped
+    steps: list[BrowserFlowStep] = Field(default_factory=list)
+
+
 class BrowserVerificationResult(BaseModel):
     """Outcome of the optional post-run browser verification (Task 06.2B).
 
@@ -279,6 +315,17 @@ class BrowserVerificationResult(BaseModel):
     install_command: Optional[str] = None
     install_status: Optional[str] = None  # "passed" | "failed" | "skipped"
     install_output_preview: str = ""
+    # Phase 11 — interactive verification evidence. All defaulted so older
+    # records round-trip unchanged. ``console_errors`` / ``network_failures``
+    # are bounded, redacted text captured across every visited page (console
+    # ``error`` messages + uncaught page errors; failed requests + HTTP >= 400
+    # responses). ``flows`` holds the per-step outcomes of declared
+    # interaction flows. Console/network entries are *evidence* for the
+    # recovery classifier and visual judge — they never flip ``status`` by
+    # themselves; a failed declared flow does.
+    console_errors: list[str] = Field(default_factory=list)
+    network_failures: list[str] = Field(default_factory=list)
+    flows: list[BrowserFlowResult] = Field(default_factory=list)
 
 
 class VisualReviewResult(BaseModel):
@@ -377,6 +424,13 @@ class RecoveryAssessment(BaseModel):
     follow_up_task_card: str = ""
     rationale: str = ""
     error: Optional[str] = None
+    # Phase 11 — Recovery Matrix classification. ``recovery_type`` is one of
+    # ``recovery_matrix.RECOVERY_TYPES`` (empty on legacy records / error
+    # paths); ``classified_by`` records whether the judge's own type survived
+    # validation ("judge") or the deterministic rule-based classification was
+    # used ("rules"). Both defaulted so old run.json round-trips.
+    recovery_type: str = ""
+    classified_by: str = ""  # "rules" | "judge" | ""
 
 
 class SkillPatchProposal(BaseModel):
