@@ -2573,14 +2573,30 @@ def _finalize_vercel_deploy(
     blocker_msg: str | None = None
     if dep_id and state == "READY":
         pass
-    elif error or state in ("ERROR", "CANCELED", "DELETED"):
+    elif state in ("ERROR", "CANCELED", "DELETED"):
         blocker_msg = credentials.redact(f"Vercel {kind} failed: {error or state}", project_id)
+    elif dep_id and error:
+        # The deployment was created but a (typically transient) network error
+        # broke the READY poll — the deployment itself may still be building or
+        # already live on Vercel. Keep its identity on the record: discarding it
+        # orphans a real deployment from the run, the Links panel, and
+        # redeploy/rollback (observed live when a flaky network killed the poll
+        # while the deployment went on to reach READY).
+        blocker_msg = credentials.redact(
+            f"Vercel {kind} status polling failed ({error}) — the deployment may "
+            "still be in progress; verify in the Vercel dashboard",
+            project_id,
+        )
     elif dep_id:
         # Created but not confirmed READY before the cap — record it, flag verify.
         blocker_msg = f"Vercel {kind} did not reach READY before timeout — verify in the Vercel dashboard"
     else:
         blocker_msg = credentials.redact(f"Vercel {kind} failed: {error or 'no deployment id returned'}", project_id)
-    stamp_dep = bool(dep_id and (state == "READY" or (not error and state not in ("ERROR", "CANCELED", "DELETED"))))
+    # Stamp the deployment identity whenever one was actually created and did
+    # not definitively fail — a poll error must not lose a live deployment. A
+    # definitively failed deployment stays unstamped so a fresh deploy on this
+    # run isn't blocked by the already-has-a-deployment guard.
+    stamp_dep = bool(dep_id and state not in ("ERROR", "CANCELED", "DELETED"))
 
     def _settle(r: RunRecord):
         r.deploy_state = None

@@ -247,6 +247,12 @@ installer.
   instead of normalized; and a project's own keep-alive preview holding the
   dev port failed the next verification's pre-flight (the guard now stops the
   project's OWN managed preview and proceeds — foreign listeners still fail).
+- **Post-release fixes.** A transient network failure during the deploy
+  READY-poll no longer discards the created deployment's identity from the run
+  record (it orphaned a live deployment from the UI and redeploy/rollback);
+  the Links panel falls back to Vercel's deployment list when no run carries a
+  URL; and the composer `@`-command menu no longer inherits the Send button's
+  accent background (unreadable options).
 - **Release hardening.** `backend/.env.example` now documents every global
   token the code honors (model providers, Tavily, GitHub/Vercel/Supabase/
   Stripe); a one-command Windows installer (`install.ps1`) + launcher

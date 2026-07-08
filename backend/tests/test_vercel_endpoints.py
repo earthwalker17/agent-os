@@ -304,6 +304,52 @@ def test_deploy_finalizer_preserves_concurrent_commit_fields():
     _run(body)
 
 
+def test_deploy_poll_network_error_keeps_deployment_identity():
+    """Pre-launch fix: a transient network failure during the READY poll must
+    not discard the created deployment's identity — the deployment may still
+    reach READY on Vercel (observed live), and without id/url the run, the
+    Links panel, and redeploy/rollback are orphaned. A definitively failed
+    deployment (ERROR) stays unstamped so a fresh deploy on the run isn't
+    blocked by the already-has-a-deployment guard."""
+
+    def body(env):
+        env.make_project("p")
+        env.make_run("p")
+        env._save(main, "_DEPLOY_POLL_INTERVAL", 0)
+        credentials.set_credential("vercel", "p", fields={"token": "t"})
+        credentials.update_metadata("vercel", "p", {"project_id": "prj_1", "org_id": "team_1"})
+        env.patch_vc(
+            status=_linked_status,
+            create_deployment=lambda *a, **k: vc.DeploymentResult(
+                ok=True, deployment_id="dpl_net", url="https://app-net.vercel.app",
+                ready_state="BUILDING"),
+            get_deployment=lambda *a, **k: vc.DeploymentResult(
+                ok=False, error="network error calling Vercel: SSL EOF"),
+        )
+        cf = env.client.post("/api/projects/p/execution/runs/run-1/vercel/deploy", json={"confirm": True})
+        assert cf.status_code == 200
+        raw = run_store.read_run_json("p", "run-1")
+        assert raw["deployment_id"] == "dpl_net"
+        assert raw["deployment_url"] == "https://app-net.vercel.app"
+        assert raw["deploy_state"] is None
+        assert any("polling failed" in b for b in raw["blockers"])
+
+        # A definitive ERROR still leaves the run unstamped.
+        env.make_run("p", run_id="run-2")
+        env.patch_vc(
+            create_deployment=lambda *a, **k: vc.DeploymentResult(
+                ok=True, deployment_id="dpl_bad", url="https://app-bad.vercel.app",
+                ready_state="ERROR"),
+        )
+        cf2 = env.client.post("/api/projects/p/execution/runs/run-2/vercel/deploy", json={"confirm": True})
+        assert cf2.status_code == 200
+        raw2 = run_store.read_run_json("p", "run-2")
+        assert raw2["deployment_id"] is None and raw2["deployment_url"] is None
+        assert any("failed" in b for b in raw2["blockers"])
+
+    _run(body)
+
+
 def test_deploy_requires_token():
     def body(env):
         env.make_project("p")

@@ -4025,7 +4025,11 @@ button {
   padding: 4px;
 }
 
-.command-menu-option {
+/* Scoped under `.chat-input.composer` so these beat the generic
+   `.chat-input button` Send-button rule (accent background + white text) —
+   the same specificity trick as `.composer-icon-btn`. Without it every menu
+   option renders as a solid accent block with unreadable text. */
+.chat-input.composer .command-menu-option {
   width: 100%;
   display: flex;
   flex-direction: column;
@@ -4039,8 +4043,8 @@ button {
   cursor: pointer;
 }
 
-.command-menu-option:hover,
-.command-menu-option.selected {
+.chat-input.composer .command-menu-option:hover,
+.chat-input.composer .command-menu-option.selected {
   background: var(--accent-soft);
 }
 

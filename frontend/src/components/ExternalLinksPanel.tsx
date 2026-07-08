@@ -44,6 +44,22 @@ function ExternalLinksPanel({ projectId, refreshSignal }: Props) {
         url: deployed.deployment_url,
         sub: deployed.deployment_target || undefined,
       })
+    } else {
+      // No run carries a deployment URL (a deploy finalizer that died mid-poll
+      // loses it on old records, and runs can be pruned) — fall back to
+      // Vercel's own deployment list and surface the newest READY one.
+      const deps = (await getJson('/vercel/deployments', null)) as {
+        deployments?: { url?: string | null; ready_state?: string | null; target?: string | null }[]
+      } | null
+      const ready = (deps?.deployments || []).filter((d) => d.ready_state === 'READY' && d.url)
+      const best = ready.find((d) => d.target === 'production') || ready[0]
+      if (best?.url) {
+        items.push({
+          label: 'Live deployment',
+          url: best.url.startsWith('http') ? best.url : `https://${best.url}`,
+          sub: best.target || undefined,
+        })
+      }
     }
     const pr = runList.find((r) => r.pr_url)
     if (pr?.pr_url) {
