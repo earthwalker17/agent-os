@@ -135,13 +135,33 @@ def test_parser_rejects_unknown_tool():
     assert parse_inspect_request(raw) is None
 
 
-def test_parser_rejects_when_not_object_only():
-    # Mixed prose + JSON should NOT trigger inspection — the system prompt
-    # tells the model to emit ONLY the JSON object.
+def test_parser_extracts_request_embedded_in_prose():
+    # Pre-launch E2E regression: models sometimes narrate before/after the
+    # JSON directive. A silently dropped request never executes and the raw
+    # protocol text leaks into the visible answer — so an embedded,
+    # well-formed directive now parses.
     raw = "Sure, let me look at that:\n" + json.dumps({
         "inspect_request": {"tool": "read_file", "path": "x"},
     })
+    assert parse_inspect_request(raw) == {"tool": "read_file", "path": "x"}
+    # ...including with trailing narration after the object.
+    raw2 = (
+        "I need the entry point first.\n\n"
+        '{"inspect_request": {"tool": "read_file", "path": "src/main.py"}}\n\n'
+        "Then I will summarize it."
+    )
+    assert parse_inspect_request(raw2) == {"tool": "read_file", "path": "src/main.py"}
+
+
+def test_parser_embedded_still_rejects_mentions_and_bad_tools():
+    # A bare mention of the key without a spanning JSON object stays inert.
+    assert parse_inspect_request('the inspect_request channel takes a "tool" field') is None
+    assert parse_inspect_request('use "inspect_request" to read files') is None
+    # An embedded directive with an unknown tool is still rejected.
+    raw = "Trying:\n" + json.dumps({"inspect_request": {"tool": "rm_rf", "path": "/"}})
     assert parse_inspect_request(raw) is None
+    # Malformed JSON around the key is rejected.
+    assert parse_inspect_request('{"inspect_request": {"tool": "read_file", }') is None
 
 
 def test_parser_rejects_empty_and_text():

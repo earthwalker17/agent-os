@@ -196,6 +196,13 @@ def _propose_inner(
 def _build_proposal(parsed: dict) -> SkillPatchProposal:
     agent_id = str(parsed.get("target_agent_id") or "").strip().lower()
     skill_id = str(parsed.get("target_skill_id") or "").strip().lower()
+    # Judges sometimes return the skill id agent-qualified ("coder/skill-name"
+    # or "skills/coder/skill-name") — normalize to the bare skill id before
+    # the registry lookup instead of rejecting a legitimate proposal.
+    if "/" in skill_id:
+        parts = [p for p in skill_id.split("/") if p and p != "skills"]
+        if len(parts) >= 2 and parts[-2] == agent_id:
+            skill_id = parts[-1]
     ref = agents_registry.skill_ref(agent_id, skill_id)
     if ref is None:
         return SkillPatchProposal(

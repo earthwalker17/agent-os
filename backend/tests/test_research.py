@@ -125,11 +125,29 @@ def test_parse_accepts_bare_and_fenced_json():
     assert parse_research_request(fenced) == {"tool": "web_search", "query": "q"}
 
 
+def test_parse_extracts_request_embedded_in_prose():
+    # Pre-launch E2E regression: the model narrated before the directive, the
+    # strict parse missed it, the request never executed, and the protocol
+    # text (plus fabricated "results") leaked into the visible answer.
+    embedded = 'I will search: {"research_request": {"tool": "web_search", "query": "q"}}'
+    assert parse_research_request(embedded) == {"tool": "web_search", "query": "q"}
+    transcriptish = (
+        "Search worked. Fetching the top doc next.\n\n"
+        '{"research_request": {"tool": "fetch_url", "url": "https://example.com/docs"}}\n\n'
+        "user RESEARCH RESULT: (fabricated)\n...then my answer."
+    )
+    assert parse_research_request(transcriptish) == {
+        "tool": "fetch_url",
+        "url": "https://example.com/docs",
+    }
+
+
 def test_parse_rejects_prose_wrong_key_unknown_tool():
     assert parse_research_request("Here is my answer.") is None
-    assert parse_research_request('I will search: {"research_request": {"tool": "web_search"}}') is None
+    assert parse_research_request('the "research_request" protocol takes a tool field') is None
     assert parse_research_request('{"inspect_request": {"tool": "read_file"}}') is None
     assert parse_research_request('{"research_request": {"tool": "run_shell"}}') is None
+    assert parse_research_request('so I sent {"research_request": {"tool": "run_shell"}} earlier') is None
     assert parse_research_request('{"research_request": "web_search"}') is None
     assert parse_research_request("") is None
     assert parse_research_request(None) is None  # type: ignore[arg-type]

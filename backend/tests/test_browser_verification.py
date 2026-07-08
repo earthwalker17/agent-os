@@ -415,6 +415,60 @@ def test_port_in_use_aborts_before_capturing_foreign_app():
     _run(body)
 
 
+def test_port_held_by_own_preview_is_stopped_and_proceeds():
+    """Pre-launch E2E regression: a PASSING verification hands its dev server
+    to the keep-alive preview registry, which then held 5174 and failed the
+    project's NEXT verification at the port pre-flight. The guard must stop
+    the project's OWN managed preview and proceed (foreign listeners still
+    fail — covered by the test above)."""
+
+    def body(layout: _TempLayout):
+        task_md = (
+            "## Browser Verification\n\n```bash\nnpm run dev\nurl: http://127.0.0.1:5174\n```\n"
+        )
+        layout.init_workspace("agent-os", task_md_body=task_md)
+        run_dir = layout.make_run_dir("agent-os", "r1")
+
+        from execution import preview as preview_mod
+
+        stopped = {"n": 0}
+        port_free = {"v": False}
+
+        prev_port = bv._port_in_use
+        prev_status = preview_mod.get_preview_status
+        prev_stop = preview_mod.stop_preview
+        # Port reads busy until our own preview is stopped.
+        bv._port_in_use = lambda host, port: not port_free["v"]  # type: ignore[assignment]
+        preview_mod.get_preview_status = lambda pid: {  # type: ignore[assignment]
+            "running": True, "url": "http://127.0.0.1:5174", "project_id": pid,
+        }
+
+        def _fake_stop(pid):
+            stopped["n"] += 1
+            port_free["v"] = True
+            return {"ok": True, "running": False}
+
+        preview_mod.stop_preview = _fake_stop  # type: ignore[assignment]
+        try:
+            # The guard should stop the preview and continue into the real
+            # lifecycle — which then fails at the dev-server launch (there is
+            # no real npm dev server here), proving we got PAST the pre-flight.
+            result = bv.run_browser_verification(
+                "agent-os", run_dir=run_dir,
+                screenshot_runner=_writing_screenshot_runner,
+                readiness_timeout_seconds=1,
+            )
+        finally:
+            bv._port_in_use = prev_port  # type: ignore[assignment]
+            preview_mod.get_preview_status = prev_status  # type: ignore[assignment]
+            preview_mod.stop_preview = prev_stop  # type: ignore[assignment]
+
+        assert stopped["n"] == 1
+        assert "already in use" not in (result.output_preview or "")
+
+    _run(body)
+
+
 def test_unreachable_url_records_failed_and_cleans_up():
     def body(layout: _TempLayout):
         task_md = (

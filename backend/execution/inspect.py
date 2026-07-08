@@ -286,13 +286,18 @@ _INSPECT_REQUEST_KEY = "inspect_request"
 
 
 def parse_inspect_request(raw: str) -> Optional[dict]:
-    """If ``raw`` is a JSON object with an ``inspect_request`` key, return that
-    inner dict; otherwise return None (treat the raw output as a text answer).
+    """If ``raw`` carries a ``{"inspect_request": {...}}`` directive, return
+    the inner dict; otherwise return None (treat the raw output as a text
+    answer).
 
-    Tolerant of leading/trailing whitespace and a single ``` fence.
-    Intentionally strict otherwise: we don't want to mis-fire on chat
-    responses that happen to contain JSON-like prose. The directive must be
-    the ENTIRE output.
+    The primary parse is strict — the directive as the ENTIRE output
+    (tolerant of whitespace and a single ``` fence) — so ordinary prose never
+    mis-fires. As a fallback, a directive EMBEDDED in narration is extracted
+    via a balanced-brace scan: models sometimes preface the JSON with
+    commentary, and dropping such a request silently (a) never executes it
+    and (b) leaks the raw protocol text into the visible chat answer
+    (observed live in the pre-launch E2E). A rare misfire on a quoted
+    example is cheap — the channel is read-only and budget-capped.
     """
     if not raw or not isinstance(raw, str):
         return None
@@ -307,12 +312,16 @@ def parse_inspect_request(raw: str) -> Optional[dict]:
         if text.endswith("```"):
             text = text[: -3]
         text = text.strip()
-    if not (text.startswith("{") and text.endswith("}")):
-        return None
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
+    parsed: Optional[dict] = None
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except json.JSONDecodeError:
+            parsed = None
+    if parsed is None or not isinstance(parsed.get(_INSPECT_REQUEST_KEY), dict):
+        parsed = extract_embedded_request(raw, _INSPECT_REQUEST_KEY)
     if not isinstance(parsed, dict):
         return None
     request = parsed.get(_INSPECT_REQUEST_KEY)
@@ -322,6 +331,62 @@ def parse_inspect_request(raw: str) -> Optional[dict]:
     if tool not in VALID_TOOLS:
         return None
     return request
+
+
+def extract_embedded_request(raw: str, key: str) -> Optional[dict]:
+    """Find the first ``{"<key>": {...}}`` JSON object embedded anywhere in
+    ``raw`` (balanced-brace scan, string-literal aware) and return the parsed
+    OUTER dict, or ``None``.
+
+    Shared by the inspect and research channels. A bare *mention* of the key
+    without a well-formed JSON object spanning it returns ``None``.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    marker = f'"{key}"'
+    pos = raw.find(marker)
+    while pos != -1:
+        # Try the nearest "{" before the marker, then progressively earlier
+        # ones, requiring the balanced object to span the marker itself.
+        start = raw.rfind("{", 0, pos + 1)
+        while start != -1:
+            obj = _scan_balanced_object(raw, start)
+            if obj is not None and start + len(obj) > pos:
+                try:
+                    parsed = json.loads(obj)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict) and isinstance(parsed.get(key), dict):
+                    return parsed
+            start = raw.rfind("{", 0, start)
+        pos = raw.find(marker, pos + len(marker))
+    return None
+
+
+def _scan_balanced_object(text: str, start: int) -> Optional[str]:
+    """Return the balanced ``{...}`` substring beginning at ``start``,
+    honoring JSON string literals and escapes; ``None`` if unbalanced."""
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
 
 def execute_inspect_request(project_id: str, request: dict) -> InspectionResult:

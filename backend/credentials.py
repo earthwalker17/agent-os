@@ -274,24 +274,29 @@ def status(project_id: Optional[str] = None, provider: str = "github") -> dict:
     cfg = _provider_cfg(provider)
     source = _token_source(project_id, provider)
     configured = source != "none"
-    rec = _project_record(project_id, provider) if source == "project" else _global_record(provider)
+    prec = _project_record(project_id, provider)
+    grec = _global_record(provider)
     out: dict = {
         "provider": provider,
         "configured": configured,
         "source": source,  # project | global_file | env | none
         "scope": "project" if source == "project" else ("global" if configured else "none"),
     }
-    # Non-secret metadata (values are safe to surface).
+    # Non-secret metadata (values are safe to surface) — resolved project →
+    # global like get_metadata(), independent of where the TOKEN came from:
+    # an env/global token must not hide project-scoped fields from the UI.
     for mf in cfg["meta_fields"]:
-        out[mf] = rec.get(mf)
+        pv = prec.get(mf)
+        out[mf] = pv if (pv is not None and str(pv).strip()) else grec.get(mf)
     # Presence-only map for every secret field (booleans, never values). The
-    # primary token reflects the resolved `configured` (which includes env).
+    # primary token reflects the resolved `configured` (which includes env);
+    # extra secrets mirror get_secret()'s project → global resolution.
     fields: dict[str, bool] = {}
     for f in cfg["secret_fields"]:
         if f == cfg["token_field"]:
             fields[f] = configured
         else:
-            fields[f] = bool((rec.get(f) or "").strip())
+            fields[f] = bool(str(prec.get(f) or "").strip()) or bool(str(grec.get(f) or "").strip())
     out["secret_fields"] = fields
     return out
 

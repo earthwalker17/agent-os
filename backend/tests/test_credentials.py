@@ -288,6 +288,44 @@ def test_stripe_live_key_refused_test_key_ok():
     _run(body)
 
 
+def test_status_project_fields_visible_with_env_token():
+    """An env-resolved token must not hide project-scoped metadata/secrets.
+
+    Regression (pre-launch audit): status() picked ONE record by token source,
+    so with GITHUB_TOKEN/SUPABASE_ACCESS_TOKEN in .env the UI reported
+    default_remote / project_ref / db_password as missing even though they
+    were stored (and used) at project scope.
+    """
+
+    def body(sb):
+        sb.set_env("SUPABASE_ACCESS_TOKEN", "sbp_envtok0123456789ab")
+        credentials.set_credential(
+            "supabase",
+            "proj",
+            fields={
+                "db_password": "proj-db-pw",
+                "project_ref": "abcdefabcdef",
+                "url": "https://abcdefabcdef.supabase.co",
+            },
+        )
+        st = credentials.status("proj", "supabase")
+        assert st["source"] == "env" and st["configured"] is True
+        assert st["project_ref"] == "abcdefabcdef"
+        assert st["url"] == "https://abcdefabcdef.supabase.co"
+        assert st["secret_fields"]["db_password"] is True
+        assert "proj-db-pw" not in json.dumps(st)
+        # global-file fields still show through when the project has none
+        sb.set_env("GITHUB_TOKEN", "env-gh-tok")
+        credentials.set_credential(
+            "github", None, fields={"default_remote": "me/global-repo"}, scope="global"
+        )
+        st2 = credentials.status("proj", "github")
+        assert st2["source"] == "env"
+        assert st2["default_remote"] == "me/global-repo"
+
+    _run(body)
+
+
 def test_status_all_lists_every_provider():
     def body(sb):
         credentials.set_credential("vercel", "proj", fields={"token": "vrc-tok"})

@@ -670,6 +670,40 @@ def _port_in_use(host: str, port: int) -> bool:
         return False
 
 
+def _stop_own_preview_if_holding(project_id: str, host: str, port: int) -> bool:
+    """If THIS project's managed keep-alive preview holds ``host:port``, stop
+    it and wait for the socket to free; return True once the port is usable.
+
+    A passing verification hands its dev server to the preview registry
+    (`adopt_preview`), so without this the project's NEXT verification always
+    failed the port pre-flight — a run marked `partial` because its own
+    still-serving preview held 5174 (observed live in the pre-launch E2E).
+    Only the project's OWN registered preview is ever stopped; foreign
+    listeners still fail the guard. Best-effort; never raises.
+
+    The import is function-scope: ``preview`` imports lifecycle helpers from
+    this module at module load, so the reverse edge exists only at call time.
+    """
+    try:
+        from . import preview  # noqa: PLC0415 — see docstring
+
+        status = preview.get_preview_status(project_id)
+        if not status.get("running"):
+            return False
+        preview_url = str(status.get("url") or "")
+        parsed = urllib.parse.urlparse(preview_url)
+        if (parsed.port or DEFAULT_DEV_PORT) != port:
+            return False
+        preview.stop_preview(project_id)
+        for _ in range(10):
+            if not _port_in_use(host, port):
+                return True
+            time.sleep(0.5)
+        return not _port_in_use(host, port)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ---------- screenshot runner ----------
 
 
@@ -1646,14 +1680,17 @@ def _core_browser_verification(
 
     # Pre-flight (real launches only): if the dev port is already bound, a
     # foreign server / another project's preview would answer the readiness
-    # probe and we'd screenshot the WRONG app and mark it passed. Abort with a
-    # clear blocker instead. Skipped when a fake ``process_starter`` is injected
-    # (tests) — there is no real socket to collide with.
+    # probe and we'd screenshot the WRONG app and mark it passed. The ONE safe
+    # exception is THIS project's own managed keep-alive preview (adopted from
+    # a previous passing verification): it is Agent OS's restartable child
+    # serving the same app, so stop it and proceed instead of failing the run.
+    # Skipped when a fake ``process_starter`` is injected (tests) — there is
+    # no real socket to collide with.
     if process_starter is None:
         parsed = urllib.parse.urlparse(config.url)
         host = parsed.hostname or DEFAULT_DEV_HOST
         port = parsed.port or DEFAULT_DEV_PORT
-        if _port_in_use(host, port):
+        if _port_in_use(host, port) and not _stop_own_preview_if_holding(project_id, host, port):
             return BrowserVerificationResult(
                 enabled=True,
                 command=config.command,

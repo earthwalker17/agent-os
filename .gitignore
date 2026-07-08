@@ -10,11 +10,15 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 
-# Local databases
+# Local databases (incl. SQLite WAL sidecars: .db-shm / .db-wal)
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 backend/*.db
+backend/*.db-shm
+backend/*.db-wal
 backend/*.sqlite
 backend/*.sqlite3
 
@@ -46,19 +50,7 @@ execution_workspaces/*
 !execution_workspaces/AGENT.example.md
 !execution_workspaces/TASK.example.md
 
-# Public showcase — Aegis Launch Control.
-# This demo was built end-to-end, autonomously, by the Agent OS Coding Agent
-# from an EMPTY repo (see its SHOWCASE.md). It is committed as a public example
-# of the system's current capability while every other project/workspace stays
-# private. Re-include the whole folder, then drop the regenerable heavy
-# artifacts (node_modules / dist / logs) so only source + run evidence ship.
-!execution_workspaces/aegis-launch-control/
-!execution_workspaces/aegis-launch-control/**
-execution_workspaces/aegis-launch-control/**/node_modules/
-execution_workspaces/aegis-launch-control/**/dist/
-execution_workspaces/aegis-launch-control/logs/
-
-# Chat attachments (Task 07.0) - user-uploaded files attached to chat messages.
+# Chat attachments - user-uploaded files attached to chat messages.
 # Private local state, same as memory and workspaces.
 chat_uploads/
 

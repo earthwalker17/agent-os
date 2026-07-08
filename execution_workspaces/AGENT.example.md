@@ -17,9 +17,10 @@ and expects concise, verifiable result summaries in return.
 - All code changes for this project happen inside `repo/`.
 - Long-form scratch state, logs, and per-run artifacts go under `runs/` and
   `logs/` — never inside `repo/`.
-- Project-level memory (`PROJECT.md`, `STATUS.md`, `TASK_QUEUE.md`,
-  `DECISIONS.md`, `RESEARCH.md`) lives in `projects/{project_id}/` and is
-  owned by the main agent. Read it for context; do not edit it.
+- Project-level memory (`PROJECT.md`, `STATUS.md` with its `## Task Queue`
+  board, `DECISIONS.md`, `RESEARCH.md`, `LESSONS.md`) lives in
+  `projects/{project_id}/` and is owned by the main agent. Read it for
+  context; do not edit it.
 
 ## Coding Principles
 - Clarity over cleverness. Prefer explicit, readable code.

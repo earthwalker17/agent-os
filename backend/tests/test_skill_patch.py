@@ -176,6 +176,35 @@ def test_unknown_target_skill_is_rejected():
     _run(body)
 
 
+def test_agent_qualified_skill_id_is_normalized():
+    """Pre-launch E2E regression: the judge returned the skill id
+    agent-qualified ("coder/definition-of-done-checklist"), and the raw
+    registry lookup rejected a legitimate proposal."""
+
+    def body(env):
+        env.workspace()
+        env.seed_skill("coder", "definition-of-done-checklist",
+                       "# Definition-of-Done Checklist\n> when a task is done\n\n- [ ] tests pass")
+        env.run("p", "r1", files_changed=["app.py"], summary="did work")
+        for qualified in ("coder/definition-of-done-checklist",
+                          "skills/coder/definition-of-done-checklist"):
+            env.run("p", f"r-{hash(qualified) & 0xffff}", files_changed=["app.py"],
+                    summary="did work")
+            payload = dict(_GOOD, target_skill_id=qualified)
+            out = skill_patch.propose_skill_patch(
+                "p", f"r-{hash(qualified) & 0xffff}", llm_caller=_caller(payload)
+            )
+            assert out is not None and out.proposed is True, (qualified, out.error)
+            assert out.target_skill_id == "definition-of-done-checklist"
+        # a genuinely foreign prefix is still rejected
+        env.run("p", "r-foreign", files_changed=["app.py"], summary="did work")
+        bad = dict(_GOOD, target_skill_id="reviewer/code-review-rubric")
+        out = skill_patch.propose_skill_patch("p", "r-foreign", llm_caller=_caller(bad))
+        assert out.proposed is False and "unknown skill" in (out.error or "")
+
+    _run(body)
+
+
 def test_idempotent_once_per_run():
     def body(env):
         env.workspace()

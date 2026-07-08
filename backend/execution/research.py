@@ -44,6 +44,7 @@ from typing import Callable, Optional
 import credentials
 
 from . import web_search
+from .inspect import extract_embedded_request
 
 log = logging.getLogger(__name__)
 
@@ -494,9 +495,15 @@ _RESEARCH_REQUEST_KEY = "research_request"
 
 
 def parse_research_request(raw: str) -> Optional[dict]:
-    """If ``raw`` is exactly a ``{"research_request": {...}}`` JSON object,
-    return the inner dict; otherwise ``None`` (raw is the text answer).
-    Tolerant of one ``` fence — same strictness as ``parse_inspect_request``."""
+    """If ``raw`` carries a ``{"research_request": {...}}`` directive, return
+    the inner dict; otherwise ``None`` (raw is the text answer).
+
+    Same two-tier parse as ``parse_inspect_request``: strict whole-output
+    first (tolerant of one ``` fence), then a balanced-brace fallback for a
+    directive embedded in narration — a silently dropped request never
+    executes and leaks protocol text into the visible answer (observed live
+    in the pre-launch E2E; the model then fabricated the "fetched" evidence).
+    """
     if not raw or not isinstance(raw, str):
         return None
     text = raw.strip()
@@ -509,12 +516,16 @@ def parse_research_request(raw: str) -> Optional[dict]:
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
-    if not (text.startswith("{") and text.endswith("}")):
-        return None
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
+    parsed: Optional[dict] = None
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except json.JSONDecodeError:
+            parsed = None
+    if parsed is None or not isinstance(parsed.get(_RESEARCH_REQUEST_KEY), dict):
+        parsed = extract_embedded_request(raw, _RESEARCH_REQUEST_KEY)
     if not isinstance(parsed, dict):
         return None
     request = parsed.get(_RESEARCH_REQUEST_KEY)
