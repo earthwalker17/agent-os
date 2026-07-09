@@ -5,6 +5,10 @@ interface Props {
   projectId: string
   onClose: () => void
   onSaved?: () => void
+  /** Public UI pass — lock the modal to ONE provider (opened from that
+   * provider's Integrations card): the tab switcher is hidden and the heading
+   * names the provider. All save/disconnect/field logic is unchanged. */
+  singleProvider?: Exclude<ConnectorProvider, 'github'>
 }
 
 interface FieldDef {
@@ -71,8 +75,8 @@ const PROVIDERS = Object.keys(CONFIG) as Exclude<ConnectorProvider, 'github'>[]
  * visible in the inputs so the user can see + edit what's set. Closing with
  * unsaved edits prompts to save first — only Save persists.
  */
-function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
-  const [provider, setProvider] = useState<Exclude<ConnectorProvider, 'github'>>('vercel')
+function ConnectorsModal({ projectId, onClose, onSaved, singleProvider }: Props) {
+  const [provider, setProvider] = useState<Exclude<ConnectorProvider, 'github'>>(singleProvider ?? 'vercel')
   const [fields, setFields] = useState<Record<string, string>>({})
   const [scope, setScope] = useState<'project' | 'global'>('project')
   const [allowLive, setAllowLive] = useState(false)
@@ -180,20 +184,25 @@ function ConnectorsModal({ projectId, onClose, onSaved }: Props) {
   return (
     <div className="modal-overlay" onClick={attemptClose}>
       <div className="connector-modal" onClick={(e) => e.stopPropagation()}>
-        <h3>Connectors</h3>
-        <div className="gitops-actions" style={{ marginBottom: 8 }}>
-          {PROVIDERS.map((p) => (
-            <button
-              key={p}
-              type="button"
-              className={`gitops-btn${provider === p ? ' connected' : ''}`}
-              onClick={() => setProvider(p)}
-            >
-              {CONFIG[p].label}
-              {statuses[p]?.configured ? ' ✓' : ''}
-            </button>
-          ))}
+        <div className="connector-modal-head">
+          <h3>{singleProvider ? `${def.label} connector` : 'Connectors'}</h3>
+          <button className="modal-close" onClick={attemptClose}>&times;</button>
         </div>
+        {!singleProvider && (
+          <div className="gitops-actions" style={{ marginBottom: 8 }}>
+            {PROVIDERS.map((p) => (
+              <button
+                key={p}
+                type="button"
+                className={`gitops-btn${provider === p ? ' connected' : ''}`}
+                onClick={() => setProvider(p)}
+              >
+                {CONFIG[p].label}
+                {statuses[p]?.configured ? ' ✓' : ''}
+              </button>
+            ))}
+          </div>
+        )}
 
         <p className="run-chat-muted">
           {def.note ||

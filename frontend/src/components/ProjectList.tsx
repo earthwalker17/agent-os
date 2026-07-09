@@ -25,7 +25,8 @@ interface Props {
   onRenameProject: (projectId: string) => void
   onDeleteProject: (projectId: string) => void
   onDeleteConversation: (conv: Conversation) => void
-  onSelectGeneral: () => void
+  /** Public UI pass — "+" on the Conversations section: open the General
+   * landing state (the conversation itself is created on the first send). */
   onNewGeneralConversation: () => void
   onOpenGlobalMemory: () => void
   onOpenAgents: () => void
@@ -50,7 +51,6 @@ function ProjectList({
   onRenameProject,
   onDeleteProject,
   onDeleteConversation,
-  onSelectGeneral,
   onNewGeneralConversation,
   onOpenGlobalMemory,
   onOpenAgents,
@@ -59,7 +59,6 @@ function ProjectList({
   onToggleCollapse,
 }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
-  const [generalExpanded, setGeneralExpanded] = useState(false)
 
   const toggle = (projectId: string) => {
     setExpanded(prev => {
@@ -75,8 +74,6 @@ function ProjectList({
   }
 
   const isExpanded = (id: string) => expanded.has(id) || id === activeProject
-
-  const isGeneralOpen = generalExpanded || isGeneralActive
 
   // Collapsed rail — same component stays mounted, so expand/selection state
   // survives collapse; every rail button reuses the existing handlers.
@@ -96,16 +93,16 @@ function ProjectList({
           <button
             className="sidebar-rail-btn"
             onClick={onOpenAgents}
-            title="Agents"
-            aria-label="Agents"
+            title="Agents & Skills"
+            aria-label="Agents and Skills"
           >
             <IconSpark />
           </button>
           <button
             className="sidebar-rail-btn"
             onClick={onOpenGlobalMemory}
-            title="Global memory"
-            aria-label="Global memory"
+            title="Global Memory"
+            aria-label="Global Memory"
           >
             <IconBook />
           </button>
@@ -138,62 +135,59 @@ function ProjectList({
       </div>
 
       <div className="sidebar-body">
-        {/* Phase 10 — Agents browser */}
+        {/* Phase 10 — Agents & Skills browser */}
         <button className="agents-btn" onClick={onOpenAgents}>
           <IconSpark size={14} />
-          Agents
+          Agents &amp; Skills
         </button>
 
-        {/* Global memory button */}
+        {/* Global Memory button */}
         <button className="global-memory-btn" onClick={onOpenGlobalMemory}>
           <IconBook size={14} />
-          Global memory
+          Global Memory
         </button>
 
-        {/* GENERAL workspace section */}
+        {/* Conversations — the GENERAL workspace's chats, listed flat.
+            "+ New conversation" opens the landing; the conversation itself is
+            created when the first message is sent. */}
         <div className="sidebar-header">
-          <h2>General</h2>
+          <h2>Conversations</h2>
+          <button
+            className="sidebar-action-btn"
+            onClick={onNewGeneralConversation}
+            title="New conversation"
+            aria-label="New conversation"
+          >
+            <IconPlus />
+          </button>
         </div>
         <div className="general-section">
-          <div className="project-row">
+          <div className="conv-list conv-list-flat">
+            {generalConversations.map(conv => (
+              <div key={conv.id} className="conv-row">
+                <button
+                  className={`conv-btn ${conv.id === activeConversation ? 'active' : ''}`}
+                  onClick={() => onSelectConversation(conv)}
+                  title={conv.title}
+                >
+                  {conv.title}
+                </button>
+                <button
+                  className="conv-delete-btn"
+                  onClick={e => { e.stopPropagation(); onDeleteConversation(conv) }}
+                  title="Delete conversation"
+                >
+                  <IconX size={12} />
+                </button>
+              </div>
+            ))}
             <button
-              className={`project-btn ${isGeneralActive ? 'active' : ''}`}
-              onClick={() => { setGeneralExpanded(prev => !prev); onSelectGeneral() }}
+              className={`conv-btn new-conv ${isGeneralActive && !activeConversation ? 'active' : ''}`}
+              onClick={onNewGeneralConversation}
             >
-              <span className={`expand-icon ${isGeneralOpen ? 'open' : ''}`}>
-                <IconChevronRight />
-              </span>
-              General
+              + New conversation
             </button>
           </div>
-          {isGeneralOpen && (
-            <div className="conv-list">
-              {generalConversations.map(conv => (
-                <div key={conv.id} className="conv-row">
-                  <button
-                    className={`conv-btn ${conv.id === activeConversation ? 'active' : ''}`}
-                    onClick={() => onSelectConversation(conv)}
-                    title={conv.title}
-                  >
-                    {conv.title}
-                  </button>
-                  <button
-                    className="conv-delete-btn"
-                    onClick={e => { e.stopPropagation(); onDeleteConversation(conv) }}
-                    title="Delete conversation"
-                  >
-                    <IconX size={12} />
-                  </button>
-                </div>
-              ))}
-              <button
-                className="conv-btn new-conv"
-                onClick={onNewGeneralConversation}
-              >
-                + New conversation
-              </button>
-            </div>
-          )}
         </div>
 
         {/* Divider */}

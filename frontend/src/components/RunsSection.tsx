@@ -223,8 +223,8 @@ function RunsSection({ projectId, refreshSignal }: Props) {
   const runningCount = activeCount
 
   return (
-    <details className="runs-section" open>
-      <summary>
+    <section className="runs-section">
+      <div className="context-section-label runs-header">
         <span className="runs-summary-left">
           <span>Runs</span>
           {hasActive && (
@@ -250,7 +250,7 @@ function RunsSection({ projectId, refreshSignal }: Props) {
         >
           {loading ? '…' : '↻'}
         </button>
-      </summary>
+      </div>
 
       {showPreviewControl && (
         <div className="preview-control">
@@ -372,7 +372,7 @@ function RunsSection({ projectId, refreshSignal }: Props) {
           onClose={() => setOpenTraceId(null)}
         />
       )}
-    </details>
+    </section>
   )
 }
 

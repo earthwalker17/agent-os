@@ -132,6 +132,34 @@ def test_git_status_endpoint():
     _run(body)
 
 
+def test_git_log_endpoint():
+    def body(env):
+        repo = env.make_project("p")
+        env.make_run("p")
+        # Create a real commit so history is non-empty.
+        (repo / "hello.txt").write_text("hi\n", encoding="utf-8")
+        rt = ToolRuntime("p")
+        rt.run_git(["add", "hello.txt"])
+        rt.run_git(["commit", "-m", "seed commit"])
+        r = env.client.get("/api/projects/p/git/log")
+        assert r.status_code == 200
+        commits = r.json()["commits"]
+        assert isinstance(commits, list) and len(commits) >= 1
+        assert any(c["subject"] == "seed commit" for c in commits)
+        for c in commits:
+            assert set(c.keys()) == {"hash", "short", "author", "date", "subject"}
+
+    _run(body)
+
+
+def test_git_log_endpoint_rejects_general():
+    def body(env):
+        r = env.client.get("/api/projects/__GENERAL__/git/log")
+        assert r.status_code in (400, 404)
+
+    _run(body)
+
+
 def test_diff_endpoint():
     def body(env):
         env.make_project("p")

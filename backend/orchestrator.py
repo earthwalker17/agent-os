@@ -83,8 +83,15 @@ def _read(path: Path) -> str:
 
 
 def load_global_memory() -> dict[str, str]:
-    """Load the three writable global memory files (for viewer/editor API)."""
+    """Load the global memory files for the viewer/editor API.
+
+    Includes SOUL.md so the UI can show + user-edit it, but SOUL.md stays out
+    of every *auto*-writeback allow-list (``WRITABLE_GLOBAL_FILES``): the
+    Main Agent and all judge/reconciliation paths remain unable to write it.
+    Only the explicit user ``/global-memory/update-file`` endpoint may.
+    """
     return {
+        "SOUL.md": _read(MEMORY_DIR / "SOUL.md"),
         "USER.md": _read(MEMORY_DIR / "USER.md"),
         "WORKSTYLE.md": _read(MEMORY_DIR / "WORKSTYLE.md"),
         "MEMORY.md": _read(MEMORY_DIR / "MEMORY.md"),

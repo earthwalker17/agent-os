@@ -487,10 +487,18 @@ MEMORY_DIR = Path(__file__).resolve().parent.parent / "memory"
 
 WRITABLE_GLOBAL_FILE_LIST = ["USER.md", "WORKSTYLE.md", "MEMORY.md"]
 
+# Files a USER may edit through the Global Memory modal. SOUL.md is included
+# here — and ONLY here — so the user (never any LLM/judge path) can edit it:
+# `WRITABLE_GLOBAL_FILES` (the auto-writeback allow-list) still excludes SOUL.md,
+# so the Main Agent, the intake judge, and post-run reconciliation remain unable
+# to write it. This one manual endpoint is its sole write path.
+USER_EDITABLE_GLOBAL_FILES = [*WRITABLE_GLOBAL_FILES, "SOUL.md"]
+
 
 @app.get("/api/global-memory")
 def api_get_global_memory():
-    """Return the 3 writable global memory files (SOUL.md excluded)."""
+    """Return the global memory files for the viewer/editor (SOUL.md included,
+    shown read-only-to-the-agent + user-editable)."""
     return load_global_memory()
 
 
@@ -501,11 +509,15 @@ class UpdateGlobalFileRequest(BaseModel):
 
 @app.post("/api/global-memory/update-file")
 def api_update_global_file(req: UpdateGlobalFileRequest):
-    """Manually update a global memory file."""
-    if req.filename not in WRITABLE_GLOBAL_FILES:
+    """Manually update a global memory file (the sole SOUL.md write path).
+
+    Atomic (temp sibling + ``os.replace``): these files — SOUL.md especially — are
+    read on every chat turn as the identity anchor, so a plain truncate-then-write
+    would let a concurrent turn observe an empty / half-written file.
+    """
+    if req.filename not in USER_EDITABLE_GLOBAL_FILES:
         raise HTTPException(status_code=400, detail="Invalid filename or file is read-only")
-    filepath = MEMORY_DIR / req.filename
-    filepath.write_text(req.content, encoding="utf-8")
+    memory_engine._atomic_write(MEMORY_DIR / req.filename, req.content)
     return {"status": "ok"}
 
 
@@ -1996,6 +2008,16 @@ def api_git_status(project_id: str):
     _require_workspace(project_id)
     _reject_general_repo_op(project_id)
     return git_ops.git_status(project_id).to_dict()
+
+
+@app.get("/api/projects/{project_id}/git/log")
+def api_git_log(project_id: str, limit: int = 50):
+    """Read-only commit history (newest first) for the project repo — powers the
+    GitHub modal's traceable git-record view. `git log` is sandbox-allow-listed
+    and non-destructive; author/subject are redacted, output is bounded."""
+    _require_workspace(project_id)
+    _reject_general_repo_op(project_id)
+    return {"commits": git_ops.list_commits(project_id, limit=limit)}
 
 
 @app.get("/api/projects/{project_id}/github/connector")

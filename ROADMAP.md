@@ -263,6 +263,55 @@ installer.
   Phase 8/9 E2Es) removed from the repo and the local cockpit; secret audit
   clean.
 
+## Public UI/UX Pass
+
+Frontend-only cockpit polish toward the public README hero; no behavior
+change, no backend edits (verified by build + a Playwright sweep of both
+themes + an adversarial behavior-preservation review of the diff).
+
+- **New-conversation landing.** When a workspace is selected with no
+  conversation open, the center column now shows a landing state — a
+  time-of-day greeting, the real composer (shared with the thread, so voice /
+  `@`-autocomplete / attachments are one code path), quick `@`-command chips,
+  and a per-project Recent Runs list. The first send creates the conversation
+  (a `justCreatedConvRef` guard keeps the optimistic bubble from being wiped
+  by the messages fetch) then transitions into the thread. "+ New
+  conversation" now opens the landing instead of instant-creating.
+- **Composer polish.** The full-width model-dropdown band is gone; the
+  `ModelPicker` rides inside the composer row, the text "Send" became a 38×38
+  arrow button, and all controls share the 38px baseline. Ctrl/Cmd+Enter vs
+  Enter and the `@`-menu keyboard nav are unchanged.
+- **Sidebar.** "Agents" → "Agents & Skills"; the "General" section became a
+  flat "Conversations" list with a `+` header action (the redundant inner
+  "General" row removed); Settings stays a footer gear; spacing / hover /
+  focus states tightened.
+- **Right panel.** Grouped into divider-separated labeled sections (Project
+  Memory / Integrations / Workspace / Runs); the split GitHub-panel +
+  hidden-connectors-button gave way to a four-provider Integrations list
+  (GitHub / Vercel / Supabase / Stripe) with live status dots. Every connector
+  field/flow preserved.
+
+### Increment 2 — refinements
+
+- **SOUL.md is now user-editable, agent-still-read-only.** A constitutional
+  tightening-by-widening: SOUL.md shows at the top of the Global Memory modal
+  and the user can edit it through the one explicit
+  `/global-memory/update-file` endpoint, but it stays out of every
+  auto-writeback allow-list — the Main Agent, intake judge, and post-run
+  reconciliation still cannot touch it. A new test asserts both halves.
+- **Traceable Git from the UI.** Provider cards now open their OWN central
+  modal (GitHub → repo + working-tree + an expandable all-commits history from
+  a new read-only, redacted, bounded `GET /git/log`; Vercel/Supabase/Stripe →
+  `ConnectorsModal` locked to that single provider). `git log` was already
+  sandbox-allow-listed and non-destructive, so the endpoint reuses `run_git`.
+- **Cockpit polish.** Left: "Global Memory", a clear gear Settings button,
+  skill Edit moved top-right. Center: the redundant "Workspace" eyebrow gone, a
+  compact "Model" picker (not the long model name), composer controls aligned
+  to one 38px baseline. Right: the "Context" heading dropped, STATUS.md
+  default-folded, Runs demoted from a fold to a plain section header.
+- Re-verified live (build + a Playwright sweep of every state in both themes,
+  21/21 checks) and refreshed the README's actual-app screenshots.
+
 ---
 
 ## Current Constraints

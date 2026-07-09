@@ -1,7 +1,7 @@
 import type { ProjectContext } from '../types'
 import RunsSection from './RunsSection'
 import EnvRegistryPanel from './EnvRegistryPanel'
-import GitPanel from './GitPanel'
+import IntegrationsPanel from './IntegrationsPanel'
 import ExternalLinksPanel from './ExternalLinksPanel'
 
 interface Props {
@@ -17,7 +17,6 @@ function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Pro
   if (!projectId || !context) {
     return (
       <aside className="sidebar context-panel">
-        <h2>Context</h2>
         <p className="context-empty">Select a project to view its memory and runs.</p>
       </aside>
     )
@@ -25,15 +24,16 @@ function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Pro
 
   return (
     <aside className="sidebar context-panel">
-      <h2>Context</h2>
       <div className="context-project-name">{projectId}</div>
+
+      <div className="context-section-label">Project memory</div>
       <div className="context-files">
         {FILE_ORDER.map(filename => {
           const content = context[filename]
           if (content === undefined) return null
 
           return (
-            <details key={filename} open={filename === 'STATUS.md'}>
+            <details key={filename}>
               <summary>{filename}</summary>
               <div className="context-read">
                 <pre className="context-content">{content || '(empty)'}</pre>
@@ -46,10 +46,11 @@ function ContextPanel({ projectId, context, onEditFile, runsRefreshSignal }: Pro
         })}
       </div>
 
-      <GitPanel projectId={projectId} refreshSignal={runsRefreshSignal} />
+      <div className="context-section-label">Integrations</div>
+      <IntegrationsPanel projectId={projectId} refreshSignal={runsRefreshSignal} />
 
+      <div className="context-section-label">Workspace</div>
       <EnvRegistryPanel projectId={projectId} />
-
       <ExternalLinksPanel projectId={projectId} refreshSignal={runsRefreshSignal} />
 
       <RunsSection projectId={projectId} refreshSignal={runsRefreshSignal} />

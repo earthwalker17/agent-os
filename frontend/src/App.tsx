@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import ProjectList from './components/ProjectList'
 import ChatPanel from './components/ChatPanel'
 import ContextPanel from './components/ContextPanel'
@@ -34,6 +34,11 @@ function App() {
   // GENERAL workspace state
   const [isGeneralActive, setIsGeneralActive] = useState(false)
   const [generalConversations, setGeneralConversations] = useState<Conversation[]>([])
+
+  // Public UI pass — id of a conversation just created by the landing
+  // composer's first send. The messages-fetch effect skips one fetch for it,
+  // so a slow-resolving empty response can't wipe the optimistic first bubble.
+  const justCreatedConvRef = useRef<string | null>(null)
 
   // Task 07.1 + Provider Registry 2.0 — model provider + model selection.
   const [providersList, setProvidersList] = useState<ProviderInfo[]>([])
@@ -239,6 +244,12 @@ function App() {
 
   useEffect(() => {
     if (!activeConversation) { setMessages([]); return }
+    if (justCreatedConvRef.current === activeConversation) {
+      // Brand-new conversation from the landing composer — nothing exists on
+      // the server yet, so keep the optimistic messages instead of fetching [].
+      justCreatedConvRef.current = null
+      return
+    }
     let cancelled = false
     fetch(`/api/conversations/${activeConversation}/messages`)
       .then(res => res.json())
@@ -399,7 +410,7 @@ function App() {
     setActiveConversation(conv.id)
   }, [])
 
-  const handleNewConversation = useCallback(async (projectId: string) => {
+  const handleNewConversation = useCallback(async (projectId: string): Promise<Conversation | null> => {
     try {
       const res = await fetch(`/api/projects/${projectId}/conversations`, {
         method: 'POST',
@@ -407,17 +418,20 @@ function App() {
         body: JSON.stringify({ title: '' }),
       })
       const conv: Conversation = await res.json()
+      justCreatedConvRef.current = conv.id
       setConversations(prev => [conv, ...prev])
       setIsGeneralActive(false)
       setActiveProject(projectId)
       setActiveConversation(conv.id)
       setMessages([])
+      return conv
     } catch (err) {
       console.error('Failed to create conversation:', err)
+      return null
     }
   }, [])
 
-  const handleNewGeneralConversation = useCallback(async () => {
+  const handleNewGeneralConversation = useCallback(async (): Promise<Conversation | null> => {
     try {
       const res = await fetch('/api/general/conversations', {
         method: 'POST',
@@ -425,16 +439,34 @@ function App() {
         body: JSON.stringify({ title: '' }),
       })
       const conv: Conversation = await res.json()
+      justCreatedConvRef.current = conv.id
       setGeneralConversations(prev => [conv, ...prev])
       setIsGeneralActive(true)
       setActiveProject(null)
       setContext(null)
       setActiveConversation(conv.id)
       setMessages([])
+      return conv
     } catch (err) {
       console.error('Failed to create general conversation:', err)
+      return null
     }
   }, [])
+
+  // Public UI pass — the landing composer's first send: create a conversation
+  // for the active workspace and return its id so the send can thread it
+  // explicitly (App state hasn't flushed yet inside the same async flow).
+  const handleStartConversation = useCallback(async (): Promise<string | null> => {
+    if (isGeneralActive) {
+      const conv = await handleNewGeneralConversation()
+      return conv?.id ?? null
+    }
+    if (activeProject) {
+      const conv = await handleNewConversation(activeProject)
+      return conv?.id ?? null
+    }
+    return null
+  }, [isGeneralActive, activeProject, handleNewConversation, handleNewGeneralConversation])
 
   const handleDeleteConversation = useCallback((conv: Conversation) => {
     setConfirmDialog({
@@ -474,8 +506,11 @@ function App() {
 
   // --- Chat ---
 
-  const handleSend = useCallback(async (message: string, attachments?: ChatAttachment[]) => {
-    if (!activeConversation) return
+  const handleSend = useCallback(async (message: string, attachments?: ChatAttachment[], conversationIdOverride?: string) => {
+    // The landing composer sends into a conversation it just created — its id
+    // arrives as an override because `activeConversation` hasn't flushed yet.
+    const targetConversation = conversationIdOverride ?? activeConversation
+    if (!targetConversation) return
 
     // Snapshot revise-mode at the start of the send; clear it eagerly so the
     // banner disappears immediately on submit. We restore on error so the
@@ -506,7 +541,7 @@ function App() {
         provider?: string
         model?: string
       } = {
-        conversation_id: activeConversation,
+        conversation_id: targetConversation,
         message,
         provider: selectedProvider,
       }
@@ -699,13 +734,12 @@ function App() {
         generalConversations={generalConversations}
         onSelectProject={handleSelectProject}
         onSelectConversation={handleSelectConversation}
-        onNewConversation={handleNewConversation}
+        onNewConversation={handleSelectProject}
         onNewProject={handleNewProject}
         onRenameProject={handleRenameProject}
         onDeleteProject={handleDeleteProject}
         onDeleteConversation={handleDeleteConversation}
-        onSelectGeneral={handleSelectGeneral}
-        onNewGeneralConversation={handleNewGeneralConversation}
+        onNewGeneralConversation={handleSelectGeneral}
         onOpenGlobalMemory={handleOpenGlobalMemory}
         onOpenAgents={() => setAgentsModal(true)}
         onOpenSettings={() => setSettingsModal(true)}
@@ -717,6 +751,7 @@ function App() {
         conversationId={activeConversation}
         messages={messages}
         onSend={handleSend}
+        onStartConversation={handleStartConversation}
         loading={loading}
         headerLabel={chatLabel}
         runProjectId={isGeneralActive ? null : activeProject}

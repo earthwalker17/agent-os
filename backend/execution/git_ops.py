@@ -343,6 +343,54 @@ def current_branch(project_id: str, *, runtime: Optional[ToolRuntime] = None) ->
     return None
 
 
+# Field/record separators that cannot appear in a commit subject/author, so we
+# can split a `git log` line safely without a delimiter collision.
+_LOG_FS = "\x1f"  # between fields
+_LOG_RS = "\x1e"  # between records
+_MAX_LOG_COMMITS = 200
+
+
+def list_commits(
+    project_id: str, *, limit: int = 50, runtime: Optional[ToolRuntime] = None
+) -> list[dict]:
+    """Read-only commit history for the project repo, newest first.
+
+    Mirrors ``git_status`` (single sandboxed ``run_git`` executor, output already
+    hard-bounded there). Each commit's author + subject is run through
+    ``_redact`` before it leaves the module. ``limit`` is clamped to
+    ``_MAX_LOG_COMMITS``. Never raises — a non-repo or a git failure yields ``[]``.
+    """
+    rt = runtime or ToolRuntime(project_id)
+    if not _is_repo(project_id):
+        return []
+    n = max(1, min(int(limit or 0) or 50, _MAX_LOG_COMMITS))
+    pretty = _LOG_FS.join(["%H", "%h", "%an", "%ad", "%s"]) + _LOG_RS
+    res = rt.run_git(
+        ["log", f"-n{n}", "--date=iso", f"--pretty=format:{pretty}"]
+    )
+    if not res.success:
+        return []
+    commits: list[dict] = []
+    for record in res.output.split(_LOG_RS):
+        record = record.strip("\n")
+        if not record.strip():
+            continue
+        parts = record.split(_LOG_FS)
+        if len(parts) < 5:
+            continue
+        full, short, author, date, subject = parts[0], parts[1], parts[2], parts[3], parts[4]
+        commits.append(
+            {
+                "hash": full.strip(),
+                "short": short.strip(),
+                "author": _redact(author.strip()),
+                "date": date.strip(),
+                "subject": _redact(subject.strip()),
+            }
+        )
+    return commits
+
+
 def create_checkpoint(
     project_id: str, label: str, *, runtime: Optional[ToolRuntime] = None
 ) -> CheckpointResult:

@@ -63,8 +63,10 @@ function ModelPicker({ models, selectedModel, onSelect, disabled }: Props) {
             {current.vision ? '👁' : 'T'}
           </span>
         )}
-        <span className="model-picker-label">{label}</span>
-        <span className="model-picker-caret" aria-hidden="true">▴</span>
+        {/* Compact: a fixed "Model" label, not the (long) model name. The
+            selected model is in the tooltip + highlighted in the dropdown. */}
+        <span className="model-picker-label">Model</span>
+        <span className="model-picker-caret" aria-hidden="true">▾</span>
       </button>
       {open && (
         <ul className="model-picker-menu" role="listbox">

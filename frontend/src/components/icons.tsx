@@ -127,3 +127,64 @@ export function IconStop({ size = 14 }: IconProps) {
     </svg>
   )
 }
+
+/** Composer send (arrow up). */
+export function IconArrowUp({ size = 16 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <line x1="12" y1="19" x2="12" y2="5.5" />
+      <polyline points="5.5 11.5, 12 5, 18.5 11.5" />
+    </svg>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* Provider brand marks — filled silhouettes for the Integrations panel.
+   All inherit currentColor so the panel's CSS decides the tint per theme. */
+
+function brandProps(size: number, viewBox = '0 0 24 24') {
+  return {
+    width: size,
+    height: size,
+    viewBox,
+    fill: 'currentColor' as const,
+    'aria-hidden': true as const,
+    focusable: false as const,
+  }
+}
+
+/** GitHub octocat mark (octicon silhouette). */
+export function BrandGitHub({ size = 16 }: IconProps) {
+  return (
+    <svg {...brandProps(size, '0 0 16 16')}>
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
+    </svg>
+  )
+}
+
+/** Vercel triangle. */
+export function BrandVercel({ size = 16 }: IconProps) {
+  return (
+    <svg {...brandProps(size)}>
+      <path d="M12 4.2 21.7 20.5H2.3L12 4.2z" />
+    </svg>
+  )
+}
+
+/** Supabase bolt. */
+export function BrandSupabase({ size = 16 }: IconProps) {
+  return (
+    <svg {...brandProps(size)}>
+      <path d="M13.9 2.1 4.2 13.6c-.5.6-.1 1.5.7 1.5h6.1l-1 6.7c-.1.8.9 1.2 1.4.6l9.7-11.5c.5-.6.1-1.5-.7-1.5h-6.1l1-6.7c.1-.8-.9-1.2-1.4-.6z" />
+    </svg>
+  )
+}
+
+/** Stripe "S" glyph. */
+export function BrandStripe({ size = 16 }: IconProps) {
+  return (
+    <svg {...brandProps(size)}>
+      <path d="M13.98 10.02c-1.82-.68-2.82-1.2-2.82-2.02 0-.7.57-1.1 1.6-1.1 1.87 0 3.8.72 5.13 1.37V3.72C16.44 3.15 15 2.8 12.76 2.8 9 2.8 6.5 4.77 6.5 8.05c0 5.12 7.04 4.3 7.04 6.51 0 .83-.72 1.1-1.72 1.1-1.53 0-3.49-.63-5.04-1.47v4.6c1.72.74 3.45 1.05 5.04 1.05 3.85 0 6.5-1.9 6.5-5.22-.02-5.53-7.34-4.55-7.34-6.6z" />
+    </svg>
+  )
+}

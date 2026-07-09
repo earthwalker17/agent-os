@@ -330,25 +330,40 @@ button {
   min-width: 236px;
 }
 
+/* A clear, bordered gear button (not just a hover row). */
 .sidebar-settings-btn {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
-  background: transparent;
-  border: none;
-  border-radius: var(--r-sm);
-  color: var(--text-muted);
+  justify-content: center;
+  gap: 8px;
+  padding: 9px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.14s var(--ease), color 0.14s var(--ease);
+  transition: background 0.14s var(--ease), color 0.14s var(--ease),
+    border-color 0.14s var(--ease);
 }
 
 .sidebar-settings-btn:hover {
-  background: var(--bg-input);
-  color: var(--text);
+  background: var(--bg-elev-2);
+  border-color: var(--border-strong);
+  color: var(--text-strong);
+}
+
+/* Keyboard focus — visible ring on the sidebar's icon/footer controls. */
+.sidebar-settings-btn:focus-visible,
+.sidebar-rail-btn:focus-visible,
+.sidebar-collapse-btn:focus-visible,
+.sidebar-action-btn:focus-visible,
+.agents-btn:focus-visible,
+.global-memory-btn:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
 }
 
 /* Collapsed rail */
@@ -408,7 +423,7 @@ button {
 .project-btn {
   width: 100%;
   text-align: left;
-  padding: 7px 10px;
+  padding: 8px 10px;
   background: transparent;
   border: none;
   color: var(--text);
@@ -454,10 +469,16 @@ button {
   padding-bottom: 4px;
 }
 
+/* Public UI pass — the Conversations section lists the GENERAL workspace's
+   chats flat under the section header, so it drops the nesting indent. */
+.conv-list.conv-list-flat {
+  padding-left: 4px;
+}
+
 .conv-btn {
   width: 100%;
   text-align: left;
-  padding: 5px 10px;
+  padding: 6px 10px;
   background: transparent;
   border: none;
   color: var(--text-muted);
@@ -810,14 +831,17 @@ button {
 .composer-textarea {
   flex: 1;
   min-width: 0;
-  padding: 9px 14px;
+  /* line-height 20 + 8+8 padding + 1+1 border = 38px, exactly matching the
+     attach / mic / model / send controls on a single line. */
+  padding: 8px 14px;
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   color: var(--text);
   font-family: inherit;
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 20px;
+  min-height: 38px;
   outline: none;
   resize: none;
   overflow-y: auto;
@@ -887,16 +911,19 @@ button {
   100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); }
 }
 
+/* Send is a compact 38×38 arrow button, matching the icon-control baseline. */
 .composer .composer-send-btn {
   flex-shrink: 0;
+  width: 38px;
   height: 38px;
-  padding: 0 18px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: var(--accent-strong);
   color: #fff;
   border: none;
   border-radius: var(--r-md);
-  font-size: 13.5px;
-  font-weight: 600;
   cursor: pointer;
   transition: background 0.14s var(--ease);
 }
@@ -911,12 +938,14 @@ button {
 }
 
 /* Provider Registry 2.0 — composer-side model picker (compact, opens UPWARD,
-   right-aligned over the input area) + per-model image-upload gating cues. */
-.composer-modelbar {
-  display: flex;
-  justify-content: flex-end;
-  padding: 8px 20px 0;
-  background: var(--bg-surface);
+   right-aligned over the input area) + per-model image-upload gating cues.
+   Public UI pass: the picker rides INSIDE the composer row (right side,
+   before Send) — the old full-width `.composer-modelbar` band is gone. */
+.chat-input.composer .model-picker {
+  flex-shrink: 0;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
 }
 
 .model-picker {
@@ -1054,6 +1083,54 @@ button {
 
 .model-picker-vision.no {
   color: var(--text-muted);
+}
+
+/* Scoped under `.chat-input.composer` so the picker's trigger + menu options
+   beat the generic `.chat-input button` accent rule now that the picker sits
+   inside the form — the same specificity trick as `.composer-icon-btn` and
+   the command-menu options. Without these, both render as solid accent
+   blocks with unreadable text. */
+.chat-input.composer .model-picker-trigger {
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chat-input.composer .model-picker-trigger:hover:not(:disabled),
+.chat-input.composer .model-picker-trigger:focus:not(:disabled) {
+  color: var(--text);
+  background: var(--bg-input);
+  border-color: var(--border);
+}
+
+.chat-input.composer .model-picker-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 7px 9px;
+  background: transparent;
+  border: none;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 400;
+  text-align: left;
+}
+
+.chat-input.composer .model-picker-option:hover {
+  background: var(--bg-input);
+}
+
+.chat-input.composer .model-picker-option.selected {
+  background: var(--accent-soft);
+  color: var(--text-strong);
+  font-weight: 600;
 }
 
 /* Image-upload-disabled cues for a text-only model. */
@@ -1713,6 +1790,21 @@ button {
   margin: 12px 0;
 }
 
+/* Global Memory modal — SOUL.md "read-only to the agent" tag. */
+.global-memory-tag {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  margin-right: auto;
+  margin-left: 8px;
+}
+
 /* General section */
 .general-section {
   margin-bottom: 4px;
@@ -1819,10 +1911,10 @@ button {
 }
 
 /* Runs section (right column, below context files) */
+/* Runs section spacing — the divider now comes from the .runs-header
+   section label, so no extra border/padding here. */
 .runs-section {
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
+  margin-top: 0;
 }
 
 .runs-section > summary {
@@ -3634,8 +3726,15 @@ button {
   box-shadow: var(--shadow-3);
   animation: modal-in 0.16s var(--ease);
 }
+.connector-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .connector-modal h3 {
-  margin-bottom: 8px;
   font-size: 14.5px;
   font-weight: 650;
   color: var(--text-strong);
@@ -3961,18 +4060,31 @@ button {
   margin-top: 6px;
 }
 
+/* Edit sits top-right over the skill body (not below it). */
+.skill-read {
+  position: relative;
+}
+
+.skill-edit-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+}
+
 .skill-content {
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
   padding: 8px;
+  padding-right: 56px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   max-height: 260px;
   overflow-y: auto;
-  margin: 0 0 6px;
+  margin: 0;
 }
 
 .skill-editor {
@@ -4285,5 +4397,474 @@ button {
 .settings-hint {
   font-size: 11.5px;
   line-height: 1.5;
+  color: var(--text-muted);
+}
+
+/* =====================================================================
+   Public UI pass — landing state (the new-conversation experience)
+   ===================================================================== */
+
+.landing {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  justify-content: center;
+  padding: 24px;
+}
+
+.landing-inner {
+  width: min(640px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: max(48px, 13vh);
+  padding-bottom: 48px;
+}
+
+.landing-idle .landing-inner {
+  margin-top: max(64px, 24vh);
+}
+
+.landing-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+}
+
+.landing-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  margin-bottom: 6px;
+}
+
+.landing-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+
+.landing-greeting {
+  font-size: 27px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: var(--text-strong);
+}
+
+.landing-sub {
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.landing-sub strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* The shared composer, re-dressed as a centered card. Overflow stays visible
+   so the upward-opening @-command and model menus aren't clipped. */
+.landing-composer {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-2);
+  overflow: visible;
+}
+
+.landing-composer .chat-input {
+  border-top: none;
+  background: transparent;
+  border-radius: var(--r-lg);
+  padding: 12px;
+}
+
+.landing-composer .composer-tray {
+  background: transparent;
+  border-bottom: 1px solid var(--border);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+}
+
+/* On the landing the composer sits mid-panel inside `.landing` (a scroll
+   container), so the thread composer's upward-opening @-command and model
+   menus would be clipped at the top with no way to scroll to them. Flip them
+   to open DOWNWARD here — there's ample room below, and downward overflow is
+   reachable within the scroll container. Higher specificity than the base
+   `.command-menu` / `.model-picker-menu` upward rules. */
+.landing .command-menu,
+.landing .model-picker-menu {
+  top: calc(100% + 6px);
+  bottom: auto;
+}
+
+.landing-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.landing-chip {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  padding: 4px 12px;
+  cursor: pointer;
+  transition: background 0.14s var(--ease), border-color 0.14s var(--ease),
+    color 0.14s var(--ease);
+}
+
+.landing-chip:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+}
+
+.landing-chip:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
+}
+
+.landing-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.landing-runs-title {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+
+.landing-runs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.landing-run-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s var(--ease), background 0.14s var(--ease);
+}
+
+.landing-run-row:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-elev);
+}
+
+.landing-run-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.landing-run-time {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* =====================================================================
+   Public UI pass — right-panel section labels + Integrations cards
+   ===================================================================== */
+
+/* Section labels double as separators: a rule above each marks where one
+   section ends and the next begins (Project memory / Integrations / Workspace
+   / Runs). */
+.context-section-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-muted);
+  margin: 16px 0 8px;
+  padding: 14px 2px 0;
+  border-top: 1px solid var(--border);
+}
+
+.integrations {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Each card is a single button that opens the provider's own central modal. */
+.integration-card {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s var(--ease), background 0.14s var(--ease);
+}
+
+.integration-card:hover {
+  background: var(--bg-elev);
+  border-color: var(--border-strong);
+}
+
+.integration-card:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
+}
+
+.integration-open-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.integration-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text-strong);
+  flex-shrink: 0;
+}
+
+/* Brand tints for the marks whose identity is their color; GitHub/Vercel
+   stay ink-colored. Light theme deepens both for contrast on white. */
+.integration-mark.supabase {
+  color: #3ecf8e;
+}
+
+.integration-mark.stripe {
+  color: #635bff;
+}
+
+:root[data-theme='light'] .integration-mark.supabase {
+  color: #1c8656;
+}
+
+:root[data-theme='light'] .integration-mark.stripe {
+  color: #5851e0;
+}
+
+.integration-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.integration-tag {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--warn);
+  border: 1px solid var(--warn-bd);
+  background: var(--warn-bg);
+  border-radius: var(--r-pill);
+  padding: 0 5px;
+}
+
+.integration-status {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.integration-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.integration-status.tone-ok {
+  color: var(--ok);
+}
+
+.integration-status.tone-warn {
+  color: var(--warn);
+}
+
+.integration-status.tone-danger {
+  color: var(--danger);
+}
+
+.integration-status.tone-muted {
+  color: var(--text-muted);
+}
+
+/* Runs is now a plain section (no fold): the section label carries the running
+   indicator + refresh control on the right. */
+.runs-section {
+  display: block;
+}
+
+.context-section-label.runs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.context-section-label.runs-header .runs-summary-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* GitHub connector modal */
+.github-modal {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  width: min(560px, 94vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-3);
+  animation: modal-in 0.16s var(--ease);
+}
+
+.github-modal-body {
+  padding: 14px 18px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.git-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.git-history {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.git-history-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.git-history-toggle:hover {
+  color: var(--text-strong);
+}
+
+.git-history-body {
+  margin-top: 8px;
+}
+
+.git-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.git-commit-row {
+  display: flex;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  align-items: baseline;
+}
+
+.git-commit-row:hover {
+  background: var(--bg-elev);
+}
+
+.git-commit-hash {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.git-commit-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.git-commit-subject {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-commit-meta {
+  font-size: 10.5px;
   color: var(--text-muted);
 }

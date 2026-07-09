@@ -227,12 +227,12 @@ function AgentsModal({ agents, onClose }: Props) {
                               </div>
                             </div>
                           ) : (
-                            <>
-                              <pre className="skill-content">{openSkill.content}</pre>
-                              <button className="btn-edit-global" onClick={startEdit}>
+                            <div className="skill-read">
+                              <button className="btn-edit-global skill-edit-btn" onClick={startEdit}>
                                 Edit
                               </button>
-                            </>
+                              <pre className="skill-content">{openSkill.content}</pre>
+                            </div>
                           )}
                         </div>
                       )}

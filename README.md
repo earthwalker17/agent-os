@@ -78,9 +78,11 @@ Everything ran through Agent OS itself, the way a user would drive it:
 - **Delivered through contracts.** Two-phase preview→confirm all the way: Git commit → push to [its own repo](https://github.com/earthwalker17/agent-os-sample-project), Vercel **production** deploy (READY), Supabase link + SQL migration (tables + RLS verified live), Stripe test-mode product/price provisioning + signed webhook registration, and per-key env-var pushes — every step recorded in the project's `OPS.md` ledger.
 - **Proven in production.** A real signup on the live site, a real Stripe test checkout, and the signed `checkout.session.completed` webhook flipping `profiles.plan` to `"pro"` in the live Postgres — confirmed by reading the row back. The full payment→persistence loop, on the deployed app.
 
-And this is what the cockpit looked like while it happened — live run card with the screenshot gallery, the recovery proposal, reconciled project memory, and the Git/connector state:
+And this is the cockpit itself — the new-conversation landing (left) and a live run inside the chat thread (right), with reconciled project memory, the provider integrations, and the Git/connector state in the context panel. Shown in dark mode; a light theme ships too.
 
-![The Agent OS cockpit during the Pulseboard build](./docs/images/agent-os-cockpit.png)
+| | |
+|---|---|
+| ![Agent OS — the new-conversation landing](./docs/images/agent-os-landing-dark.png) | ![Agent OS — a live run in the chat thread](./docs/images/agent-os-thread-dark.png) |
 
 ---
 

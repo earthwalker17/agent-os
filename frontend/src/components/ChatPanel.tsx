@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
-import type { Message, PendingExecution, ChatAttachment, ModelInfo, AgentInfo } from '../types'
-import { IconMic, IconPaperclip, IconStop } from './icons'
+import type { Message, PendingExecution, ChatAttachment, ModelInfo, AgentInfo, RunRecord } from '../types'
+import { IconArrowUp, IconMic, IconPaperclip, IconSpark, IconStop } from './icons'
 import RunDetailModal from './RunDetailModal'
 import RunChatCard from './RunChatCard'
 import RunTrace from './RunTrace'
@@ -13,8 +13,13 @@ interface Props {
   projectId: string | null
   conversationId: string | null
   messages: Message[]
-  /** Send a message with optional uploaded attachments (Task 07.0). */
-  onSend: (message: string, attachments?: ChatAttachment[]) => void
+  /** Send a message with optional uploaded attachments (Task 07.0). The
+   * optional conversation-id override threads a just-created landing
+   * conversation through before App state has flushed. */
+  onSend: (message: string, attachments?: ChatAttachment[], conversationIdOverride?: string) => void
+  /** Public UI pass — landing composer's first send: create a conversation
+   * for the active workspace, resolving to its id (null on failure). */
+  onStartConversation?: () => Promise<string | null>
   loading?: boolean
   headerLabel?: string | null
   /**
@@ -89,6 +94,31 @@ function extractRunId(content: string): string | null {
 
 // Max composer height before it scrolls instead of growing further.
 const MAX_TEXTAREA_HEIGHT = 200
+
+// Public UI pass — curated quick-command chips for the landing composer,
+// drawn from the live agent registry (a command missing there doesn't show).
+const QUICK_COMMANDS = ['@plan', '@code', '@design', '@debug', '@review', '@search']
+
+/** Time-of-day greeting for the landing state. */
+function timeGreeting(): string {
+  const h = new Date().getHours()
+  if (h >= 5 && h < 12) return 'Good morning'
+  if (h >= 12 && h < 18) return 'Good afternoon'
+  return 'Good evening'
+}
+
+/** Compact relative timestamp for the landing's Recent Runs rows. */
+function timeAgo(iso: string | undefined | null): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return ''
+  const mins = Math.max(0, Math.round((Date.now() - d.getTime()) / 60000))
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.round(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.round(hours / 24)}d ago`
+}
 
 // Accepted upload types, mirroring the backend allow-list (uploads.py).
 const ACCEPT_TYPES = 'image/*,.txt,.md,.pdf,.doc,.docx'
@@ -171,6 +201,7 @@ function ChatPanel({
   conversationId,
   messages,
   onSend,
+  onStartConversation,
   loading,
   headerLabel,
   runProjectId,
@@ -201,11 +232,36 @@ function ChatPanel({
   // Phase 6.1 — per-pending user-approved auto-recovery budget (0 = none).
   const [recoveryBudgets, setRecoveryBudgets] = useState<Record<string, number>>({})
 
+  // Public UI pass — landing-state Recent Runs snapshot (per-project; the
+  // GENERAL workspace has no runs). One fetch per landing visit — no polling.
+  const [recentRuns, setRecentRuns] = useState<RunRecord[]>([])
+  useEffect(() => {
+    if (conversationId || !runProjectId) {
+      setRecentRuns([])
+      return
+    }
+    let cancelled = false
+    fetch(`/api/projects/${runProjectId}/execution/runs`)
+      .then(res => (res.ok ? res.json() : []))
+      .then((runs: RunRecord[]) => {
+        if (!cancelled) setRecentRuns(Array.isArray(runs) ? runs.slice(0, 5) : [])
+      })
+      .catch(() => {
+        if (!cancelled) setRecentRuns([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [conversationId, runProjectId])
+
   // Task 07.0 — composer attachment + voice state.
   const [files, setFiles] = useState<File[]>([])
   const [addToWorkspace, setAddToWorkspace] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  // Synchronous in-flight guard for doSend — blocks re-entry across the
+  // `await onStartConversation()` window that `loading` doesn't yet cover.
+  const sendingRef = useRef(false)
   // Provider Registry 2.0 — transient note shown when image attachments are
   // blocked/removed because the selected model can't process images.
   const [imageBlockedNote, setImageBlockedNote] = useState<string | null>(null)
@@ -465,7 +521,12 @@ function ChatPanel({
 
   const doSend = async () => {
     const trimmed = input.trim()
-    if (!conversationId || loading || uploading) return
+    // In-flight guard. `loading` (App-owned) only flips once the chat POST is
+    // underway, so on a landing first-send there's a window — between this
+    // call and `onStartConversation()` resolving — where a second submit would
+    // otherwise slip through and create a duplicate conversation. `sendingRef`
+    // closes that window synchronously.
+    if (loading || uploading || sendingRef.current) return
     // Provider Registry 2.0 — never upload images for a text-only model, even if
     // some slipped into the staged set (e.g. a late model switch).
     const filesToSend = visionEnabled
@@ -474,35 +535,50 @@ function ChatPanel({
     // Nothing to send: no text and no files.
     if (!trimmed && filesToSend.length === 0) return
 
-    let attachments: ChatAttachment[] | undefined
-    if (filesToSend.length > 0) {
-      setUploading(true)
-      setUploadError(null)
-      try {
-        const form = new FormData()
-        form.append('conversation_id', conversationId)
-        form.append('add_to_workspace', String(addToWorkspace && isProjectConversation))
-        for (const f of filesToSend) form.append('files', f)
-        const res = await fetch('/api/chat/upload', { method: 'POST', body: form })
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}))
-          setUploadError(err.detail || 'File upload failed')
-          return
-        }
-        const data = await res.json()
-        attachments = data.attachments as ChatAttachment[]
-      } catch (err) {
-        console.error('Upload error:', err)
-        setUploadError('File upload failed — see console for details.')
-        return
-      } finally {
-        setUploading(false)
+    sendingRef.current = true
+    try {
+      // Landing state — no conversation yet: create one for this workspace now
+      // and thread its id through the upload + send explicitly (App state
+      // hasn't flushed inside this same async flow).
+      let targetConversationId = conversationId
+      if (!targetConversationId) {
+        if (!onStartConversation) return
+        targetConversationId = await onStartConversation()
+        if (!targetConversationId) return
       }
-    }
 
-    onSend(trimmed, attachments)
-    setInput('')
-    setFiles([])
+      let attachments: ChatAttachment[] | undefined
+      if (filesToSend.length > 0) {
+        setUploading(true)
+        setUploadError(null)
+        try {
+          const form = new FormData()
+          form.append('conversation_id', targetConversationId)
+          form.append('add_to_workspace', String(addToWorkspace && isProjectConversation))
+          for (const f of filesToSend) form.append('files', f)
+          const res = await fetch('/api/chat/upload', { method: 'POST', body: form })
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}))
+            setUploadError(err.detail || 'File upload failed')
+            return
+          }
+          const data = await res.json()
+          attachments = data.attachments as ChatAttachment[]
+        } catch (err) {
+          console.error('Upload error:', err)
+          setUploadError('File upload failed — see console for details.')
+          return
+        } finally {
+          setUploading(false)
+        }
+      }
+
+      onSend(trimmed, attachments, targetConversationId)
+      setInput('')
+      setFiles([])
+    } finally {
+      sendingRef.current = false
+    }
   }
 
   // --- Phase 10: @-command autocomplete ---
@@ -541,6 +617,27 @@ function ChatPanel({
   const syncCaret = (el: HTMLTextAreaElement) => {
     setCaret(el.selectionStart ?? el.value.length)
   }
+
+  // Public UI pass — landing quick chips: swap/insert the leading @-command,
+  // keeping any text the user already typed after it.
+  const applyQuickCommand = (entry: CommandEntry) => {
+    const rest = input.replace(/^@\S+\s*/, '')
+    const next = entry.command + ' ' + rest
+    setInput(next)
+    setCaret(next.length)
+    setMenuDismissed(true)
+    requestAnimationFrame(() => {
+      const el = inputRef.current
+      if (el) {
+        el.focus()
+        el.setSelectionRange(next.length, next.length)
+      }
+    })
+  }
+
+  const quickChipEntries = QUICK_COMMANDS.map(c =>
+    commandEntries.find(en => en.command === c)
+  ).filter((en): en is CommandEntry => !!en)
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -583,13 +680,160 @@ function ChatPanel({
 
   const label = headerLabel || projectId
 
+  const sendDisabled = loading || uploading || (!input.trim() && files.length === 0)
+
+  // The composer (file tray + input row) is shared verbatim between the
+  // landing state and the open-conversation thread, so the upload / voice /
+  // caret / @-menu machinery lives on exactly one set of hooks and handlers.
+  const composerTray = (files.length > 0 || uploadError || voiceError || imageBlockedNote) && (
+    <div className="composer-tray">
+      {voiceError && <div className="composer-voice-error">{voiceError}</div>}
+      {imageBlockedNote && (
+        <div className="composer-image-blocked">{imageBlockedNote}</div>
+      )}
+      {uploadError && <div className="composer-upload-error">{uploadError}</div>}
+      {files.length > 0 && (
+        <>
+          <div className="composer-chips">
+            {files.map((f, i) => (
+              <div className="composer-chip" key={i} title={f.name}>
+                <span className="composer-chip-name">{f.name}</span>
+                <span className="composer-chip-size">{formatSize(f.size)}</span>
+                <button
+                  type="button"
+                  className="composer-chip-remove"
+                  onClick={() => removeFile(i)}
+                  disabled={uploading}
+                  aria-label={`Remove ${f.name}`}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+          {isProjectConversation && (
+            <label className="composer-workspace-toggle">
+              <input
+                type="checkbox"
+                checked={addToWorkspace}
+                onChange={e => setAddToWorkspace(e.target.checked)}
+                disabled={uploading}
+              />
+              Add to workspace too
+            </label>
+          )}
+        </>
+      )}
+    </div>
+  )
+
+  const composerForm = (
+    <form className="chat-input composer" onSubmit={handleSubmit}>
+      {menuEntries.length > 0 && (
+        <CommandMenu
+          entries={menuEntries}
+          selectedIndex={menuSelected}
+          onSelect={selectCommand}
+          onHover={setMenuIndex}
+        />
+      )}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept={visionEnabled ? ACCEPT_TYPES : ACCEPT_TYPES_NO_IMAGE}
+        style={{ display: 'none' }}
+        onChange={handleFilesPicked}
+      />
+      <button
+        type="button"
+        className={`composer-icon-btn composer-attach-btn${visionEnabled ? '' : ' no-image'}`}
+        onClick={() => fileInputRef.current?.click()}
+        disabled={loading || uploading}
+        title={
+          visionEnabled
+            ? 'Attach files'
+            : 'Attach files — images unavailable for the selected model'
+        }
+        aria-label="Attach files"
+      >
+        <IconPaperclip />
+      </button>
+      <textarea
+        ref={inputRef}
+        className="composer-textarea"
+        value={input}
+        onChange={e => {
+          setInput(e.target.value)
+          setCaret(e.target.selectionStart ?? e.target.value.length)
+          setMenuDismissed(false)
+          setMenuIndex(0)
+        }}
+        onKeyDown={handleKeyDown}
+        onKeyUp={e => syncCaret(e.currentTarget)}
+        onClick={e => syncCaret(e.currentTarget)}
+        placeholder={
+          revisingPendingId
+            ? 'Describe what to change about the plan...  (Ctrl+Enter to send)'
+            : conversationId
+              ? 'Type a message...  (Enter for newline, Ctrl+Enter to send)'
+              : 'Type your first message...  (Ctrl+Enter to send)'
+        }
+        rows={1}
+        autoFocus
+        disabled={loading}
+      />
+      <button
+        type="button"
+        className={`composer-icon-btn composer-voice-btn${recording ? ' recording' : ''}`}
+        onClick={toggleVoice}
+        disabled={loading || uploading || !voiceSupported}
+        title={
+          voiceSupported
+            ? recording
+              ? 'Stop listening'
+              : 'Start voice input'
+            : 'Voice input not supported in this browser'
+        }
+        aria-label="Voice input"
+      >
+        {recording ? <IconStop /> : <IconMic />}
+      </button>
+      {models && models.length > 0 && (
+        <ModelPicker
+          models={models}
+          selectedModel={selectedModel ?? ''}
+          onSelect={(m) => onSelectModel && onSelectModel(m)}
+          disabled={loading || uploading}
+        />
+      )}
+      <button
+        type="submit"
+        className="composer-send-btn"
+        disabled={sendDisabled}
+        title={uploading ? 'Uploading…' : revisingPendingId ? 'Send revision (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
+        aria-label={uploading ? 'Uploading' : revisingPendingId ? 'Send revision' : 'Send'}
+      >
+        <IconArrowUp size={17} />
+      </button>
+    </form>
+  )
+
   if (!projectId) {
     return (
       <main className="chat-panel">
-        <div className="chat-empty">
-          <div className="empty-state">
-            <p className="empty-state-title">No workspace selected</p>
-            <p className="empty-state-hint">Pick a project or General from the sidebar to start chatting.</p>
+        <div className="landing landing-idle">
+          <div className="landing-inner">
+            <div className="landing-hero">
+              <span className="landing-mark">
+                <IconSpark size={22} />
+              </span>
+              <span className="landing-eyebrow">Agent OS · standby</span>
+              <h1 className="landing-greeting">{timeGreeting()}, Builder.</h1>
+              <p className="landing-sub">
+                Pick a project from the sidebar — or create one — to open its cockpit.
+              </p>
+            </div>
           </div>
         </div>
       </main>
@@ -601,27 +845,98 @@ function ChatPanel({
       <main className="chat-panel">
         <div className="chat-header">
           <div className="chat-header-row">
-            <span className="chat-header-eyebrow">Workspace</span>
             <h2>{label}</h2>
           </div>
         </div>
-        <div className="chat-empty">
-          <div className="empty-state">
-            <p className="empty-state-title">No conversation open</p>
-            <p className="empty-state-hint">Select a conversation in the sidebar, or start a new one.</p>
+        <div className="landing">
+          <div className="landing-inner">
+            <div className="landing-hero">
+              <span className="landing-mark">
+                <IconSpark size={22} />
+              </span>
+              <span className="landing-eyebrow">{label} · cockpit ready</span>
+              <h1 className="landing-greeting">{timeGreeting()}, Builder.</h1>
+              <p className="landing-sub">
+                {runProjectId ? (
+                  <>What shall we build in <strong>{label}</strong> today?</>
+                ) : (
+                  'Plan, research, or think out loud — useful facts persist to global memory.'
+                )}
+              </p>
+            </div>
+            <div className="landing-composer">
+              {composerTray}
+              {composerForm}
+            </div>
+            {quickChipEntries.length > 0 && (
+              <div className="landing-chips">
+                {quickChipEntries.map(en => (
+                  <button
+                    key={en.command}
+                    type="button"
+                    className="landing-chip"
+                    onClick={() => applyQuickCommand(en)}
+                    title={en.description}
+                  >
+                    {en.command}
+                  </button>
+                ))}
+              </div>
+            )}
+            {runProjectId && recentRuns.length > 0 && (
+              <div className="landing-runs">
+                <span className="landing-runs-title">Recent runs</span>
+                <ul className="landing-runs-list">
+                  {recentRuns.map(run => (
+                    <li key={run.run_id}>
+                      <button
+                        type="button"
+                        className="landing-run-row"
+                        onClick={() => setOpenRunId(run.run_id)}
+                        title="Open run details"
+                      >
+                        <span className={`run-status status-${run.status || 'unknown'}`}>
+                          {run.status || 'unknown'}
+                        </span>
+                        <span className="landing-run-title">{run.task_title || '(untitled run)'}</span>
+                        <span className="landing-run-time">
+                          {timeAgo(run.completed_at || run.created_at)}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         </div>
+        {openRunId && runProjectId && (
+          <RunDetailModal
+            projectId={runProjectId}
+            runId={openRunId}
+            onClose={() => setOpenRunId(null)}
+            onOpenTrace={(rid) => {
+              setOpenRunId(null)
+              setOpenTraceId(rid)
+            }}
+            onRunsChanged={onRunsChanged}
+          />
+        )}
+        {openTraceId && runProjectId && (
+          <RunTrace
+            projectId={runProjectId}
+            runId={openTraceId}
+            onClose={() => setOpenTraceId(null)}
+          />
+        )}
       </main>
     )
   }
-
-  const sendDisabled = loading || uploading || (!input.trim() && files.length === 0)
 
   return (
     <main className="chat-panel">
       <div className="chat-header">
         <div className="chat-header-row">
-          <span className="chat-header-eyebrow">Workspace</span>
           <h2>{label}</h2>
         </div>
       </div>
@@ -942,131 +1257,9 @@ function ChatPanel({
         </div>
       )}
       {/* Task 07.0 — selected file chips + "add to workspace" toggle, shown
-          above the composer before sending. */}
-      {(files.length > 0 || uploadError || voiceError || imageBlockedNote) && (
-        <div className="composer-tray">
-          {voiceError && <div className="composer-voice-error">{voiceError}</div>}
-          {imageBlockedNote && (
-            <div className="composer-image-blocked">{imageBlockedNote}</div>
-          )}
-          {uploadError && <div className="composer-upload-error">{uploadError}</div>}
-          {files.length > 0 && (
-            <>
-              <div className="composer-chips">
-                {files.map((f, i) => (
-                  <div className="composer-chip" key={i} title={f.name}>
-                    <span className="composer-chip-name">{f.name}</span>
-                    <span className="composer-chip-size">{formatSize(f.size)}</span>
-                    <button
-                      type="button"
-                      className="composer-chip-remove"
-                      onClick={() => removeFile(i)}
-                      disabled={uploading}
-                      aria-label={`Remove ${f.name}`}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ))}
-              </div>
-              {isProjectConversation && (
-                <label className="composer-workspace-toggle">
-                  <input
-                    type="checkbox"
-                    checked={addToWorkspace}
-                    onChange={e => setAddToWorkspace(e.target.checked)}
-                    disabled={uploading}
-                  />
-                  Add to workspace too
-                </label>
-              )}
-            </>
-          )}
-        </div>
-      )}
-      {models && models.length > 0 && (
-        <div className="composer-modelbar">
-          <ModelPicker
-            models={models}
-            selectedModel={selectedModel ?? ''}
-            onSelect={(m) => onSelectModel && onSelectModel(m)}
-            disabled={loading || uploading}
-          />
-        </div>
-      )}
-      <form className="chat-input composer" onSubmit={handleSubmit}>
-        {menuEntries.length > 0 && (
-          <CommandMenu
-            entries={menuEntries}
-            selectedIndex={menuSelected}
-            onSelect={selectCommand}
-            onHover={setMenuIndex}
-          />
-        )}
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          accept={visionEnabled ? ACCEPT_TYPES : ACCEPT_TYPES_NO_IMAGE}
-          style={{ display: 'none' }}
-          onChange={handleFilesPicked}
-        />
-        <button
-          type="button"
-          className={`composer-icon-btn composer-attach-btn${visionEnabled ? '' : ' no-image'}`}
-          onClick={() => fileInputRef.current?.click()}
-          disabled={loading || uploading}
-          title={
-            visionEnabled
-              ? 'Attach files'
-              : 'Attach files — images unavailable for the selected model'
-          }
-          aria-label="Attach files"
-        >
-          <IconPaperclip />
-        </button>
-        <textarea
-          ref={inputRef}
-          className="composer-textarea"
-          value={input}
-          onChange={e => {
-            setInput(e.target.value)
-            setCaret(e.target.selectionStart ?? e.target.value.length)
-            setMenuDismissed(false)
-            setMenuIndex(0)
-          }}
-          onKeyDown={handleKeyDown}
-          onKeyUp={e => syncCaret(e.currentTarget)}
-          onClick={e => syncCaret(e.currentTarget)}
-          placeholder={
-            revisingPendingId
-              ? 'Describe what to change about the plan...  (Ctrl+Enter to send)'
-              : 'Type a message...  (Enter for newline, Ctrl+Enter to send)'
-          }
-          rows={1}
-          autoFocus
-          disabled={loading}
-        />
-        <button
-          type="button"
-          className={`composer-icon-btn composer-voice-btn${recording ? ' recording' : ''}`}
-          onClick={toggleVoice}
-          disabled={loading || uploading || !voiceSupported}
-          title={
-            voiceSupported
-              ? recording
-                ? 'Stop listening'
-                : 'Start voice input'
-              : 'Voice input not supported in this browser'
-          }
-          aria-label="Voice input"
-        >
-          {recording ? <IconStop /> : <IconMic />}
-        </button>
-        <button type="submit" className="composer-send-btn" disabled={sendDisabled}>
-          {uploading ? 'Uploading...' : revisingPendingId ? 'Send revision' : 'Send'}
-        </button>
-      </form>
+          above the composer before sending. Shared with the landing state. */}
+      {composerTray}
+      {composerForm}
       {openRunId && runProjectId && (
         <RunDetailModal
           projectId={runProjectId}

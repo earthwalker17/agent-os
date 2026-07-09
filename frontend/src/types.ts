@@ -418,6 +418,15 @@ export interface GitStatus {
   error?: string | null
 }
 
+/** Public UI pass — one commit row from GET /git/log (author/subject redacted). */
+export interface GitCommit {
+  hash: string
+  short: string
+  author: string
+  date: string
+  subject: string
+}
+
 /** Phase 7 — GitHub connector presence + connectivity (never the token value). */
 export interface GitHubConnectorStatus {
   provider: 'github'

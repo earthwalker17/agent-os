@@ -70,8 +70,11 @@ not agent tools.
   Next), `DECISIONS.md`, `RESEARCH.md`, `LESSONS.md` (durable Main-Agent
   lessons; never written by the Coding Agent). `OPS.md` is the deployment
   ledger, written only by the deterministic `ops_ledger` — never by an LLM.
-- `SOUL.md` is **read-only and hidden**: loaded as the identity anchor every
-  turn, never shown in any UI, never auto-written, never in any write path.
+- `SOUL.md` is **read-only to every agent/LLM path**: loaded as the identity
+  anchor every turn, never auto-written, never in any judge/reconciliation
+  writeback allow-list. It is shown at the top of the Global Memory modal and
+  editable **only by the user**, through the one explicit manual
+  `/global-memory/update-file` endpoint — the sole SOUL.md write path.
 - All other global/project memory files participate in **policy-filtered
   semantic writeback**: after each non-delegated turn a judge call proposes
   structured JSON updates (`{filename, section, content, action}`); the
