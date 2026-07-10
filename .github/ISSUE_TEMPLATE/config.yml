@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & ideas (Discussions)
+    url: https://github.com/earthwalker17/agent-os/discussions
+    about: Ask questions, share what you built, or float an open-ended idea before filing an issue.
+  - name: 🔒 Report a security vulnerability (private)
+    url: https://github.com/earthwalker17/agent-os/security/advisories/new
+    about: Never file security issues publicly. Use GitHub Private Vulnerability Reporting — see SECURITY.md.

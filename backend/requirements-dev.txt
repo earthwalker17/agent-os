@@ -1,0 +1,7 @@
+# Development / CI dependencies.
+# Installs the runtime dependencies plus the test runner, so a single
+#   pip install -r requirements-dev.txt
+# gives you everything needed to run `python -m pytest tests`.
+# The suite stubs the LLM caller, so no API keys are required.
+-r requirements.txt
+pytest>=8,<10

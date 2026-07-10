@@ -1,0 +1,159 @@
+name: "🐛 Bug report"
+description: Report a reproducible problem in Agent OS
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        > [!CAUTION]
+        > **Never paste secrets.** Redact API keys, provider tokens,
+        > `GITHUB_TOKEN` / `VERCEL_TOKEN` / `SUPABASE_ACCESS_TOKEN` /
+        > `STRIPE_SECRET_KEY`, `.env` contents, and anything from the
+        > `credentials/` store out of logs, screenshots, and stack traces
+        > before posting. If the bug is security-sensitive, do **not** file it
+        > here — follow [SECURITY.md](https://github.com/earthwalker17/agent-os/blob/main/SECURITY.md)
+        > and report it privately instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I removed all API keys, tokens, and other secrets from everything I'm about to paste.
+          required: true
+        - label: This is not a security vulnerability (those go through private reporting, not public issues).
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+      placeholder: When I ..., Agent OS ... instead of ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps so we can reproduce the problem.
+      value: |
+        1. Go to '...'
+        2. Send the message / run the command '...'
+        3. Click '...'
+        4. See error
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Agent OS is affected?
+      options:
+        - "Not sure"
+        - "Chat / Main Agent orchestration"
+        - "Coding Agent run / execution"
+        - "Sandbox / ToolRuntime"
+        - "Verification (command / browser / visual)"
+        - "Memory engine"
+        - "Git / GitHub delivery"
+        - "Connectors (Vercel / Supabase / Stripe)"
+        - "Research / RAG / Skills"
+        - "Frontend / UI"
+        - "Installer / setup"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS and version.
+      placeholder: e.g. Windows 11 26200 / macOS 14.5 / Ubuntu 24.04
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+      placeholder: e.g. Python 3.11.9
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      description: Output of `node --version` (if the frontend or a build is involved).
+      placeholder: e.g. v20.11.1
+    validations:
+      required: false
+
+  - type: dropdown
+    id: providers
+    attributes:
+      label: Model provider(s) in use
+      description: Which provider(s) were configured when the bug occurred?
+      multiple: true
+      options:
+        - "Claude (Anthropic)"
+        - "GPT (OpenAI)"
+        - "Gemini (Google)"
+        - "DeepSeek"
+        - "Kimi (Moonshot)"
+        - "GLM (Zhipu)"
+        - "None / not relevant"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connectors
+    attributes:
+      label: Connectors involved
+      description: Were any external connectors active for this bug?
+      multiple: true
+      options:
+        - "None"
+        - "GitHub"
+        - "Vercel"
+        - "Supabase"
+        - "Stripe (test mode)"
+        - "Tavily (@search)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs, run artifacts, or screenshots
+      description: |
+        Paste backend console output, a `run.json` / `result.md` excerpt, or a
+        screenshot. **Redact all secrets first.**
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help — recent changes, how often it reproduces, etc.
+    validations:
+      required: false

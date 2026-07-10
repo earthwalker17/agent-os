@@ -8,6 +8,10 @@
 
 **`LLM + Harness = Agent`**
 
+[![CI](https://github.com/earthwalker17/agent-os/actions/workflows/ci.yml/badge.svg)](https://github.com/earthwalker17/agent-os/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/earthwalker17/agent-os?sort=semver&color=2f6f4e)](https://github.com/earthwalker17/agent-os/releases/latest)
+[![License: Apache 2.0](https://img.shields.io/github/license/earthwalker17/agent-os?color=3776ab)](./LICENSE)
+
 ![Local-first](https://img.shields.io/badge/local--first-filesystem%20%2B%20SQLite-2f6f4e)
 ![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20Python%203.10%2B-3776ab)
 ![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite%20%2B%20TypeScript-61dafb)
@@ -259,6 +263,16 @@ agent-os/
 | 12 | Launch / Growth Studio — diagrams, demo kits, release assets | ⏳ planned |
 
 The full evolution log lives in [`ROADMAP.md`](./ROADMAP.md); the long-term direction in [`BLUEPRINT.md`](./BLUEPRINT.md).
+
+---
+
+## Contributing & community
+
+Agent OS is open source under the [Apache 2.0 License](./LICENSE). Contributions that respect its local-first, sandboxed, approval-gated design are welcome.
+
+- **[Contributing guide](./CONTRIBUTING.md)** — dev setup, running the checks, and the pull-request process.
+- **[Security policy](./SECURITY.md)** — report vulnerabilities privately through GitHub, never in a public issue.
+- **[Code of Conduct](./CODE_OF_CONDUCT.md)** · **[Changelog](./CHANGELOG.md)** · **[Discussions](https://github.com/earthwalker17/agent-os/discussions)**
 
 ---
 

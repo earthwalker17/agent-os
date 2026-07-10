@@ -1,0 +1,95 @@
+name: "✨ Feature request"
+description: Suggest an idea or improvement for Agent OS
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape Agent OS.
+
+        Agent OS is a **local-first AI project cockpit** with a deliberate
+        design. The strongest proposals strengthen its principles rather than
+        working around them. Please read
+        [CONTRIBUTING.md](https://github.com/earthwalker17/agent-os/blob/main/CONTRIBUTING.md)
+        and skim
+        [ARCHITECTURE.md](https://github.com/earthwalker17/agent-os/blob/main/ARCHITECTURE.md)
+        before filing, and use
+        [Discussions](https://github.com/earthwalker17/agent-os/discussions)
+        for open-ended ideas.
+
+        > [!WARNING]
+        > **Never paste secrets.** Redact API keys, provider tokens, and `.env`
+        > contents from any logs, config snippets, or mockups you attach.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and where does Agent OS get in the way today?
+      placeholder: I'm always frustrated when ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the feature or change you'd like to see.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Agent OS would this affect?
+      options:
+        - "Not sure"
+        - "Chat / Main Agent orchestration"
+        - "Coding Agent run / execution"
+        - "Sandbox / ToolRuntime"
+        - "Verification (command / browser / visual)"
+        - "Memory engine"
+        - "Git / GitHub delivery"
+        - "Connectors (Vercel / Supabase / Stripe)"
+        - "Research / RAG / Skills"
+        - "Frontend / UI"
+        - "Installer / setup / docs"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: principles
+    attributes:
+      label: Alignment with Agent OS principles
+      description: >
+        Agent OS is intentionally opinionated. Confirm your idea fits the core
+        design (see CONTRIBUTING.md → "Guiding principles"). If a box can't be
+        checked, explain the trade-off below — it may still be a great idea,
+        but we'll want to discuss it.
+      options:
+        - label: "**Local-first** — it works with filesystem + SQLite + FastAPI + React, without requiring new cloud services, queues, or external infrastructure for the core."
+          required: true
+        - label: "**Sandboxed execution** — it keeps all repo paths and shell commands routed through the single `ProjectSandbox` / `ToolRuntime` chokepoint (no raw `os` / `subprocess` access)."
+          required: true
+        - label: "**Explicit approval gates** — it does not push code, mutate an external system, or spend money from inferred intent; delivery/deploys/payments stay two-phase preview → confirm."
+          required: true
+        - label: "**Human control** — it keeps the user in the loop and does not remove a decision point, auto-inject repo contents into the Main Agent, or let an agent write outside its lane."
+          required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about, and why the proposal is better.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mockups, links, prior art, or anything else that helps.
+    validations:
+      required: false
