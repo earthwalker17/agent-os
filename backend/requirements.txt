@@ -5,4 +5,4 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.9
 # Browser verification (Task 06.2B/C) drives a headless Chromium via Playwright.
 # After installing, run once: python -m playwright install chromium
-playwright>=1.40.0
+playwright>=1.61.0
