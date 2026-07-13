@@ -21,6 +21,20 @@
 
 </div>
 
+<div align="center">
+
+## See Agent OS in action
+
+[![Watch the Agent OS demo — plan, execute, verify, recover, approve, ship](./demo/agent-os-demo-thumbnail.png)](https://youtu.be/KVtN_26qDYw?si=lZ3hrhakmc8g2LOD)
+
+**▶ [Watch the 1-minute demo on YouTube](https://youtu.be/KVtN_26qDYw?si=lZ3hrhakmc8g2LOD)**
+
+</div>
+
+The 1-minute demo runs on **real Pulseboard run records** — no re-run, no rebuild, no fabricated data — and walks the full harness loop: **plan → execute → verify → recover → approve → ship**.
+
+---
+
 > **Docs map.** This README is the public landing page. The system's shape (files,
 > pipelines, invariants) lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md); the evolution
 > log in [`ROADMAP.md`](./ROADMAP.md); the long-term direction in

@@ -125,3 +125,19 @@ temp/
 # Locally-installed external CLIs (supabase / stripe) — per-machine binaries
 # used by the sandboxed executors; large + platform-specific, never committed.
 .tools/
+
+# =========================
+# Demo video — scripts committed, media/artifacts are not
+# =========================
+# The reproducible pipeline (demo/record.py, demo/make_video.py, its fonts and
+# the README thumbnail) is committed; everything below is regenerated locally
+# from those scripts, so it stays out of the repo. The rendered demo lives on
+# YouTube, not in Git — never commit binary video output.
+# raw Playwright .webm beat recordings
+demo/raw/
+# FFmpeg segments + clips.json (build intermediates)
+demo/build/
+# label text files written by make_video.py
+demo/assets/labels/
+# generated demo video output
+demo/*.mp4
